@@ -11,6 +11,7 @@
 - 系统 TTS 引擎：`service.MultiTtsService`（`android.intent.action.TTS_SERVICE`），支持语言/音色查询、语速/音调/音量映射、停止与取消
 - 委托代理合成：把文本转交选定引擎 `synthesizeToFile`，解码 WAV（PCM 8/16/24/32、float32）后按 PCM 分块流式回传
 - Compose 工作台：文本输入、语速/音量/音调滑块、**真实引擎选择**（跟随系统默认 / 任一已装引擎）、音色选择、朗读与停止
+- **语音包**：导入本地 zip、填写在线目录地址后下载安装、查看/应用/删除；包内音色可绑定到"引擎 + 语音名"，应用即切换
 - 分享文本直接朗读（`ACTION_SEND` / `text/plain`）
 - 角色、替换规则、最近文本本地持久化（SharedPreferences）
 - 读取系统已安装语音引擎的音色列表
@@ -26,13 +27,15 @@
 ```
 app/src/main/java/org/nobody/multitts/replica/
 ├── MainActivity.kt          # 入口，处理分享文本
-├── data/                    # SpeechController（系统 TTS 客户端）、SpeechVoice
+├── data/                    # SpeechController（系统 TTS 客户端）、SpeechVoice、voicepack/（语音包解析/仓库/在线目录）
 ├── engine/                  # 引擎契约（api/EngineApi）、引擎枚举（EngineCatalog）、委托代理（proxy/）
 ├── service/                 # MultiTtsService：系统 TextToSpeechService 实现
 ├── ui/                      # Compose 界面与 MainViewModel
 └── ui/theme/                # 配色与主题
 docs/REIMPLEMENTATION_TARGET.md   # 原版逆向结论与分期目标
-scripts/                     # build.ps1 / install.ps1
+docs/VOICE_PACKS.md          # 语音包格式、在线目录协议、导入/下载与安全边界
+samples/demo-xiaomi/         # 示例语音包（pack.json）
+scripts/                     # build.ps1 / install.ps1 / make-pack.ps1
 ```
 
 ## 构建
@@ -77,6 +80,7 @@ java.io.IOException: Unable to establish loopback connection
   少了该 category 时 `getEngines()` 不含本应用，显式指定引擎会被静默回落到默认引擎（实测踩过）
 - 系统默认引擎切换无法用 adb 完成（MIUI 拒绝 `WRITE_SECURE_SETTINGS`），需在“设置 → 语音合成”手动选择
 - 无测试依赖（离线缓存中缺少 JUnit/AndroidX Test），单测需联网补齐后再接入
+- 语音包目录默认允许明文 HTTP（自建 NAS/局域网场景），公网分发请用 HTTPS 并填写 `sha256`
 - `values/strings.xml` 与 `values-zh-rCN/strings.xml` 内容相同，默认语言仍是中文
 - 真机为 MIUI 且常处于锁屏，`adb shell input` 被系统拒绝，UI 自动化需先解锁或改用模拟器
 
@@ -93,6 +97,25 @@ adb logcat -s MultiTtsService
 
 预期日志：`Sucessfully bound to org.nobody.multitts.replica` → `delegating synthesis to <engine>` →
 `streaming pcm: 24000Hz fmt=2 ch=1` → `synthesis finished`，同时客户端进程出现 `AudioTrack` 播放。
+
+## 语音包
+
+详见 [`docs/VOICE_PACKS.md`](docs/VOICE_PACKS.md)。最简流程：
+
+```powershell
+# 1) 打包（输出 zip 路径与可直接粘贴进 catalog.json 的字段）
+./scripts/make-pack.ps1 -SourceDir ./samples/demo-xiaomi -OutputDir ./dist
+
+# 2) 本地联调：起一个静态服务并让设备回环访问
+adb reverse tcp:8765 tcp:8765
+python -m http.server 8765   # 在 dist 所在目录
+
+# 3) 直接安装 zip 直链 / 指定在线目录
+adb shell am start --es packUrl "http://127.0.0.1:8765/demo-xiaomi-1.0.0.zip" -n org.nobody.multitts.replica/.MainActivity
+adb shell am start --es catalog "http://127.0.0.1:8765/catalog.json" -n org.nobody.multitts.replica/.MainActivity
+```
+
+应用内「语音包」界面同样支持 SAF 导入本地 zip 与在线下载（含 sha256 校验、临时目录安装、失败不破坏已装版本）。
 
 ## 后续规划
 

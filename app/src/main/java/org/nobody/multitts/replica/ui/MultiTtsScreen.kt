@@ -1,5 +1,7 @@
 package org.nobody.multitts.replica.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -77,7 +79,11 @@ fun MultiTtsScreen(
     )
     val scope = rememberCoroutineScope()
     var showVoicePicker by remember { mutableStateOf(false) }
+    var showVoicePacks by remember { mutableStateOf(false) }
     var collectionDialog by remember { mutableStateOf<CollectionDialog?>(null) }
+    val packPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) viewModel.importPack(uri)
+    }
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -102,6 +108,10 @@ fun MultiTtsScreen(
                 DrawerEntry("音色库") {
                     scope.launch { drawerState.close() }
                     showVoicePicker = true
+                }
+                DrawerEntry("语音包") {
+                    scope.launch { drawerState.close() }
+                    showVoicePacks = true
                 }
                 DrawerEntry("文本替换") {
                     scope.launch { drawerState.close() }
@@ -183,6 +193,24 @@ fun MultiTtsScreen(
                 showVoicePicker = false
             },
             onDismiss = { showVoicePicker = false },
+        )
+    }
+
+    if (showVoicePacks) {
+        VoicePackDialog(
+            packs = state.packs,
+            catalog = state.catalog,
+            catalogUrl = state.catalogUrl,
+            busyId = state.packBusyId,
+            progress = state.packProgress,
+            status = state.packStatus,
+            onCatalogUrlChange = viewModel::setCatalogUrl,
+            onRefreshCatalog = viewModel::refreshCatalog,
+            onImport = { packPicker.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
+            onDownload = viewModel::downloadPack,
+            onApplyVoice = viewModel::applyPackVoice,
+            onRemove = viewModel::removePack,
+            onDismiss = { showVoicePacks = false },
         )
     }
 

@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "id": "demo-xiaomi",
+  "name": "示例语音包",
+  "version": "1.0.0",
+  "author": "MultiTTS",
+  "description": "绑定已装系统引擎的示例语音包，用于验证导入与在线下载流程。",
+  "voices": [
+    {
+      "id": "mibrain-default",
+      "name": "小米系统音色",
+      "locale": "zh-CN",
+      "engine": "com.xiaomi.mibrain.speech",
+      "requiresNetwork": false
+    },
+    {
+      "id": "follow-current",
+      "name": "跟随当前引擎",
+      "locale": "zh-CN"
+    }
+  ]
+}

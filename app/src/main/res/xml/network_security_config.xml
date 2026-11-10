@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  语音包目录与 zip 多为自建服务（NAS / 局域网 / 本机调试），因此允许明文 HTTP。
+  面向公网分发的目录请自行使用 HTTPS；应用只校验可选的 sha256 字段。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
