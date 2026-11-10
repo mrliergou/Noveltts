@@ -100,6 +100,9 @@ adb shell am start --es packUrl "http://127.0.0.1:8765/demo-xiaomi-1.0.0.zip" `
 # 设置并刷新在线目录
 adb shell am start --es catalog "http://127.0.0.1:8765/catalog.json" `
   -n org.nobody.multitts.replica/.MainActivity
+
+# 直接打开「语音包」界面（截屏 / 演示用）
+adb shell am start --es open voicepacks -n org.nobody.multitts.replica/.MainActivity
 ```
 
 本机联调可用 `adb reverse tcp:8765 tcp:8765` + `python -m http.server 8765`。

@@ -72,6 +72,7 @@ import org.nobody.multitts.replica.ui.theme.Teal
 fun MultiTtsScreen(
     viewModel: MainViewModel,
     onOpenSystemSpeechSettings: () -> Unit,
+    openVoicePacksOnStart: Boolean = false,
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val drawerState = androidx.compose.material3.rememberDrawerState(
@@ -79,7 +80,7 @@ fun MultiTtsScreen(
     )
     val scope = rememberCoroutineScope()
     var showVoicePicker by remember { mutableStateOf(false) }
-    var showVoicePacks by remember { mutableStateOf(false) }
+    var showVoicePacks by remember { mutableStateOf(openVoicePacksOnStart) }
     var collectionDialog by remember { mutableStateOf<CollectionDialog?>(null) }
     val packPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) viewModel.importPack(uri)
@@ -378,9 +379,16 @@ private fun EngineSelector(
                 selected = selectedPackage == null,
                 onClick = { onEngineSelected(null) },
             )
-            engines.forEach { engine ->
+            val orderedEngines = engines.sortedBy { engine ->
+                when (engine.packageName) {
+                    selfPackage -> 0
+                    systemDefaultPackage -> 1
+                    else -> 2
+                }
+            }
+            orderedEngines.forEach { engine ->
                 EngineChip(
-                    label = if (engine.packageName == selfPackage) "${engine.label} · 本应用" else engine.label,
+                    label = if (engine.packageName == selfPackage) "本应用 · ${engine.label}" else engine.label,
                     selected = selectedPackage == engine.packageName,
                     onClick = { onEngineSelected(engine.packageName) },
                 )

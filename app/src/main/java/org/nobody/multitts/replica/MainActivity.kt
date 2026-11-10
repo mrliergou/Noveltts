@@ -24,6 +24,7 @@ class MainActivity : ComponentActivity() {
                 MultiTtsScreen(
                     viewModel = viewModel,
                     onOpenSystemSpeechSettings = ::openSystemSpeechSettings,
+                    openVoicePacksOnStart = intent?.getStringExtra(EXTRA_OPEN) == OPEN_VOICE_PACKS,
                 )
             }
         }
@@ -66,6 +67,8 @@ class MainActivity : ComponentActivity() {
     private companion object {
         const val EXTRA_PACK_URL = "packUrl"
         const val EXTRA_CATALOG_URL = "catalog"
+        const val EXTRA_OPEN = "open"
+        const val OPEN_VOICE_PACKS = "voicepacks"
     }
 
     private fun openSystemSpeechSettings() {
