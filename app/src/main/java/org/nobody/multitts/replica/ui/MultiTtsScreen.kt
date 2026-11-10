@@ -2,6 +2,7 @@ package org.nobody.multitts.replica.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -48,6 +49,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -56,14 +58,13 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
 import org.nobody.multitts.replica.R
+import org.nobody.multitts.replica.engine.TtsEngineInfo
 import org.nobody.multitts.replica.data.SpeechVoice
 import org.nobody.multitts.replica.ui.theme.Accent
 import org.nobody.multitts.replica.ui.theme.AppBackground
 import org.nobody.multitts.replica.ui.theme.Ink
 import org.nobody.multitts.replica.ui.theme.Muted
 import org.nobody.multitts.replica.ui.theme.Teal
-
-private val channels = listOf("搜狗语音", "快速网络", "滴滴语音")
 
 @Composable
 fun MultiTtsScreen(
@@ -148,9 +149,11 @@ fun MultiTtsScreen(
                     onVolumeChange = viewModel::updateVolume,
                     onPitchChange = viewModel::updatePitch,
                 )
-                ChannelSelector(
-                    selectedChannel = state.channel,
-                    onChannelSelected = viewModel::selectChannel,
+                EngineSelector(
+                    engines = state.engines,
+                    selectedPackage = state.enginePackage,
+                    systemDefaultPackage = state.systemDefaultPackage,
+                    onEngineSelected = viewModel::selectEngine,
                 )
                 TextComposer(
                     text = state.text,
@@ -320,45 +323,68 @@ private fun SliderRow(
 }
 
 @Composable
-private fun ChannelSelector(selectedChannel: String, onChannelSelected: (String) -> Unit) {
+private fun EngineSelector(
+    engines: List<TtsEngineInfo>,
+    selectedPackage: String?,
+    systemDefaultPackage: String?,
+    onEngineSelected: (String?) -> Unit,
+) {
+    val selfPackage = LocalContext.current.packageName
+    val defaultLabel = engines.firstOrNull { it.packageName == systemDefaultPackage }?.label
+        ?: systemDefaultPackage.orEmpty()
     Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("语音通道", fontWeight = FontWeight.Bold, color = Ink, modifier = Modifier.weight(1f))
-            Text("使用系统默认引擎", style = MaterialTheme.typography.labelSmall, color = Muted)
+            Text("合成引擎", fontWeight = FontWeight.Bold, color = Ink, modifier = Modifier.weight(1f))
+            Text(
+                text = if (systemDefaultPackage == selfPackage) "本应用是系统默认引擎" else "系统默认：$defaultLabel",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (systemDefaultPackage == selfPackage) Teal else Muted,
+            )
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-            channels.forEachIndexed { index, channel ->
-                val selected = channel == selectedChannel
-                Surface(
-                    onClick = { onChannelSelected(channel) },
-                    modifier = Modifier.weight(1f).height(58.dp),
-                    shape = MaterialTheme.shapes.medium,
-                    color = if (selected) Teal else MaterialTheme.colorScheme.surface,
-                ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center,
-                    ) {
-                        Text(
-                            channel,
-                            color = if (selected) Color.White else Ink,
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold,
-                        )
-                        Text(
-                            "通道标签 %02d".format(index + 1),
-                            color = if (selected) Color.White.copy(alpha = 0.8f) else Muted,
-                            style = MaterialTheme.typography.labelSmall,
-                        )
-                    }
-                }
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+        ) {
+            EngineChip(
+                label = "跟随系统",
+                selected = selectedPackage == null,
+                onClick = { onEngineSelected(null) },
+            )
+            engines.forEach { engine ->
+                EngineChip(
+                    label = if (engine.packageName == selfPackage) "${engine.label} · 本应用" else engine.label,
+                    selected = selectedPackage == engine.packageName,
+                    onClick = { onEngineSelected(engine.packageName) },
+                )
             }
         }
         Text(
-            text = "当前版本的合成由系统默认语音引擎处理。",
+            text = "工作台用所选引擎朗读；选中本应用时，它会再把文本委托给其它引擎合成。",
             style = MaterialTheme.typography.labelSmall,
             color = Muted,
         )
+    }
+}
+
+@Composable
+private fun EngineChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = MaterialTheme.shapes.medium,
+        color = if (selected) Teal else MaterialTheme.colorScheme.surface,
+        modifier = Modifier.height(40.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 14.dp),
+        ) {
+            Text(
+                text = label,
+                color = if (selected) Color.White else Ink,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold,
+            )
+        }
     }
 }
 

@@ -11,13 +11,17 @@ import kotlinx.coroutines.flow.update
 import org.nobody.multitts.replica.data.SpeechController
 import org.nobody.multitts.replica.data.SpeechEngineState
 import org.nobody.multitts.replica.data.SpeechVoice
+import org.nobody.multitts.replica.engine.EngineCatalog
+import org.nobody.multitts.replica.engine.TtsEngineInfo
 
 data class MainUiState(
     val text: String = "",
     val speed: Int = 50,
     val volume: Int = 50,
     val pitch: Int = 25,
-    val channel: String = "搜狗语音",
+    val engines: List<TtsEngineInfo> = emptyList(),
+    val enginePackage: String? = null,
+    val systemDefaultPackage: String? = null,
     val speech: SpeechEngineState = SpeechEngineState(),
     val roles: Set<String> = emptySet(),
     val replacements: Set<String> = emptySet(),
@@ -28,12 +32,18 @@ class MainViewModel(
     savedStateHandle: SavedStateHandle,
 ) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences("multitts", Context.MODE_PRIVATE)
+    private val engines = EngineCatalog.installedEngines(application)
+    private val systemDefaultPackage = EngineCatalog.defaultEnginePackage(application)
+    private val initialEngine: String? = savedStateHandle.get<String>(EXTRA_ENGINE)
+        ?.takeIf { it.isNotBlank() }
+        ?: preferences.getString(KEY_ENGINE, null)
+            ?.takeIf { saved -> engines.any { it.packageName == saved } }
     private val _uiState = MutableStateFlow(loadInitialState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
     private val speechController = SpeechController(
         context = application,
         onStateChanged = ::onSpeechStateChanged,
-        enginePackage = savedStateHandle.get<String>(EXTRA_ENGINE),
+        enginePackage = initialEngine,
     )
 
     init {
@@ -57,9 +67,12 @@ class MainViewModel(
         state.copy(pitch = progress)
     }
 
-    fun selectChannel(channel: String) {
-        preferences.edit().putString(KEY_CHANNEL, channel).apply()
-        _uiState.update { it.copy(channel = channel) }
+    fun selectEngine(packageName: String?) {
+        val normalized = packageName?.takeIf { it.isNotBlank() }
+        if (normalized == _uiState.value.enginePackage) return
+        preferences.edit().putString(KEY_ENGINE, normalized.orEmpty()).remove(KEY_VOICE).apply()
+        _uiState.update { it.copy(enginePackage = normalized) }
+        speechController.useEngine(normalized)
     }
 
     fun selectVoice(voice: SpeechVoice) {
@@ -152,7 +165,9 @@ class MainViewModel(
         speed = preferences.getInt(KEY_SPEED, 50),
         volume = preferences.getInt(KEY_VOLUME, 50),
         pitch = preferences.getInt(KEY_PITCH, 25),
-        channel = preferences.getString(KEY_CHANNEL, "搜狗语音") ?: "搜狗语音",
+        engines = engines,
+        enginePackage = initialEngine,
+        systemDefaultPackage = systemDefaultPackage,
         roles = preferences.getStringSet(KEY_ROLES, emptySet()).orEmpty(),
         replacements = preferences.getStringSet(KEY_REPLACEMENTS, emptySet()).orEmpty(),
         speech = SpeechEngineState(
@@ -165,7 +180,7 @@ class MainViewModel(
         const val KEY_SPEED = "speed"
         const val KEY_VOLUME = "volume"
         const val KEY_PITCH = "pitch"
-        const val KEY_CHANNEL = "channel"
+        const val KEY_ENGINE = "engine"
         const val KEY_VOICE = "voice"
         const val KEY_ROLES = "roles"
         const val KEY_REPLACEMENTS = "replacements"

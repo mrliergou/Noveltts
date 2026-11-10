@@ -19,7 +19,7 @@ data class SpeechEngineState(
 class SpeechController(
     context: Context,
     private val onStateChanged: (SpeechEngineState) -> Unit,
-    private val enginePackage: String? = null,
+    private var enginePackage: String? = null,
 ) {
     private val appContext = context.applicationContext
     private var textToSpeech: TextToSpeech? = null
@@ -49,7 +49,7 @@ class SpeechController(
             .sortedBy { it.name.lowercase(Locale.ROOT) }
             .map(::toSpeechVoice)
         val engineName = tts.engines
-            .firstOrNull { it.name == tts.defaultEngine }
+            .firstOrNull { it.name == (enginePackage ?: tts.defaultEngine) }
             ?.label
             .orEmpty()
         val selectedVoice = state.selectedVoice
@@ -130,6 +130,22 @@ class SpeechController(
         if (name == state.selectedVoice) return
         applyVoice(name)
         update(state.copy(selectedVoice = name))
+    }
+
+    /** 切换朗读所用的系统引擎；传 null 表示跟随系统默认引擎。 */
+    fun useEngine(packageName: String?) {
+        val normalized = packageName?.takeIf { it.isNotBlank() }
+        if (normalized == enginePackage) return
+        enginePackage = normalized
+        queued = null
+        textToSpeech?.stop()
+        textToSpeech?.shutdown()
+        textToSpeech = null
+        state = SpeechEngineState(
+            statusMessage = if (normalized == null) "正在连接系统默认引擎…" else "正在连接 $normalized…",
+        )
+        update(state)
+        initialize()
     }
 
     fun shutdown() {
