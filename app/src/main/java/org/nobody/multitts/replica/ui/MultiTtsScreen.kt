@@ -557,6 +557,11 @@ private fun SavedItemsDialog(
         title = { Text(title) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = "目前只做保存，尚未参与合成；接入数据层后再生效。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Muted,
+                )
                 OutlinedTextField(
                     value = value,
                     onValueChange = { value = it },
@@ -594,6 +599,11 @@ private fun ReplacementDialog(
         title = { Text(stringResource(R.string.replacements)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "替换规则目前只做保存，朗读时尚未生效。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Muted,
+                )
                 OutlinedTextField(find, { find = it }, label = { Text(stringResource(R.string.find_text)) }, singleLine = true)
                 OutlinedTextField(replaceWith, { replaceWith = it }, label = { Text(stringResource(R.string.replace_with)) }, singleLine = true)
                 SavedItemList(items, onRemove)
