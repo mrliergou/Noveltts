@@ -19,63 +19,72 @@ data class SpeechEngineState(
 class SpeechController(
     context: Context,
     private val onStateChanged: (SpeechEngineState) -> Unit,
+    private val enginePackage: String? = null,
 ) {
     private val appContext = context.applicationContext
     private var textToSpeech: TextToSpeech? = null
     private var state = SpeechEngineState()
-    private var queuedText: String? = null
+    private var queued: PendingSpeech? = null
 
     fun initialize() {
         if (textToSpeech != null) return
 
-        textToSpeech = TextToSpeech(appContext) { result ->
-            if (result != TextToSpeech.SUCCESS) {
-                update(state.copy(statusMessage = "没有可用的系统语音引擎"))
-                return@TextToSpeech
+        val onInit = TextToSpeech.OnInitListener { result -> handleInit(result) }
+        textToSpeech = if (enginePackage.isNullOrBlank()) {
+            TextToSpeech(appContext, onInit)
+        } else {
+            // 指定引擎时用于预览复刻版自己，而不必先把它设成系统默认引擎。
+            TextToSpeech(appContext, onInit, enginePackage)
+        }
+    }
+
+    private fun handleInit(result: Int) {
+        if (result != TextToSpeech.SUCCESS) {
+            update(state.copy(statusMessage = "没有可用的系统语音引擎"))
+            return
+        }
+
+        val tts = textToSpeech ?: return
+        val availableVoices = tts.voices.orEmpty()
+            .sortedBy { it.name.lowercase(Locale.ROOT) }
+            .map(::toSpeechVoice)
+        val engineName = tts.engines
+            .firstOrNull { it.name == tts.defaultEngine }
+            ?.label
+            .orEmpty()
+        val selectedVoice = state.selectedVoice
+            .takeIf { selected -> availableVoices.any { it.name == selected } }
+            ?: availableVoices.firstOrNull()?.name.orEmpty()
+
+        state = state.copy(
+            isReady = true,
+            engineName = engineName,
+            voices = availableVoices,
+            selectedVoice = selectedVoice,
+            statusMessage = if (engineName.isBlank()) "系统语音引擎已连接" else "已连接 · $engineName",
+        )
+        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {
+                update(state.copy(isSpeaking = true, statusMessage = "正在朗读"))
             }
 
-            val tts = textToSpeech ?: return@TextToSpeech
-            val availableVoices = tts.voices.orEmpty()
-                .sortedBy { it.name.lowercase(Locale.ROOT) }
-                .map(::toSpeechVoice)
-            val engineName = tts.engines
-                .firstOrNull { it.name == tts.defaultEngine }
-                ?.label
-                .orEmpty()
-            val selectedVoice = state.selectedVoice
-                .takeIf { selected -> availableVoices.any { it.name == selected } }
-                ?: availableVoices.firstOrNull()?.name.orEmpty()
-
-            state = state.copy(
-                isReady = true,
-                engineName = engineName,
-                voices = availableVoices,
-                selectedVoice = selectedVoice,
-                statusMessage = if (engineName.isBlank()) "系统语音引擎已连接" else "已连接 · $engineName",
-            )
-            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {
-                    update(state.copy(isSpeaking = true, statusMessage = "正在朗读"))
-                }
-
-                override fun onDone(utteranceId: String?) {
-                    update(state.copy(isSpeaking = false, statusMessage = "朗读完成"))
-                }
-
-                @Deprecated("Deprecated by Android; retained for older engines.")
-                override fun onError(utteranceId: String?) {
-                    onSpeechError()
-                }
-
-                override fun onError(utteranceId: String?, errorCode: Int) {
-                    onSpeechError()
-                }
-            })
-            update(state)
-            queuedText?.let { text ->
-                queuedText = null
-                speak(text, 50, 25, 50)
+            override fun onDone(utteranceId: String?) {
+                update(state.copy(isSpeaking = false, statusMessage = "朗读完成"))
             }
+
+            @Deprecated("Deprecated by Android; retained for older engines.")
+            override fun onError(utteranceId: String?) {
+                onSpeechError()
+            }
+
+            override fun onError(utteranceId: String?, errorCode: Int) {
+                onSpeechError()
+            }
+        })
+        update(state)
+        queued?.let { pending ->
+            queued = null
+            speak(pending.text, pending.speed, pending.pitch, pending.volume)
         }
     }
 
@@ -87,7 +96,7 @@ class SpeechController(
         }
         val tts = textToSpeech
         if (!state.isReady || tts == null) {
-            queuedText = cleanText
+            queued = PendingSpeech(cleanText, speed, pitch, volume)
             update(state.copy(statusMessage = "系统语音引擎正在启动"))
             return
         }
@@ -112,7 +121,7 @@ class SpeechController(
     }
 
     fun stop() {
-        queuedText = null
+        queued = null
         textToSpeech?.stop()
         update(state.copy(isSpeaking = false, statusMessage = "已停止朗读"))
     }
@@ -124,7 +133,7 @@ class SpeechController(
     }
 
     fun shutdown() {
-        queuedText = null
+        queued = null
         textToSpeech?.stop()
         textToSpeech?.shutdown()
         textToSpeech = null
@@ -158,4 +167,11 @@ class SpeechController(
     private fun onSpeechError() {
         update(state.copy(isSpeaking = false, statusMessage = "朗读失败，请检查系统语音引擎"))
     }
+
+    private data class PendingSpeech(
+        val text: String,
+        val speed: Int,
+        val pitch: Int,
+        val volume: Int,
+    )
 }

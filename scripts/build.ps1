@@ -31,12 +31,14 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 function Resolve-Sdk([string]$explicit) {
     $candidates = @(
-        $explicit,
-        $env:ANDROID_HOME,
-        $env:ANDROID_SDK_ROOT,
-        (Join-Path $env:LOCALAPPDATA 'Android\Sdk'),
-        'C:\Android\Sdk'
-    ) | Where-Object { $_ -and (Test-Path (Join-Path $_ 'platforms')) }
+        @(
+            $explicit,
+            $env:ANDROID_HOME,
+            $env:ANDROID_SDK_ROOT,
+            (Join-Path $env:LOCALAPPDATA 'Android\Sdk'),
+            'C:\Android\Sdk'
+        ) | Where-Object { $_ -and (Test-Path (Join-Path $_ 'platforms')) }
+    )
     if (-not $candidates) {
         throw 'Android SDK 未找到。请用 -SdkPath 或设置 ANDROID_HOME 指向包含 platforms 的目录。'
     }
@@ -45,12 +47,14 @@ function Resolve-Sdk([string]$explicit) {
 
 function Resolve-GradleHome([string]$explicit) {
     $candidates = @(
-        $explicit,
-        $env:GRADLE_USER_HOME,
-        (Join-Path $env:LOCALAPPDATA 'MultiTTS\gradle-home'),
-        (Join-Path (Split-Path $root -Parent) 'MultiTTS\gradle-home'),
-        (Join-Path $root '.gradle-home')
-    ) | Where-Object { $_ -and (Test-Path (Join-Path $_ 'wrapper\dists')) }
+        @(
+            $explicit,
+            $env:GRADLE_USER_HOME,
+            (Join-Path $env:LOCALAPPDATA 'MultiTTS\gradle-home'),
+            (Join-Path (Split-Path $root -Parent) 'MultiTTS\gradle-home'),
+            (Join-Path $root '.gradle-home')
+        ) | Where-Object { $_ -and (Test-Path (Join-Path $_ 'wrapper\dists')) }
+    )
     if (-not $candidates) {
         throw 'Gradle Home 未找到（需要包含 wrapper\dists 的离线缓存）。请用 -GradleHome 指定。'
     }

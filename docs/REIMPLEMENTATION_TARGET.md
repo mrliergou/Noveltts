@@ -194,7 +194,7 @@ Android TextToSpeechService -> domain synthesis coordinator
 
 与原版目标的关键差距：
 
-- **P0 阻断**：当前没有 `TextToSpeechService`，不会作为可选系统 TTS 引擎出现，也不能向系统返回 PCM。
+- **P0（2026-11-10 进展）**：已注册 `org.nobody.multitts.replica/.service.MultiTtsService`（action `android.intent.action.TTS_SERVICE` + `category DEFAULT`，permission `BIND_TEXT_TO_SPEECH_SERVICE`），`TextToSpeech` 可枚举、可绑定，`onSynthesizeText` 会把请求委托给设备上其他引擎并回传 PCM。仍未做 `CHECK_TTS_DATA` / `GET_SAMPLE_TEXT` / `CONFIGURE_ENGINE` 的 Activity，系统设置里的“试听/配置”入口尚不可用。
 - **P1**：目前使用系统已安装 Voice；这不能代表原版的本地/在线音色库或引擎管理。
 - **P2**：角色目前是字符串集合，替换规则是两段文字，不具备原版匹配模型、分组、排序、regex、enable 和 speaker 引用。
 - **P2**：音色/引擎数据库、配置导入/导出、搜索和更新功能未实现。
@@ -207,10 +207,10 @@ Android TextToSpeechService -> domain synthesis coordinator
 
 ### P0 系统 TTS
 
-- [ ] Android TTS 设置能发现并选择 MultiTTS。
+- [x] Android TTS 设置能发现并选择 MultiTTS。（引擎可枚举可绑定；系统默认切换需手动，见 §7）
 - [ ] `CHECK_TTS_DATA` 与 `GET_SAMPLE_TEXT` 返回合法结果。
 - [ ] 中英文语言能力与 Voice 列表一致。
-- [ ] 标准调用能成功朗读；语速、音调、音量和 Voice 确实传入 engine adapter。
+- [x] 标准调用能成功朗读；语速、音调、音量和 Voice 确实传入 engine adapter。（2026-11-10 真机验证：显式引擎路径回环成功）
 - [ ] Stop 会取消网络/本地任务并触发正确状态；Activity 不在前台也能合成。
 - [ ] Voice 不存在、语言不支持、引擎未初始化、超时和离线均有明确错误和恢复路径。
 - [ ] 前台合成通知遵循 Android 版本权限要求；任务结束后无残留服务/锁。

@@ -3,10 +3,13 @@
 以 Kotlin + Jetpack Compose 重实现 `org.nobody.multitts` 的**系统 TTS 引擎**能力。
 复刻版包名为 `org.nobody.multitts.replica`，可与原版共存安装，便于真机对照。
 
-> 当前状态：**P0 进行中**。应用已是一个可用的"TTS 客户端 + 工作台"，但**尚未注册 `TextToSpeechService`**，因此还不是系统可选的语音引擎。
+> 当前状态：**P0 引擎链路已打通**。应用已注册 `TextToSpeechService`，可作为系统语音引擎被其他应用绑定；
+> 合成目前**委托给设备上已有的引擎**（默认优先系统默认引擎），自身尚无音色模型。
 
 ## 已有能力
 
+- 系统 TTS 引擎：`service.MultiTtsService`（`android.intent.action.TTS_SERVICE`），支持语言/音色查询、语速/音调/音量映射、停止与取消
+- 委托代理合成：把文本转交选定引擎 `synthesizeToFile`，解码 WAV（PCM 8/16/24/32、float32）后按 PCM 分块流式回传
 - Compose 工作台：文本输入、语速/音量/音调滑块、系统音色选择、朗读与停止
 - 分享文本直接朗读（`ACTION_SEND` / `text/plain`）
 - 角色、替换规则、最近文本本地持久化（SharedPreferences）
@@ -14,10 +17,10 @@
 
 ## 尚未实现（不要误认为可用）
 
-- **不是系统 TTS 引擎**：系统设置里的"语音合成"看不到本应用
 - "搜狗语音 / 快速网络 / 滴滴语音"只是界面标签，实际全部走系统默认引擎
 - 角色与替换规则只做字符串保存，**从未参与合成**
 - 无多音色分角色朗读、无本地模型、无前台服务/通知/QS 磁贴
+- 引擎只会转发给别的引擎；把系统默认引擎切成复刻版后，若设备上再没有其他引擎，将无音源
 
 ## 目录
 
@@ -25,6 +28,8 @@
 app/src/main/java/org/nobody/multitts/replica/
 ├── MainActivity.kt          # 入口，处理分享文本
 ├── data/                    # SpeechController（系统 TTS 客户端）、SpeechVoice
+├── engine/                  # 引擎契约（api/EngineApi）、引擎枚举（EngineCatalog）、委托代理（proxy/）
+├── service/                 # MultiTtsService：系统 TextToSpeechService 实现
 ├── ui/                      # Compose 界面与 MainViewModel
 └── ui/theme/                # 配色与主题
 docs/REIMPLEMENTATION_TARGET.md   # 原版逆向结论与分期目标
@@ -69,9 +74,26 @@ java.io.IOException: Unable to establish loopback connection
 
 ## 已知限制
 
+- **服务必须声明 `android.intent.category.DEFAULT`**：`TextToSpeech` 用 `queryIntentServices(..., MATCH_DEFAULT_ONLY)` 枚举引擎，
+  少了该 category 时 `getEngines()` 不含本应用，显式指定引擎会被静默回落到默认引擎（实测踩过）
+- 系统默认引擎切换无法用 adb 完成（MIUI 拒绝 `WRITE_SECURE_SETTINGS`），需在“设置 → 语音合成”手动选择
 - 无测试依赖（离线缓存中缺少 JUnit/AndroidX Test），单测需联网补齐后再接入
 - `values/strings.xml` 与 `values-zh-rCN/strings.xml` 内容相同，默认语言仍是中文
 - 真机为 MIUI 且常处于锁屏，`adb shell input` 被系统拒绝，UI 自动化需先解锁或改用模拟器
+
+## 真机验证（2026-11-10）
+
+```powershell
+# 用显式引擎启动（不改系统默认），随后观察 logcat
+adb shell am start -a android.intent.action.SEND -t text/plain `
+  --es android.intent.extra.TEXT "复刻版引擎自检。" `
+  --es engine org.nobody.multitts.replica `
+  -n org.nobody.multitts.replica/.MainActivity
+adb logcat -s MultiTtsService
+```
+
+预期日志：`Sucessfully bound to org.nobody.multitts.replica` → `delegating synthesis to <engine>` →
+`streaming pcm: 24000Hz fmt=2 ch=1` → `synthesis finished`，同时客户端进程出现 `AudioTrack` 播放。
 
 ## 后续规划
 

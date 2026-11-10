@@ -3,6 +3,7 @@ package org.nobody.multitts.replica.ui
 import android.app.Application
 import android.content.Context
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.SavedStateHandle
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -22,11 +23,18 @@ data class MainUiState(
     val replacements: Set<String> = emptySet(),
 )
 
-class MainViewModel(application: Application) : AndroidViewModel(application) {
+class MainViewModel(
+    application: Application,
+    savedStateHandle: SavedStateHandle,
+) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences("multitts", Context.MODE_PRIVATE)
     private val _uiState = MutableStateFlow(loadInitialState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
-    private val speechController = SpeechController(application, ::onSpeechStateChanged)
+    private val speechController = SpeechController(
+        context = application,
+        onStateChanged = ::onSpeechStateChanged,
+        enginePackage = savedStateHandle.get<String>(EXTRA_ENGINE),
+    )
 
     init {
         speechController.initialize()
@@ -161,5 +169,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         const val KEY_VOICE = "voice"
         const val KEY_ROLES = "roles"
         const val KEY_REPLACEMENTS = "replacements"
+        const val EXTRA_ENGINE = "engine"
     }
 }
