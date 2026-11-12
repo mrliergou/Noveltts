@@ -2,6 +2,7 @@ package app.noveltts
 
 import android.content.Intent
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -15,6 +16,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Log.i(TAG, "onCreate intent=$intent")
         handleSharedText(intent)
         handlePackInstall(intent)
         handleCatalogIntent(intent)
@@ -33,6 +35,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        Log.i(TAG, "onNewIntent intent=$intent")
         handleSharedText(intent)
         handlePackInstall(intent)
         handleCatalogIntent(intent)
@@ -52,6 +55,7 @@ class MainActivity : ComponentActivity() {
      */
     private fun handlePackInstall(intent: Intent?) {
         val url = intent?.getStringExtra(EXTRA_PACK_URL)?.trim().orEmpty()
+        Log.i(TAG, "handlePackInstall url='$url'")
         if (url.isEmpty()) return
         viewModel.installPackFromUrl(url)
     }
@@ -65,6 +69,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private companion object {
+        const val TAG = "MainActivity"
         const val EXTRA_PACK_URL = "packUrl"
         const val EXTRA_CATALOG_URL = "catalog"
         const val EXTRA_OPEN = "open"

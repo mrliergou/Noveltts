@@ -444,7 +444,6 @@ private fun PackCard(pack: VoicePack, busy: Boolean, onRemove: () -> Unit) {
             val meta = buildString {
                 append("${pack.voices.size} 个音色")
                 if (pack.author.isNotBlank()) append(" · ${pack.author}")
-                append(" · ").append(pack.format.name)
             }
             Text(text = meta, style = MaterialTheme.typography.labelSmall, color = Muted)
             if (pack.description.isNotBlank()) {
