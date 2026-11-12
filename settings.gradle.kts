@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "MultiTTS"
+rootProject.name = "NovelTTS"
 include(":app")

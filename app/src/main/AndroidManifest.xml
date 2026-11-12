@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 微软语音 SDK 的清单会合并进 RECORD_AUDIO；本应用只做合成、不录音，移除以免误导向用户要麦克风权限。 -->
+    <uses-permission
+        android:name="android.permission.RECORD_AUDIO"
+        tools:node="remove" />
     <queries>
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />

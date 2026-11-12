@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-    构建 MultiTTS 复刻版。
+    构建 NovelTTS。
 
 .DESCRIPTION
     统一设置 Android SDK、Gradle Home、离线依赖缓存后再调用 Gradle，避免每次手写一长串环境变量。

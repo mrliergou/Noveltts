@@ -1,6 +1,6 @@
-# MultiTTS 复刻版开发交接
+# NovelTTS 开发交接
 
-最后更新：2026-11-12（第二次更新：界面已重建并编译通过）  
+最后更新：2026-11-12（第三次更新：项目改名 NovelTTS，包名迁移到 `app.noveltts`）  
 项目根目录：`F:\codex\MultiTTS`  
 目标设备：`M2102J2SC`，Android 13 / SDK 33，arm64-v8a，adb 序列号记录为 `5cb24277`
 
@@ -14,6 +14,10 @@
 2. 用只读方式核对 `ui/MainViewModel.kt`、`MainActivity.kt`、`service/MultiTtsService.kt` 的实际 API。
 3. 接上设备（`adb devices` 应出现 `5cb24277`）后按 §4 的验收清单跑真机验证。
 4. 验证新发现的问题优先于新功能。
+
+**改名说明（2026-11-12）：** 应用名 `NovelTTS`，`namespace`/`applicationId` 均为 `app.noveltts`，源码目录 `app/src/main/java/app/noveltts/`。
+系统的音色前缀**仍然是** `multitts:<packId>:<engineCode>:<voiceCode>`——它是已保存的协议标识，改名会让用户已选音色全部失效，所以没有跟着改。
+包名变化意味着旧的 `org.nobody.multitts.replica` 装不上也升不上，**必须卸载重装**，装完还要在系统设置里重新选一次默认引擎。
 
 **工作区已在提交 `f9da1eb` 收口**（界面重建 + 引擎/管线接入 + 打包修复）。本地 119 MB 测试包 `语音包\【离线】 微软官方语音（晓晓+云希）(1).zip` 已加入 `.gitignore`，**不要提交**。不要执行 `git reset --hard`、`git clean -fdx` 或回滚已完成改动。
 
@@ -401,7 +405,7 @@ synthesizer.SpeakSsml(ssml)
 
 ### P1：已完成（2026-11-12）
 
-- 新增 `app/src/main/java/org/nobody/multitts/replica/ui/engine/EngineSupportActivities.kt`：
+- 新增 `app/src/main/java/app/noveltts/ui/engine/EngineSupportActivities.kt`：
   - `TtsCheckDataActivity`：响应 `android.speech.tts.engine.CHECK_TTS_DATA`，回传 `EXTRA_AVAILABLE_VOICES` / `EXTRA_UNAVAILABLE_VOICES`（后者含缺许可证的离线音色）。
   - `TtsSampleTextActivity`：响应 `android.speech.tts.engine.GET_SAMPLE_TEXT`，按 `language` extra 返回中/英示例文本。
   - `TtsConfigureActivity`：响应 `android.speech.tts.engine.CONFIGURE_ENGINE`，打开主界面。
@@ -582,7 +586,7 @@ UI 显示名可以变，系统 ID 不能随意变，否则已保存的默认音�
 
 数据：
 
-- `app/src/main/java/org/nobody/multitts/replica/data/voicepack/VoicePack.kt`
+- `app/src/main/java/app/noveltts/data/voicepack/VoicePack.kt`
 - `.../OriginalPackParser.kt`
 - `.../VoicePackStore.kt`
 - `.../VoiceRegistry.kt`
@@ -619,8 +623,8 @@ UI：
 
 测试：
 
-- `app/src/test/java/org/nobody/multitts/replica/engine/edge/EdgeGecTest.kt`
-- `app/src/test/java/org/nobody/multitts/replica/domain/TextPipelineTest.kt`
+- `app/src/test/java/app/noveltts/engine/edge/EdgeGecTest.kt`
+- `app/src/test/java/app/noveltts/domain/TextPipelineTest.kt`
 
 ## 8. 新会话推荐开场动作
 

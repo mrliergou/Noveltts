@@ -11,7 +11,7 @@ param(
     [string]$SdkPath,
     [switch]$Rebuild,
     [switch]$NoLaunch,
-    [string]$Activity = 'org.nobody.multitts.replica/.MainActivity'
+    [string]$Activity = 'app.noveltts/.MainActivity'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,15 +54,15 @@ Write-Host "[install] apk    = $apk" -ForegroundColor DarkGray
 if ($LASTEXITCODE -ne 0) {
     if (($out | Out-String) -match 'INSTALL_FAILED_UPDATE_INCOMPATIBLE') {
         Write-Host '签名与原安装包不一致。确认可以清数据后执行：' -ForegroundColor Yellow
-        Write-Host "  & '$adb' -s $Serial uninstall org.nobody.multitts.replica" -ForegroundColor Yellow
+        Write-Host "  & '$adb' -s $Serial uninstall app.noveltts" -ForegroundColor Yellow
     }
     exit 1
 }
 
-$version = (& $adb -s $Serial shell "dumpsys package org.nobody.multitts.replica | grep -m1 versionName").Trim()
+$version = (& $adb -s $Serial shell "dumpsys package app.noveltts | grep -m1 versionName").Trim()
 Write-Host "[install] $version" -ForegroundColor DarkGray
 
 if (-not $NoLaunch) {
-    & $adb -s $Serial shell "am force-stop org.nobody.multitts.replica"
+    & $adb -s $Serial shell "am force-stop app.noveltts"
     & $adb -s $Serial shell "am start -W -n $Activity"
 }

@@ -148,13 +148,13 @@ packId = "vp-" + sha256(config.yaml + 0x00 + engines.yaml).take(16)
 
 ```powershell
 # 直接安装 zip 直链
-adb shell am start --es packUrl "http://127.0.0.1:8765/pack.zip" -n org.nobody.multitts.replica/.MainActivity
+adb shell am start --es packUrl "http://127.0.0.1:8765/pack.zip" -n app.noveltts/.MainActivity
 
 # 设置在线目录并刷新
-adb shell am start --es catalog "http://127.0.0.1:8765/catalog.json" -n org.nobody.multitts.replica/.MainActivity
+adb shell am start --es catalog "http://127.0.0.1:8765/catalog.json" -n app.noveltts/.MainActivity
 
 # 直接打开语音包页
-adb shell am start --es open voicepacks -n org.nobody.multitts.replica/.MainActivity
+adb shell am start --es open voicepacks -n app.noveltts/.MainActivity
 ```
 
 期望日志：

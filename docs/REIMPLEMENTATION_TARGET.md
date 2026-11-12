@@ -1,4 +1,4 @@
-# MultiTTS Kotlin 重实现目标
+# NovelTTS Kotlin 重实现目标
 
 本文是后续 Kotlin 重实现的产品与行为目标。实现者应先读本文，再按阶段开发并更新验收状态。除非注明，本文中的“原版行为”来自 APK 静态证据，不代表已经在设备上动态验证。
 
@@ -49,7 +49,7 @@
 | 已安装 TTS 引擎 | 仅两个：`com.xiaomi.mibrain.speech`（`com.xiaomi.mibrain.speech.tts.TtsService`）、原版 `org.nobody.multitts`（`org.nobody.multitts.service.TTSService`） |
 | 系统默认合成引擎 | `org.nobody.multitts`（即原版），见 `settings get secure tts_default_synth` |
 | 原版实际版本 | `versionName=1.5.6`、`versionCode=57`、`targetSdk=34` |
-| 复刻版（重装后） | `org.nobody.multitts.replica` v1.0.0，可启动，`am start` 返回 ok，进程存活，无自身崩溃 |
+| 复刻版（重装后） | `app.noveltts` v1.0.0，可启动，`am start` 返回 ok，进程存活，无自身崩溃 |
 | 设备限制 | MIUI 拒绝 `adb shell input` 注入（`SecurityException: INJECT_EVENTS`），UI 自动化需先解锁或改用模拟器 |
 
 结论：本机可用的委托后端只有小米引擎与原版引擎，**没有可扫描的本地模型库**；这决定了 P0 必须先把"委托代理"链路做实。
@@ -190,7 +190,7 @@ Android TextToSpeechService -> domain synthesis coordinator
 
 ## 7. 当前 Kotlin 复刻版进展
 
-`org.nobody.multitts.replica` 已从「委托系统引擎转发」改为**真实引擎实现**：
+`app.noveltts` 已从「委托系统引擎转发」改为**真实引擎实现**：
 自己解析语音包（原版 `config.yaml` + `engines.yaml`），走 Edge 在线与微软嵌入式离线两个后端合成，
 并把结果以系统 `TextToSpeechService` 的身份回传。
 

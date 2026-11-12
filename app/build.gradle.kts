@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "org.nobody.multitts.replica"
+    namespace = "app.noveltts"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "org.nobody.multitts.replica"
+        applicationId = "app.noveltts"
         minSdk = 26
         targetSdk = 35
         versionCode = 1

@@ -1,16 +1,16 @@
-# MultiTTS 复刻版
+# NovelTTS
 
-用 Kotlin + Jetpack Compose 重实现 [`org.nobody.multitts`](https://github.com/jing332/tts-server-android) 一类的
-**Android TTS 引擎**：应用自己解析语音包、自己合成音频，作为系统 TTS provider 被其他应用调用，
-而不是把朗读转发给别的引擎。
+NovelTTS 是一个用 Kotlin + Jetpack Compose 写的 **Android TTS 引擎**：自己解析语音包、自己合成音频，
+作为系统 TTS provider 被阅读器/浏览器等应用调用，而不是把朗读转发给别的引擎。
 
-复刻版包名 `org.nobody.multitts.replica`，可与原版共存安装，方便真机对照。
+项目起点是重实现 [`org.nobody.multitts`](https://github.com/jing332/tts-server-android)（MultiTTS）的行为，
+现在已独立成型：包名 `app.noveltts`，与原版 MultiTTS 可共存安装，方便真机对照。
 
 > **当前状态**：`:app:assembleDebug` 通过，13 个单元测试全绿，APK 可产出；
 > **但真机运行尚未验证**（Edge 是否真能出声、系统 TTS 是否真调到本应用、界面截图验收都还没做）。
 > 详见 [HANDOFF.md](HANDOFF.md) 的状态与卡点章节。
 
-## 与旧版的区别
+## 与原版 MultiTTS 的区别
 
 旧版本只做「委托代理」：把文本转给设备上另一个 TTS，再把 WAV 回传，本身没有音色。
 现在改为真正的引擎实现：
@@ -53,7 +53,7 @@
 ## 目录
 
 ```
-app/src/main/java/org/nobody/multitts/replica/
+app/src/main/java/app/noveltts/
 ├── MainActivity.kt              # 入口：分享文本、packUrl、catalog、open=voicepacks
 ├── data/
 │   ├── config/RulesRepository   # 角色/替换规则 JSON 持久化
@@ -121,14 +121,14 @@ adb reverse tcp:8765 tcp:8765
 python -m http.server 8765
 
 # 直接安装 zip 直链 / 设置在线目录
-adb shell am start --es packUrl "http://127.0.0.1:8765/pack.zip" -n org.nobody.multitts.replica/.MainActivity
-adb shell am start --es catalog "http://127.0.0.1:8765/catalog.json" -n org.nobody.multitts.replica/.MainActivity
+adb shell am start --es packUrl "http://127.0.0.1:8765/pack.zip" -n app.noveltts/.MainActivity
+adb shell am start --es catalog "http://127.0.0.1:8765/catalog.json" -n app.noveltts/.MainActivity
 ```
 
 ## 作为系统 TTS 使用
 
 1. 安装并打开应用，在「语音包」里导入语音包；
-2. 系统设置 → 语音合成（部分 ROM 在「无障碍」）→ 首选引擎选 **MultiTTS 复刻版**；
+2. 系统设置 → 语音合成（部分 ROM 在「无障碍」）→ 首选引擎选 **NovelTTS**；
 3. 其他应用调用 TTS 时，系统只会看到 `usable=true` 的 `multitts:...` 音色；
 4. 想验证引擎被调用：`adb logcat -s MultiTtsService`，应看到 `synthesize` 相关日志。
 
