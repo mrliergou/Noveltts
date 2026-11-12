@@ -1,11 +1,13 @@
 package org.nobody.multitts.replica.ui
 
 import android.app.Application
-import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioTrack
 import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -14,137 +16,358 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.nobody.multitts.replica.data.SpeechController
-import org.nobody.multitts.replica.data.SpeechEngineState
-import org.nobody.multitts.replica.data.SpeechVoice
+import org.nobody.multitts.replica.data.config.RulesRepository
+import org.nobody.multitts.replica.data.settings.SettingsStore
 import org.nobody.multitts.replica.data.voicepack.CatalogEntry
-import org.nobody.multitts.replica.data.voicepack.PackVoice
+import org.nobody.multitts.replica.data.voicepack.VoiceDescriptor
 import org.nobody.multitts.replica.data.voicepack.VoicePack
 import org.nobody.multitts.replica.data.voicepack.VoicePackCatalog
+import org.nobody.multitts.replica.data.voicepack.VoicePackEvents
 import org.nobody.multitts.replica.data.voicepack.VoicePackStore
-import org.nobody.multitts.replica.engine.EngineCatalog
-import org.nobody.multitts.replica.engine.TtsEngineInfo
+import org.nobody.multitts.replica.data.voicepack.VoiceRegistry
+import org.nobody.multitts.replica.domain.PipelineIssue
+import org.nobody.multitts.replica.domain.ReplacementRule
+import org.nobody.multitts.replica.domain.RoleRule
+import org.nobody.multitts.replica.domain.SynthesisPlanBuilder
+import org.nobody.multitts.replica.domain.TextPipeline
+import org.nobody.multitts.replica.engine.EngineManager
+import org.nobody.multitts.replica.engine.MultiSegmentSynthesizer
+import org.nobody.multitts.replica.engine.api.SynthesisError
+import org.nobody.multitts.replica.engine.api.SynthesisHandle
+import org.nobody.multitts.replica.engine.api.SynthesisListener
 import java.io.File
 
+enum class AppSection(val label: String) {
+    WORKBENCH("工作台"),
+    PACKS("语音包"),
+    ROLES("角色"),
+    REPLACEMENTS("替换"),
+    SETTINGS("设置"),
+}
+
+data class PreviewSegment(
+    val text: String,
+    val isDialogue: Boolean,
+    val voiceName: String,
+    val roleName: String?,
+)
+
 data class MainUiState(
+    val section: AppSection = AppSection.WORKBENCH,
     val text: String = "",
     val speed: Int = 50,
     val volume: Int = 50,
     val pitch: Int = 25,
-    val engines: List<TtsEngineInfo> = emptyList(),
-    val enginePackage: String? = null,
-    val systemDefaultPackage: String? = null,
-    val speech: SpeechEngineState = SpeechEngineState(),
-    val roles: Set<String> = emptySet(),
-    val replacements: Set<String> = emptySet(),
+    val narratorVoiceId: String = "",
+    val dialogueVoiceId: String = "",
+    val systemVoiceId: String = "",
+    val voices: List<VoiceDescriptor> = emptyList(),
     val packs: List<VoicePack> = emptyList(),
+    val roles: List<RoleRule> = emptyList(),
+    val replacements: List<ReplacementRule> = emptyList(),
+    val preview: List<PreviewSegment> = emptyList(),
+    val pipelineIssues: List<PipelineIssue> = emptyList(),
+    val punctuationFilter: Boolean = true,
+    val licenseConfigured: Boolean = false,
+    val licenseMask: String = "",
+    val edgeEndpoint: String = SettingsStore.DEFAULT_EDGE_ENDPOINT,
+    val compatibilityProxy: Boolean = false,
+    val isSpeaking: Boolean = false,
+    val statusMessage: String = "导入语音包后即可在系统 TTS 中选择 MultiTTS 音色。",
     val catalog: List<CatalogEntry> = emptyList(),
     val catalogUrl: String = "",
     val packBusyId: String? = null,
     val packProgress: Int = -1,
     val packStatus: String? = null,
-)
+) {
+    val usableVoices: List<VoiceDescriptor> get() = voices.filter { it.usable }
+}
 
-class MainViewModel(
-    application: Application,
-    savedStateHandle: SavedStateHandle,
-) : AndroidViewModel(application) {
-    private val preferences = application.getSharedPreferences("multitts", Context.MODE_PRIVATE)
-    private val engines = EngineCatalog.installedEngines(application)
-    private val systemDefaultPackage = EngineCatalog.defaultEnginePackage(application)
-    private val initialEngine: String? = savedStateHandle.get<String>(EXTRA_ENGINE)
-        ?.takeIf { it.isNotBlank() }
-        ?: preferences.getString(KEY_ENGINE, null)
-            ?.takeIf { saved -> engines.any { it.packageName == saved } }
-    private val _uiState = MutableStateFlow(loadInitialState())
-    val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
-    private val speechController = SpeechController(
-        context = application,
-        onStateChanged = ::onSpeechStateChanged,
-        enginePackage = initialEngine,
-    )
+class MainViewModel(application: Application) : AndroidViewModel(application) {
+    private val preferences = application.getSharedPreferences("multitts", android.content.Context.MODE_PRIVATE)
+    private val settings = SettingsStore(application)
     private val packStore = VoicePackStore(application)
+    private val registry = VoiceRegistry(application, packStore)
+    private val rulesRepository = RulesRepository(application)
+    private val engines = EngineManager(application, settings)
+    private val synthesizer = MultiSegmentSynthesizer(engines)
+    private val trackLock = Any()
+
+    private var playbackHandle: SynthesisHandle? = null
+    private var audioTrack: AudioTrack? = null
+
+    private val _uiState = MutableStateFlow(loadBaseState())
+    val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
     init {
-        speechController.initialize()
-        val installed = packStore.installed()
-        Log.i(TAG, "packs loaded: ${installed.size} (${installed.joinToString { "${it.id}@${it.version}" }})")
-        _uiState.update {
-            it.copy(
-                packs = installed,
-                catalogUrl = preferences.getString(KEY_CATALOG_URL, DEFAULT_CATALOG_URL).orEmpty(),
-            )
-        }
+        refreshAll()
+    }
+
+    fun selectSection(section: AppSection) {
+        _uiState.update { it.copy(section = section) }
     }
 
     fun updateText(value: String) {
         _uiState.update { it.copy(text = value) }
         preferences.edit().putString(KEY_LAST_TEXT, value).apply()
+        refreshPreview()
     }
 
-    fun updateSpeed(value: Int) = updateSetting(KEY_SPEED, value) { state, progress ->
+    fun updateSpeed(value: Int) = updateSlider(KEY_SPEED, value) { state, progress ->
         state.copy(speed = progress)
     }
 
-    fun updateVolume(value: Int) = updateSetting(KEY_VOLUME, value) { state, progress ->
+    fun updateVolume(value: Int) = updateSlider(KEY_VOLUME, value) { state, progress ->
         state.copy(volume = progress)
     }
 
-    fun updatePitch(value: Int) = updateSetting(KEY_PITCH, value) { state, progress ->
+    fun updatePitch(value: Int) = updateSlider(KEY_PITCH, value) { state, progress ->
         state.copy(pitch = progress)
     }
 
-    fun selectEngine(packageName: String?) {
-        val normalized = packageName?.takeIf { it.isNotBlank() }
-        if (normalized == _uiState.value.enginePackage) return
-        preferences.edit().putString(KEY_ENGINE, normalized.orEmpty()).remove(KEY_VOICE).apply()
-        _uiState.update { it.copy(enginePackage = normalized) }
-        speechController.useEngine(normalized)
+    fun selectNarrator(voiceId: String) {
+        settings.narratorVoice = voiceId
+        _uiState.update { it.copy(narratorVoiceId = voiceId) }
+        refreshPreview()
     }
 
-    fun selectVoice(voice: SpeechVoice) {
-        preferences.edit().putString(KEY_VOICE, voice.name).apply()
-        speechController.selectVoice(voice.name)
+    fun selectDialogue(voiceId: String) {
+        settings.dialogueVoice = voiceId
+        _uiState.update { it.copy(dialogueVoiceId = voiceId) }
+        refreshPreview()
     }
 
-    fun speak() {
-        val state = _uiState.value
-        speechController.speak(state.text, state.speed, state.pitch, state.volume)
+    fun selectSystemVoice(voiceId: String) {
+        settings.systemVoice = voiceId
+        _uiState.update { it.copy(systemVoiceId = voiceId) }
+        VoicePackEvents.notifyChanged(getApplication())
     }
 
-    fun stop() = speechController.stop()
-
-    fun addRole(value: String) = updateCollection(KEY_ROLES, value) { roles ->
-        copy(roles = roles)
+    fun setPunctuationFilter(enabled: Boolean) {
+        settings.punctuationFilter = enabled
+        _uiState.update { it.copy(punctuationFilter = enabled) }
+        refreshPreview()
     }
 
-    fun removeRole(value: String) = removeFromCollection(KEY_ROLES, value) { roles ->
-        copy(roles = roles)
-    }
-
-    fun addReplacement(find: String, replaceWith: String) {
-        if (find.isBlank()) return
-        val entry = "$find → $replaceWith"
-        updateCollection(KEY_REPLACEMENTS, entry) { replacements ->
-            copy(replacements = replacements)
+    fun setLicense(value: String) {
+        settings.setLicense(value)
+        VoicePackEvents.notifyChanged(getApplication())
+        refreshAll()
+        _uiState.update {
+            it.copy(
+                statusMessage = if (value.isBlank()) {
+                    "已清除 Embedded Speech 许可证。"
+                } else {
+                    "许可证已加密保存，离线音色重新扫描完成。"
+                },
+            )
         }
     }
 
-    fun removeReplacement(value: String) = removeFromCollection(KEY_REPLACEMENTS, value) { replacements ->
-        copy(replacements = replacements)
+    fun setEdgeEndpoint(value: String) {
+        settings.edgeEndpoint = value
+        _uiState.update {
+            it.copy(
+                edgeEndpoint = settings.edgeEndpoint,
+                statusMessage = "Edge 端点已保存，下一次在线合成生效。",
+            )
+        }
+    }
+
+    fun setCompatibilityProxy(enabled: Boolean) {
+        settings.compatibilityProxy = enabled
+        _uiState.update { it.copy(compatibilityProxy = enabled) }
     }
 
     fun clearRecentText() {
         preferences.edit().remove(KEY_LAST_TEXT).apply()
         _uiState.update { it.copy(text = "") }
+        refreshPreview()
     }
+
+    fun speak() {
+        val state = _uiState.value
+        if (state.usableVoices.isEmpty()) {
+            _uiState.update { it.copy(statusMessage = "还没有可用音色，请先导入语音包或配置离线许可证。") }
+            return
+        }
+        val plan = SynthesisPlanBuilder.build(
+            text = state.text,
+            narratorVoiceId = state.narratorVoiceId,
+            dialogueVoiceId = state.dialogueVoiceId,
+            roles = state.roles,
+            replacements = state.replacements,
+            filterPurePunctuation = state.punctuationFilter,
+            voices = state.voices,
+        )
+        if (plan.segments.isEmpty()) {
+            _uiState.update { it.copy(statusMessage = "没有可朗读的文本片段。") }
+            return
+        }
+        stopPlayback(updateState = false)
+        _uiState.update {
+            it.copy(
+                isSpeaking = true,
+                statusMessage = "正在合成本地预览…",
+                pipelineIssues = plan.pipeline.issues,
+            )
+        }
+        val listener = object : SynthesisListener {
+            override fun onStart(sampleRateHz: Int, audioFormat: Int, channelCount: Int) {
+                val track = runCatching {
+                    createAudioTrack(sampleRateHz, audioFormat, channelCount)
+                }.getOrElse { error ->
+                    _uiState.update {
+                        it.copy(isSpeaking = false, statusMessage = "无法创建音频输出：${error.message}")
+                    }
+                    playbackHandle?.cancel()
+                    return
+                }
+                synchronized(trackLock) {
+                    audioTrack = track
+                }
+                runCatching { track.play() }
+                _uiState.update { it.copy(isSpeaking = true, statusMessage = "正在朗读") }
+            }
+
+            override fun onAudio(pcm: ByteArray, offset: Int, length: Int) {
+                val track = synchronized(trackLock) { audioTrack } ?: return
+                val written = track.write(pcm, offset, length, AudioTrack.WRITE_BLOCKING)
+                if (written < 0) {
+                    _uiState.update {
+                        it.copy(isSpeaking = false, statusMessage = "音频输出失败（code=$written）")
+                    }
+                    playbackHandle?.cancel()
+                }
+            }
+
+            override fun onComplete() {
+                releaseTrack()
+                playbackHandle = null
+                _uiState.update { it.copy(isSpeaking = false, statusMessage = "朗读完成") }
+            }
+
+            override fun onError(code: Int, message: String?) {
+                releaseTrack()
+                playbackHandle = null
+                _uiState.update {
+                    it.copy(
+                        isSpeaking = false,
+                        statusMessage = when (code) {
+                            SynthesisError.LICENSE_REQUIRED -> "需要先在设置中配置 Embedded Speech 许可证"
+                            SynthesisError.NETWORK_FAILED -> "在线语音失败：${message ?: "网络错误"}"
+                            else -> "合成失败：${message ?: "未知错误"}"
+                        },
+                    )
+                }
+            }
+        }
+        playbackHandle = synthesizer.synthesize(
+            segments = plan.segments,
+            rate = sliderToRate(state.speed),
+            pitch = sliderToPitch(state.pitch),
+            volume = sliderToVolume(state.volume),
+            listener = listener,
+        )
+    }
+
+    fun stop() {
+        stopPlayback(updateState = true)
+    }
+
+    fun refreshAll() {
+        val packs = packStore.installed()
+        val voices = registry.voices(settings.hasLicense())
+        val narrator = voices.firstOrNull {
+            it.usable && it.systemName == settings.narratorVoice
+        } ?: voices.firstOrNull { it.usable }
+        val dialogue = voices.firstOrNull {
+            it.usable && it.systemName == settings.dialogueVoice
+        } ?: narrator
+        val systemVoice = voices.firstOrNull {
+            it.usable && it.systemName == settings.systemVoice
+        } ?: narrator
+        _uiState.update {
+            it.copy(
+                packs = packs,
+                voices = voices,
+                roles = rulesRepository.loadRoles(),
+                replacements = rulesRepository.loadReplacements(),
+                narratorVoiceId = narrator?.systemName.orEmpty(),
+                dialogueVoiceId = dialogue?.systemName.orEmpty(),
+                systemVoiceId = systemVoice?.systemName.orEmpty(),
+                punctuationFilter = settings.punctuationFilter,
+                licenseConfigured = settings.hasLicense(),
+                licenseMask = settings.licenseMask(),
+                edgeEndpoint = settings.edgeEndpoint,
+                compatibilityProxy = settings.compatibilityProxy,
+                catalogUrl = preferences.getString(KEY_CATALOG_URL, "").orEmpty(),
+            )
+        }
+        refreshPreview()
+    }
+
+    fun saveRole(rule: RoleRule) {
+        val rules = _uiState.value.roles.toMutableList()
+        val index = rules.indexOfFirst { it.id == rule.id }
+        if (index >= 0) rules[index] = rule else rules += rule
+        val sorted = rules.sortedWith(
+            compareByDescending<RoleRule> { it.priority }.thenBy { it.name },
+        )
+        rulesRepository.saveRoles(sorted)
+        _uiState.update { it.copy(roles = sorted, statusMessage = "角色规则已保存") }
+        refreshPreview()
+    }
+
+    fun deleteRole(rule: RoleRule) {
+        val rules = _uiState.value.roles.filterNot { it.id == rule.id }
+        rulesRepository.saveRoles(rules)
+        _uiState.update { it.copy(roles = rules, statusMessage = "已删除角色规则「${rule.name}」") }
+        refreshPreview()
+    }
+
+    fun toggleRole(rule: RoleRule, enabled: Boolean) {
+        saveRole(rule.copy(enabled = enabled))
+    }
+
+    fun saveReplacement(rule: ReplacementRule) {
+        val rules = _uiState.value.replacements.toMutableList()
+        val index = rules.indexOfFirst { it.id == rule.id }
+        if (index >= 0) rules[index] = rule else rules += rule
+        val sorted = rules.sortedBy { it.order }
+        rulesRepository.saveReplacements(sorted)
+        _uiState.update { it.copy(replacements = sorted, statusMessage = "替换规则已保存") }
+        refreshPreview()
+    }
+
+    fun deleteReplacement(rule: ReplacementRule) {
+        val rules = _uiState.value.replacements.filterNot { it.id == rule.id }
+        rulesRepository.saveReplacements(rules)
+        _uiState.update {
+            it.copy(replacements = rules, statusMessage = "已删除替换规则「${rule.name}」")
+        }
+        refreshPreview()
+    }
+
+    fun toggleReplacement(rule: ReplacementRule, enabled: Boolean) {
+        saveReplacement(rule.copy(enabled = enabled))
+    }
+
+    fun testReplacements(text: String): String = TextPipeline.build(
+        text = text,
+        narratorVoiceId = null,
+        dialogueVoiceId = null,
+        roles = emptyList(),
+        replacements = _uiState.value.replacements,
+        filterPurePunctuation = false,
+    ).transformedText
 
     fun setCatalogUrl(url: String) {
-        preferences.edit().putString(KEY_CATALOG_URL, url.trim()).apply()
-        _uiState.update { it.copy(catalogUrl = url.trim()) }
+        val normalized = url.trim()
+        preferences.edit().putString(KEY_CATALOG_URL, normalized).apply()
+        _uiState.update { it.copy(catalogUrl = normalized) }
     }
 
-    /** 从 SAF 选中的 zip 导入语音包。 */
     fun importPack(uri: Uri) {
         val resolver = getApplication<Application>().contentResolver
         updatePackBusy(PACK_BUSY_IMPORT, "正在导入语音包…")
@@ -158,7 +381,9 @@ class MainViewModel(
             }
             finishPackOperation(
                 result = result,
-                success = { pack -> "已导入「${pack.name}」v${pack.version}，共 ${pack.voices.size} 个音色" },
+                success = { pack ->
+                    "已导入「${pack.name}」，共 ${pack.voices.size} 个音色"
+                },
                 failure = { error -> "导入失败：${error.message ?: error.javaClass.simpleName}" },
             )
         }
@@ -174,7 +399,6 @@ class MainViewModel(
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) { runCatching { VoicePackCatalog.fetch(url) } }
             result.onSuccess { entries ->
-                Log.i(TAG, "catalog loaded: ${entries.size} entries from $url")
                 _uiState.update {
                     it.copy(
                         catalog = entries,
@@ -218,13 +442,12 @@ class MainViewModel(
             }
             finishPackOperation(
                 result = result,
-                success = { pack -> "已安装「${pack.name}」v${pack.version}，共 ${pack.voices.size} 个音色" },
+                success = { pack -> "已安装「${pack.name}」，共 ${pack.voices.size} 个音色" },
                 failure = { error -> "下载失败：${error.message ?: error.javaClass.simpleName}" },
             )
         }
     }
 
-    /** 直接按 zip 直链安装语音包（供外部链接 / 自动化验证使用）。 */
     fun installPackFromUrl(url: String) {
         val normalized = url.trim()
         if (normalized.isEmpty() || _uiState.value.packBusyId != null) return
@@ -252,7 +475,7 @@ class MainViewModel(
             }
             finishPackOperation(
                 result = result,
-                success = { pack -> "已安装「${pack.name}」v${pack.version}，共 ${pack.voices.size} 个音色" },
+                success = { pack -> "已安装「${pack.name}」，共 ${pack.voices.size} 个音色" },
                 failure = { error -> "安装失败：${error.message ?: error.javaClass.simpleName}" },
             )
         }
@@ -261,35 +484,24 @@ class MainViewModel(
     fun removePack(pack: VoicePack) {
         viewModelScope.launch {
             val removed = withContext(Dispatchers.IO) { packStore.delete(pack.id) }
+            if (removed) {
+                VoicePackEvents.notifyChanged(getApplication())
+                refreshAll()
+            }
             _uiState.update {
-                it.copy(
-                    packs = packStore.installed(),
-                    packStatus = if (removed) "已删除「${pack.name}」" else "删除失败：${pack.name}",
-                )
+                it.copy(packStatus = if (removed) "已删除「${pack.name}」" else "删除失败：${pack.name}")
             }
         }
     }
 
-    /** 应用语音包中的音色：切换其绑定的引擎，并选中引擎内对应的语音。 */
-    fun applyPackVoice(pack: VoicePack, voice: PackVoice) {
-        val engine = voice.engine
-        if (engine != null && engine != _uiState.value.enginePackage) {
-            selectEngine(engine)
-        }
-        val voiceName = voice.voiceName
-        if (voiceName.isNullOrBlank()) {
-            _uiState.update {
-                it.copy(packStatus = "「${voice.name}」尚未绑定引擎内语音名，只切换了引擎")
-            }
-            return
-        }
-        preferences.edit().putString(KEY_VOICE, voiceName).apply()
-        speechController.selectVoice(voiceName)
-        _uiState.update { it.copy(packStatus = "已切换到「${pack.name} · ${voice.name}」") }
-    }
+    fun voiceDisplayName(voiceId: String?): String =
+        _uiState.value.voices.firstOrNull { it.systemName == voiceId }?.displayName
+            ?: "未选择"
 
-    private fun updatePackBusy(id: String, status: String) {
-        _uiState.update { it.copy(packBusyId = id, packProgress = -1, packStatus = status) }
+    override fun onCleared() {
+        stopPlayback(updateState = false)
+        synthesizer.shutdown()
+        super.onCleared()
     }
 
     private fun finishPackOperation(
@@ -297,9 +509,12 @@ class MainViewModel(
         success: (VoicePack) -> String,
         failure: (Throwable) -> String,
     ) {
-        _uiState.update { current ->
-            current.copy(
-                packs = packStore.installed(),
+        result.onSuccess {
+            VoicePackEvents.notifyChanged(getApplication())
+            refreshAll()
+        }
+        _uiState.update {
+            it.copy(
                 packBusyId = null,
                 packProgress = -1,
                 packStatus = result.fold(success, failure),
@@ -307,23 +522,49 @@ class MainViewModel(
         }
     }
 
-    override fun onCleared() {
-        speechController.shutdown()
-        super.onCleared()
+    private fun updatePackBusy(id: String, status: String) {
+        _uiState.update { it.copy(packBusyId = id, packProgress = -1, packStatus = status) }
     }
 
-    private fun onSpeechStateChanged(speechState: SpeechEngineState) {
-        val savedVoice = preferences.getString(KEY_VOICE, null)
-        val preferredVoice = savedVoice
-            ?.takeIf { name -> speechState.voices.any { it.name == name } }
-        if (preferredVoice != null && preferredVoice != speechState.selectedVoice) {
-            speechController.selectVoice(preferredVoice)
-            return
+    private fun refreshPreview() {
+        val state = _uiState.value
+        val result = TextPipeline.build(
+            text = state.text,
+            narratorVoiceId = state.narratorVoiceId,
+            dialogueVoiceId = state.dialogueVoiceId,
+            roles = state.roles,
+            replacements = state.replacements,
+            filterPurePunctuation = state.punctuationFilter,
+        )
+        val names = state.voices.associate { it.systemName to it.displayName }
+        val preview = result.segments.map { segment ->
+            PreviewSegment(
+                text = segment.text,
+                isDialogue = segment.isDialogue,
+                voiceName = names[segment.voiceId] ?: "未选择音色",
+                roleName = segment.roleName,
+            )
         }
-        _uiState.update { current -> current.copy(speech = speechState) }
+        _uiState.update { it.copy(preview = preview, pipelineIssues = result.issues) }
     }
 
-    private fun updateSetting(
+    private fun loadBaseState(): MainUiState = MainUiState(
+        text = preferences.getString(KEY_LAST_TEXT, "").orEmpty(),
+        speed = preferences.getInt(KEY_SPEED, 50),
+        volume = preferences.getInt(KEY_VOLUME, 50),
+        pitch = preferences.getInt(KEY_PITCH, 25),
+        narratorVoiceId = settings.narratorVoice,
+        dialogueVoiceId = settings.dialogueVoice,
+        systemVoiceId = settings.systemVoice,
+        punctuationFilter = settings.punctuationFilter,
+        licenseConfigured = settings.hasLicense(),
+        licenseMask = settings.licenseMask(),
+        edgeEndpoint = settings.edgeEndpoint,
+        compatibilityProxy = settings.compatibilityProxy,
+        catalogUrl = preferences.getString(KEY_CATALOG_URL, "").orEmpty(),
+    )
+
+    private fun updateSlider(
         key: String,
         value: Int,
         transform: (MainUiState, Int) -> MainUiState,
@@ -332,58 +573,72 @@ class MainViewModel(
         _uiState.update { transform(it, value) }
     }
 
-    private fun updateCollection(
-        key: String,
-        value: String,
-        updateState: MainUiState.(Set<String>) -> MainUiState,
-    ) {
-        if (value.isBlank()) return
-        val values = preferences.getStringSet(key, emptySet()).orEmpty().toMutableSet()
-        values.add(value.trim())
-        preferences.edit().putStringSet(key, values).apply()
-        _uiState.update { it.updateState(values) }
+    private fun createAudioTrack(sampleRate: Int, audioFormat: Int, channels: Int): AudioTrack {
+        val channelMask = if (channels == 1) {
+            AudioFormat.CHANNEL_OUT_MONO
+        } else {
+            AudioFormat.CHANNEL_OUT_STEREO
+        }
+        val minBuffer = AudioTrack.getMinBufferSize(sampleRate, channelMask, audioFormat)
+        val bufferSize = maxOf(minBuffer, sampleRate * 2 * channels / 4)
+        return AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(audioFormat)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(channelMask)
+                    .build(),
+            )
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .setBufferSizeInBytes(bufferSize)
+            .build()
     }
 
-    private fun removeFromCollection(
-        key: String,
-        value: String,
-        updateState: MainUiState.(Set<String>) -> MainUiState,
-    ) {
-        val values = preferences.getStringSet(key, emptySet()).orEmpty().toMutableSet()
-        values.remove(value)
-        preferences.edit().putStringSet(key, values).apply()
-        _uiState.update { it.updateState(values) }
+    private fun stopPlayback(updateState: Boolean) {
+        playbackHandle?.cancel()
+        playbackHandle = null
+        releaseTrack()
+        if (updateState) {
+            _uiState.update { it.copy(isSpeaking = false, statusMessage = "已停止朗读") }
+        }
     }
 
-    private fun loadInitialState(): MainUiState = MainUiState(
-        text = preferences.getString(KEY_LAST_TEXT, "").orEmpty(),
-        speed = preferences.getInt(KEY_SPEED, 50),
-        volume = preferences.getInt(KEY_VOLUME, 50),
-        pitch = preferences.getInt(KEY_PITCH, 25),
-        engines = engines,
-        enginePackage = initialEngine,
-        systemDefaultPackage = systemDefaultPackage,
-        roles = preferences.getStringSet(KEY_ROLES, emptySet()).orEmpty(),
-        replacements = preferences.getStringSet(KEY_REPLACEMENTS, emptySet()).orEmpty(),
-        speech = SpeechEngineState(
-            selectedVoice = preferences.getString(KEY_VOICE, "").orEmpty(),
-        ),
-    )
+    private fun releaseTrack() {
+        val track = synchronized(trackLock) {
+            val current = audioTrack
+            audioTrack = null
+            current
+        } ?: return
+        runCatching { track.stop() }
+        runCatching { track.release() }
+    }
+
+    private fun sliderToRate(value: Int): Float = if (value <= 50) {
+        (0.5f + value / 100f).coerceIn(0.5f, 1f)
+    } else {
+        (1f + (value - 50) / 50f).coerceIn(1f, 2f)
+    }
+
+    private fun sliderToPitch(value: Int): Float =
+        (0.5f + value / 50f).coerceIn(0.5f, 2f)
+
+    private fun sliderToVolume(value: Int): Float =
+        (value / 50f).coerceIn(0f, 1f)
 
     private companion object {
+        const val TAG = "MainViewModel"
         const val KEY_LAST_TEXT = "lastText"
         const val KEY_SPEED = "speed"
         const val KEY_VOLUME = "volume"
         const val KEY_PITCH = "pitch"
-        const val KEY_ENGINE = "engine"
-        const val KEY_VOICE = "voice"
-        const val KEY_ROLES = "roles"
-        const val KEY_REPLACEMENTS = "replacements"
         const val KEY_CATALOG_URL = "catalogUrl"
-        const val EXTRA_ENGINE = "engine"
         const val PACK_BUSY_IMPORT = "import"
         const val PACK_BUSY_CATALOG = "catalog"
-        const val DEFAULT_CATALOG_URL = ""
-        const val TAG = "MainViewModel"
     }
 }

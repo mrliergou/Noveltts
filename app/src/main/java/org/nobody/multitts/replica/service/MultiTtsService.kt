@@ -1,5 +1,11 @@
 package org.nobody.multitts.replica.service
 
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.media.AudioFormat
+import android.os.Build
 import android.os.Bundle
 import android.speech.tts.SynthesisCallback
 import android.speech.tts.SynthesisRequest
@@ -7,60 +13,78 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.TextToSpeechService
 import android.speech.tts.Voice
 import android.util.Log
-import org.nobody.multitts.replica.engine.EngineCatalog
+import org.nobody.multitts.replica.data.config.RulesRepository
+import org.nobody.multitts.replica.data.settings.SettingsStore
+import org.nobody.multitts.replica.data.voicepack.VoiceDescriptor
+import org.nobody.multitts.replica.data.voicepack.VoicePackEvents
+import org.nobody.multitts.replica.data.voicepack.VoicePackStore
+import org.nobody.multitts.replica.data.voicepack.VoiceRegistry
+import org.nobody.multitts.replica.domain.SynthesisPlanBuilder
+import org.nobody.multitts.replica.engine.EngineManager
+import org.nobody.multitts.replica.engine.MultiSegmentSynthesizer
 import org.nobody.multitts.replica.engine.api.SynthesisHandle
 import org.nobody.multitts.replica.engine.api.SynthesisListener
-import org.nobody.multitts.replica.engine.api.SynthesisRequest as EngineSynthesisRequest
-import org.nobody.multitts.replica.engine.proxy.SystemProxyEngine
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * 复刻版的系统 TTS 引擎入口。
+ * MultiTTS 自己的 Android TextToSpeechService。
  *
- * 从这一版开始，复刻版可以作为"系统 TTS 引擎"被设置页选中，并被任意应用调用。
- * 音频来源当前委托给另一个已安装引擎（见 [SystemProxyEngine]），后续会替换为内置模型。
- *
- * 线程模型：[onSynthesizeText] 由框架在 binder 线程调用，必须阻塞到音频写完；
- * 这里用 [CountDownLatch] 等待代理引擎的回调，[onStop] 负责提前释放。
+ * 系统只看到 usable=true 的音色；合成直接调用 Edge 或微软嵌入式引擎，不再转发给
+ * 其他已安装 TTS。离线模型未配置许可证时保留在应用内，但不暴露给系统。
  */
 class MultiTtsService : TextToSpeechService() {
-
-    private val engineRef = java.util.concurrent.atomic.AtomicReference<SystemProxyEngine?>(null)
+    private val settings by lazy { SettingsStore(this) }
+    private val packStore by lazy { VoicePackStore(this) }
+    private val registry by lazy { VoiceRegistry(this, packStore) }
+    private val rules by lazy { RulesRepository(this) }
+    private val engines by lazy { EngineManager(this, settings) }
+    private val synthesizer by lazy { MultiSegmentSynthesizer(engines) }
     private val voiceLock = Any()
 
     @Volatile
     private var cachedVoices: List<Voice> = emptyList()
 
     @Volatile
+    private var cachedDescriptors: List<VoiceDescriptor> = emptyList()
+
+    @Volatile
     private var active: ActiveSynthesis? = null
+
+    private val refreshReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            invalidateVoices()
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
-        val delegate = EngineCatalog.resolveDelegate(this)
-        if (delegate == null) {
-            Log.w(TAG, "没有可用的委托引擎，服务将以'无音源'状态运行")
-            return
+        val filter = IntentFilter(VoicePackEvents.ACTION_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(refreshReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(refreshReceiver, filter)
         }
-        Log.i(TAG, "delegating synthesis to ${delegate.packageName} / ${delegate.label}")
-        engineRef.set(SystemProxyEngine(this, delegate.packageName, delegate.label))
+        refreshVoices()
     }
 
     override fun onDestroy() {
-        engineRef.getAndSet(null)?.shutdown()
-        cachedVoices = emptyList()
+        runCatching { unregisterReceiver(refreshReceiver) }
+        active?.handle?.cancel()
+        active?.latch?.countDown()
+        active = null
+        synthesizer.shutdown()
         super.onDestroy()
     }
 
     // ---- 语言与音色 -------------------------------------------------------
 
     override fun onGetLanguage(): Array<String> {
-        val voice = ensureVoices().firstOrNull { it.locale.language == "zh" } ?: ensureVoices().firstOrNull()
-        return voice?.let {
-            arrayOf(it.locale.isO3Language, it.locale.isO3Country, it.locale.variant)
-        } ?: arrayOf("zho", "CHN", "")
+        val locale = refreshVoices().firstOrNull()?.locale ?: Locale.SIMPLIFIED_CHINESE
+        return arrayOf(locale.isO3Language, locale.isO3Country, locale.variant)
     }
 
     override fun onIsLanguageAvailable(lang: String?, country: String?, variant: String?): Int =
@@ -69,16 +93,18 @@ class MultiTtsService : TextToSpeechService() {
     override fun onLoadLanguage(lang: String?, country: String?, variant: String?): Int =
         matchLanguage(lang, country, variant)
 
-    override fun onGetVoices(): List<Voice> = ensureVoices()
+    override fun onGetVoices(): List<Voice> = refreshVoices()
 
     override fun onIsValidVoiceName(voiceName: String?): Int =
-        if (ensureVoices().any { it.name == voiceName }) TextToSpeech.SUCCESS else TextToSpeech.ERROR
+        if (refreshVoices().any { it.name == voiceName }) TextToSpeech.SUCCESS else TextToSpeech.ERROR
 
     override fun onLoadVoice(voiceName: String?): Int = onIsValidVoiceName(voiceName)
 
     override fun onGetDefaultVoiceNameFor(lang: String?, country: String?, variant: String?): String {
-        val voices = ensureVoices()
-        return voices.firstOrNull { matches(it.locale, lang, country, variant) }?.name
+        val voices = refreshVoices()
+        val configured = settings.systemVoice.takeIf { id -> voices.any { it.name == id } }
+        return configured
+            ?: voices.firstOrNull { matches(it.locale, lang, country, variant) }?.name
             ?: voices.firstOrNull()?.name
             ?: ""
     }
@@ -92,15 +118,46 @@ class MultiTtsService : TextToSpeechService() {
     // ---- 合成 -------------------------------------------------------------
 
     override fun onSynthesizeText(request: SynthesisRequest, callback: SynthesisCallback) {
-        val engine = engineRef.get()
         val text = request.charSequenceText?.toString().orEmpty()
-        if (engine == null) {
-            Log.w(TAG, "synthesize rejected: no delegate engine")
+        if (text.isBlank()) {
             safeError(callback)
             return
         }
-        if (text.isBlank()) {
+
+        val descriptors = descriptors()
+        if (descriptors.none { it.usable }) {
+            Log.w(TAG, "synthesize rejected: no usable voice")
             safeError(callback)
+            return
+        }
+        val requested = descriptors.firstOrNull { it.systemName == request.voiceName && it.usable }
+        val narrator = requested
+            ?: descriptors.firstOrNull { it.systemName == settings.narratorVoice && it.usable }
+            ?: descriptors.firstOrNull { it.systemName == settings.systemVoice && it.usable }
+            ?: descriptors.firstOrNull { it.usable && it.localeTag.startsWith("zh") }
+            ?: descriptors.firstOrNull { it.usable }
+        val dialogue = descriptors.firstOrNull {
+            it.systemName == settings.dialogueVoice && it.usable
+        } ?: narrator
+
+        val plan = SynthesisPlanBuilder.build(
+            text = text,
+            narratorVoiceId = narrator?.systemName,
+            dialogueVoiceId = dialogue?.systemName,
+            roles = rules.loadRoles(),
+            replacements = rules.loadReplacements(),
+            filterPurePunctuation = settings.punctuationFilter,
+            voices = descriptors,
+        )
+        if (plan.segments.isEmpty()) {
+            val started = runCatching {
+                callback.start(24_000, AudioFormat.ENCODING_PCM_16BIT, 1)
+            }.getOrDefault(TextToSpeech.ERROR)
+            if (started == TextToSpeech.SUCCESS) {
+                runCatching { if (!callback.hasFinished()) callback.done() }
+            } else {
+                safeError(callback)
+            }
             return
         }
 
@@ -108,15 +165,13 @@ class MultiTtsService : TextToSpeechService() {
         val aborted = AtomicBoolean(false)
         val started = AtomicBoolean(false)
         val failed = AtomicBoolean(false)
-
         val listener = object : SynthesisListener {
             override fun onStart(sampleRateHz: Int, audioFormat: Int, channelCount: Int) {
                 if (aborted.get() || !started.compareAndSet(false, true)) return
-                Log.d(TAG, "streaming pcm: ${sampleRateHz}Hz fmt=$audioFormat ch=$channelCount")
-                val result = runCatching { callback.start(sampleRateHz, audioFormat, channelCount) }
-                    .getOrDefault(TextToSpeech.ERROR)
+                val result = runCatching {
+                    callback.start(sampleRateHz, audioFormat, channelCount)
+                }.getOrDefault(TextToSpeech.ERROR)
                 if (result != TextToSpeech.SUCCESS) {
-                    Log.w(TAG, "callback.start failed: $result")
                     failed.set(true)
                     aborted.set(true)
                     latch.countDown()
@@ -125,46 +180,40 @@ class MultiTtsService : TextToSpeechService() {
 
             override fun onAudio(pcm: ByteArray, offset: Int, length: Int) {
                 if (aborted.get() || failed.get() || !started.get() || length <= 0) return
-                val result = runCatching { callback.audioAvailable(pcm, offset, length) }
-                    .getOrDefault(TextToSpeech.ERROR)
+                val result = runCatching {
+                    callback.audioAvailable(pcm, offset, length)
+                }.getOrDefault(TextToSpeech.ERROR)
                 if (result != TextToSpeech.SUCCESS) {
-                    Log.w(TAG, "callback.audioAvailable failed: $result")
                     failed.set(true)
+                    aborted.set(true)
                 }
             }
 
             override fun onComplete() {
-                if (aborted.get() || failed.get()) {
-                    latch.countDown()
-                    return
+                if (!aborted.get() && !failed.get()) {
+                    runCatching { if (!callback.hasFinished()) callback.done() }
+                        .onFailure { Log.w(TAG, "callback.done failed", it) }
                 }
-                Log.d(TAG, "synthesis finished")
-                runCatching { if (!callback.hasFinished()) callback.done() }
-                    .onFailure { Log.w(TAG, "callback.done failed", it) }
                 latch.countDown()
             }
 
             override fun onError(code: Int, message: String?) {
                 Log.w(TAG, "synthesis error [$code] $message")
                 aborted.set(true)
-                safeError(callback)
+                if (!callback.hasFinished()) safeError(callback)
                 latch.countDown()
             }
         }
 
-        val engineRequest = EngineSynthesisRequest(
-            text = text,
-            voiceId = request.voiceName?.takeIf { it.isNotEmpty() },
+        val handle = synthesizer.synthesize(
+            segments = plan.segments,
             rate = (request.speechRate / 100f).coerceIn(0.25f, 4f),
-            pitch = (request.pitch / 100f).coerceIn(0.25f, 2f),
+            pitch = (request.pitch / 100f).coerceIn(0.25f, 4f),
             volume = resolveVolume(request.params),
+            listener = listener,
         )
-
-        val handle: SynthesisHandle = engine.synthesize(engineRequest, listener)
         active = ActiveSynthesis(handle, latch)
-
         try {
-            // 系统侧播放是流式的，这里必须等音频全部交给 callback 才能返回。
             latch.await(SYNTHESIS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         } catch (interrupted: InterruptedException) {
             Log.w(TAG, "synthesis interrupted", interrupted)
@@ -176,36 +225,46 @@ class MultiTtsService : TextToSpeechService() {
     }
 
     override fun onStop() {
-        val current = active ?: return
-        current.handle.cancel()
-        current.latch.countDown()
+        active?.handle?.cancel()
+        active?.latch?.countDown()
     }
 
     // ---- 内部辅助 ---------------------------------------------------------
 
-    private fun ensureVoices(): List<Voice> {
-        cachedVoices.takeIf { it.isNotEmpty() }?.let { return it }
+    private fun invalidateVoices() {
         synchronized(voiceLock) {
-            if (cachedVoices.isNotEmpty()) return cachedVoices
-            val engine = engineRef.get() ?: return emptyList()
-            cachedVoices = engine.listVoices().mapNotNull { profile ->
-                runCatching {
-                    Voice(
-                        profile.id,
-                        Locale.forLanguageTag(profile.localeTag),
-                        profile.quality,
-                        profile.latency,
-                        profile.requiresNetwork,
-                        emptySet(),
-                    )
-                }.getOrNull()
-            }
-            return cachedVoices
+            cachedVoices = emptyList()
+            cachedDescriptors = emptyList()
         }
     }
 
+    private fun refreshVoices(): List<Voice> = synchronized(voiceLock) {
+        if (cachedVoices.isNotEmpty()) return@synchronized cachedVoices
+        cachedDescriptors = registry.voices(settings.hasLicense())
+        cachedVoices = cachedDescriptors.filter { it.usable }.mapNotNull { descriptor ->
+            runCatching {
+                Voice(
+                    descriptor.systemName,
+                    Locale.forLanguageTag(descriptor.localeTag),
+                    Voice.QUALITY_HIGH,
+                    Voice.LATENCY_NORMAL,
+                    descriptor.isOnline,
+                    emptySet(),
+                )
+            }.getOrNull()
+        }
+        cachedVoices
+    }
+
+    private fun descriptors(): List<VoiceDescriptor> = synchronized(voiceLock) {
+        if (cachedDescriptors.isEmpty()) {
+            cachedDescriptors = registry.voices(settings.hasLicense())
+        }
+        cachedDescriptors
+    }
+
     private fun matchLanguage(lang: String?, country: String?, variant: String?): Int {
-        val voices = ensureVoices()
+        val voices = refreshVoices()
         if (voices.isEmpty() || lang.isNullOrBlank()) return TextToSpeech.LANG_NOT_SUPPORTED
         val matched = voices.filter { matches(it.locale, lang, country, variant) }
         if (matched.isEmpty()) return TextToSpeech.LANG_NOT_SUPPORTED
@@ -226,16 +285,14 @@ class MultiTtsService : TextToSpeechService() {
                 locale.country.equals(country, ignoreCase = true)
             if (!countryHit) return false
         }
-        if (!variant.isNullOrEmpty()) {
-            if (!locale.variant.equals(variant, ignoreCase = true)) return false
+        if (!variant.isNullOrEmpty() && !locale.variant.equals(variant, ignoreCase = true)) {
+            return false
         }
         return true
     }
 
-    private fun resolveVolume(params: Bundle?): Float {
-        val raw = params?.getFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1f) ?: 1f
-        return raw.coerceIn(0f, 1f)
-    }
+    private fun resolveVolume(params: Bundle?): Float =
+        (params?.getFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1f) ?: 1f).coerceIn(0f, 1f)
 
     private fun safeError(callback: SynthesisCallback) {
         runCatching {

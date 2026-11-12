@@ -10,3 +10,5 @@ local.properties
 .gradle-home/
 .tmp/
 *.log
+voicepacks-local/
+语音包/

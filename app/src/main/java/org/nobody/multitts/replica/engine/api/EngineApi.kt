@@ -80,4 +80,6 @@ object SynthesisError {
     const val SYNTHESIS_FAILED = -4
     const val UNSUPPORTED_AUDIO = -5
     const val CANCELLED = -6
+    const val LICENSE_REQUIRED = -7
+    const val NETWORK_FAILED = -8
 }
