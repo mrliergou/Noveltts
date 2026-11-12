@@ -97,9 +97,13 @@ fun MultiTtsScreen(
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
-            ModalDrawerSheet {
-                Column(modifier = Modifier.padding(vertical = 18.dp)) {
-                    Column(modifier = Modifier.padding(horizontal = 24.dp)) {
+            ModalDrawerSheet(modifier = Modifier.width(272.dp)) {
+                Column(
+                    modifier = Modifier
+                        .verticalScroll(rememberScrollState())
+                        .padding(vertical = 18.dp),
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 20.dp)) {
                         Text(
                             text = "NovelTTS",
                             style = MaterialTheme.typography.titleLarge,
@@ -125,7 +129,7 @@ fun MultiTtsScreen(
                         )
                     }
                     Spacer(Modifier.height(8.dp))
-                    HorizontalDivider(modifier = Modifier.padding(horizontal = 24.dp))
+                    HorizontalDivider(modifier = Modifier.padding(horizontal = 20.dp))
                     Spacer(Modifier.height(8.dp))
                     NavigationDrawerItem(
                         label = { Text("打开系统语音设置") },
@@ -141,7 +145,7 @@ fun MultiTtsScreen(
                         text = "系统音色名 multitts:<包>:<引擎>:<音色>",
                         style = MaterialTheme.typography.labelSmall,
                         color = Muted,
-                        modifier = Modifier.padding(horizontal = 24.dp),
+                        modifier = Modifier.padding(horizontal = 20.dp),
                     )
                 }
             }

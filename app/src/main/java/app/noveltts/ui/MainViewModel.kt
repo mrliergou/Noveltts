@@ -450,7 +450,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun installPackFromUrl(url: String) {
         val normalized = url.trim()
-        if (normalized.isEmpty() || _uiState.value.packBusyId != null) return
+        val busy = _uiState.value.packBusyId
+        if (normalized.isEmpty() || busy != null) {
+            Log.w(TAG, "installPackFromUrl ignored: url='$normalized' busy='$busy'")
+            return
+        }
         val app = getApplication<Application>()
         updatePackBusy(normalized, "正在下载语音包…")
         viewModelScope.launch {
@@ -513,6 +517,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             VoicePackEvents.notifyChanged(getApplication())
             refreshAll()
         }
+        result.onFailure { Log.w(TAG, "pack operation failed", it) }
         _uiState.update {
             it.copy(
                 packBusyId = null,
@@ -549,7 +554,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun loadBaseState(): MainUiState = MainUiState(
-        text = preferences.getString(KEY_LAST_TEXT, "").orEmpty(),
+        text = preferences.getString(KEY_LAST_TEXT, "").orEmpty().ifBlank { DEFAULT_TEST_TEXT },
         speed = preferences.getInt(KEY_SPEED, 50),
         volume = preferences.getInt(KEY_VOLUME, 50),
         pitch = preferences.getInt(KEY_PITCH, 25),
@@ -634,6 +639,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
         const val TAG = "MainViewModel"
         const val KEY_LAST_TEXT = "lastText"
+
+        /** 首次打开时预填的测试段落：旁白 + 两段中文引号对话，便于导入语音包后立刻试听。 */
+        private const val DEFAULT_TEST_TEXT = """傍晚的风掠过屋檐，远处的铃声一阵一阵。
+「你终于来了。」她抬起头，眼睛里映着最后一缕霞光。
+他没有回答，只是把手里的灯往前递了递。
+「走吧，天要黑了。」"""
         const val KEY_SPEED = "speed"
         const val KEY_VOLUME = "volume"
         const val KEY_PITCH = "pitch"
