@@ -1,34 +1,27 @@
 # MultiTTS 复刻版开发交接
 
-最后更新：2026-11-12  
+最后更新：2026-11-12（第二次更新：界面已重建并编译通过）  
 项目根目录：`F:\codex\MultiTTS`  
 目标设备：`M2102J2SC`，Android 13 / SDK 33，arm64-v8a，adb 序列号记录为 `5cb24277`
 
 ## 0. 新会话先看这里
 
-**一句话状态：** 数据层、语音包解析、语音注册表、Edge/微软引擎、文本角色替换管线和系统 TTS 服务都已写完并有单元测试；唯一的大断点是 `ui/MultiTtsScreen.kt` 被删除后尚未重建，所以当前仓库不能完整编译。
+**一句话状态：** `ui/MultiTtsScreen.kt` 已按新 `MainViewModel` 重建（1270 行，五页：工作台/语音包/角色/替换/设置），`:app:assembleDebug` 成功、7 个单测全绿、APK 已产出；三个系统 TTS 配置 Activity 也已补齐。**剩下的唯一断点是真机验证**——设备当前未连接（`adb devices` 为空），所以界面与系统调用都还没有在设备上跑过。
 
 新会话请按以下顺序行动：
 
 1. 先读本文件第 2、4、5、6 节，不要重新设计已经完成的数据层和引擎层。
 2. 用只读方式核对 `ui/MainViewModel.kt`、`MainActivity.kt`、`service/MultiTtsService.kt` 的实际 API。
-3. 第一项代码工作必须是重建 `ui/MultiTtsScreen.kt`，并保留 `MainActivity.kt` 现有调用签名。
-4. 编译和单测通过后，再做 TTS 配置 Activity、Manifest intent filter 和真机验证。
+3. 接上设备（`adb devices` 应出现 `5cb24277`）后按 §4 的验收清单跑真机验证。
+4. 验证新发现的问题优先于新功能。
 
-**当前工作区不是干净状态。** `git status` 里已有大量未提交的新增/修改文件，其中包括：
-
-- 已删除的 `ui/MultiTtsScreen.kt`（必须重建，不要用 `git checkout` 恢复旧界面）。
-- 新增的数据、领域、引擎、测试目录。
-- 未跟踪的 119 MB 离线测试包：
-  `语音包\【离线】 微软官方语音（晓晓+云希）(1).zip`
-
-这个离线包只用于本地测试，**不要提交进 Git**。也不要执行 `git reset --hard`、`git clean -fdx` 或回滚任何已完成改动。
+**工作区已在提交 `f9da1eb` 收口**（界面重建 + 引擎/管线接入 + 打包修复）。本地 119 MB 测试包 `语音包\【离线】 微软官方语音（晓晓+云希）(1).zip` 已加入 `.gitignore`，**不要提交**。不要执行 `git reset --hard`、`git clean -fdx` 或回滚已完成改动。
 
 **当前绝对不能宣称已完成的事项：**
 
-- 当前代码尚未通过完整编译（缺 `MultiTtsScreen`）。
-- Edge 在线真实发声、MP3 解码、系统 TTS 调用、离线包导入后的真机发声都尚未验证。
+- Edge 在线真实发声、MP3 解码、系统 TTS 调用、离线包导入后的真机发声都尚未验证（目前只有编译与单测证据）。
 - 微软离线引擎在没有用户合法 Embedded Speech 许可证时只验证了“缺许可证会报错”，不能宣称真实离线发声已完成。
+- 界面只做了静态核对与编译验证，**没有截图验收**。
 
 ## 1. 我们在做什么
 
@@ -377,14 +370,13 @@ synthesizer.SpeakSsml(ssml)
 - 替换顺序和正则分组。
 - 纯标点过滤。
 
-UI 删除后没有再次运行全量构建；预计唯一首要错误是 `MultiTtsScreen` 缺失。
+界面重建后已重新跑全量构建与单测，结果见 §4 P0。
 
 ## 4. 当前卡点
 
-### P0：必须马上完成
+### P0：已完成（2026-11-12）
 
-1. 重新创建 `ui/MultiTtsScreen.kt`。
-2. 保持签名：
+1. `ui/MultiTtsScreen.kt` 已重建（1270 行），签名保持不变：
    ```kotlin
    @Composable
    fun MultiTtsScreen(
@@ -393,28 +385,20 @@ UI 删除后没有再次运行全量构建；预计唯一首要错误是 `MultiT
        openVoicePacksOnStart: Boolean = false,
    )
    ```
-3. 页面至少包含：
-   - 工作台：文本、旁白/对话音色、语速/音调/音量、朗读/停止、分段预览。
-   - 语音包：导入 zip、已安装包、在线/离线状态、删除、在线目录。
-   - 角色：名称、正则、音色、优先级、仅匹配对话、启停、删除。
-   - 替换：名称、查找、替换、正则、顺序、启停、测试预览。
-   - 设置：纯标点过滤、默认音色、许可证、Edge 端点、打开系统语音设置。
-4. `openVoicePacksOnStart=true` 时切到语音包页。
-5. 完成后重新跑：
-   ```powershell
-   & 'F:\codex\MultiTTS\scripts\build.ps1' -Task ':app:compileDebugKotlin' -NoOffline
-   & 'F:\codex\MultiTTS\scripts\build.ps1' -Task ':app:testDebugUnitTest' -NoOffline
-   ```
+2. 五页齐全：工作台（文本/旁白对话音色/三滑杆/朗读停止/分段预览）、语音包（导入/已安装/在线目录/下载进度/删除）、角色（正则/音色/优先级/仅对话/启停）、替换（普通与正则/顺序/启停/测试框）、设置（纯标点过滤/系统音色/Edge 端点/许可证/系统语音设置/清除最近文本）。
+3. 验证结果：
+   - `:app:compileDebugKotlin` → `BUILD SUCCESSFUL`
+   - `:app:assembleDebug` → `BUILD SUCCESSFUL`，APK `app/build/outputs/apk/debug/app-debug.apk`（27.8 MB）
+   - `:app:testDebugUnitTest` → `tests="4"` + `tests="3"`，0 failures / 0 errors
+4. 打包修复：微软语音 SDK 传递依赖的 10 个 netty jar 各带一份 `META-INF/INDEX.LIST`，`mergeDebugJavaResource` 报重复文件；已在 `app/build.gradle.kts` 的 `packaging.resources.excludes` 排除 `INDEX.LIST`、`io.netty.versions.properties` 与签名文件。
 
-### P1：系统体验缺口
+### P1：已完成（2026-11-12）
 
-- `MainActivity` 目前只处理启动、分享文本、`packUrl`、`catalog`、`open=voicepacks`。
-- 尚未增加 TTS 配置 Activity：
-  - `android.speech.tts.engine.CHECK_TTS_DATA`
-  - `android.speech.tts.engine.GET_SAMPLE_TEXT`
-  - `android.speech.tts.engine.CONFIGURE_ENGINE`
-- Manifest 尚未注册这些 intent filter。
-- 系统设置里的“试听/配置”入口目前还不完整。
+- 新增 `app/src/main/java/org/nobody/multitts/replica/ui/engine/EngineSupportActivities.kt`：
+  - `TtsCheckDataActivity`：响应 `android.speech.tts.engine.CHECK_TTS_DATA`，回传 `EXTRA_AVAILABLE_VOICES` / `EXTRA_UNAVAILABLE_VOICES`（后者含缺许可证的离线音色）。
+  - `TtsSampleTextActivity`：响应 `android.speech.tts.engine.GET_SAMPLE_TEXT`，按 `language` extra 返回中/英示例文本。
+  - `TtsConfigureActivity`：响应 `android.speech.tts.engine.CONFIGURE_ENGINE`，打开主界面。
+- `AndroidManifest.xml` 已注册三个 `exported=true`、带 `DEFAULT` 类别、`Theme.NoDisplay` 的 Activity；`aapt2 dump xmltree` 已确认合并进 APK。
 
 ### P2：运行时未验证
 
@@ -428,10 +412,10 @@ UI 删除后没有再次运行全量构建；预计唯一首要错误是 `MultiT
 
 建议按这个顺序：
 
-1. 写回 `MultiTtsScreen.kt`，接上现有 `MainViewModel`。
-2. 编译，修 Compose/API 错误。
-3. 增加 TTS 数据检查/示例文本 Activity 和 Manifest 配置。
-4. `assembleDebug`，安装到真机。
+1. ~~写回 `MultiTtsScreen.kt`~~（已完成）。
+2. ~~编译并修 Compose/API 错误~~（已完成，BUILD SUCCESSFUL）。
+3. ~~TTS 数据检查/示例文本/引擎配置 Activity + Manifest~~（已完成）。
+4. **当前第 1 步**：接上设备（`adb devices` = `5cb24277`），`adb install -r app/build/outputs/apk/debug/app-debug.apk`，截图验收五页界面。
 5. 通过 SAF 或 `packUrl` 导入在线 Edge 包。
 6. 检查：
    - 应用内音色列表出现在线音色。
