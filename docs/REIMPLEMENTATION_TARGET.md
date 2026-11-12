@@ -194,7 +194,7 @@ Android TextToSpeechService -> domain synthesis coordinator
 自己解析语音包（原版 `config.yaml` + `engines.yaml`），走 Edge 在线与微软嵌入式离线两个后端合成，
 并把结果以系统 `TextToSpeechService` 的身份回传。
 
-代码证据（2026-11-12）：`:app:compileDebugKotlin` 通过；`:app:testDebugUnitTest` 7 项全绿；
+代码证据（2026-11-12）：`:app:compileDebugKotlin` 通过；`:app:testDebugUnitTest` 13 项全绿；
 `:app:assembleDebug` 产出 27.8 MB APK。**运行时仍未验证**（无真机截图、无 Edge 实际发声记录）。
 
 ### 7.1 已完成（有代码 + 编译/单测证据）

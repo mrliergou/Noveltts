@@ -6,7 +6,7 @@
 
 ## 0. 新会话先看这里
 
-**一句话状态：** `ui/MultiTtsScreen.kt` 已按新 `MainViewModel` 重建（1270 行，五页：工作台/语音包/角色/替换/设置），`:app:assembleDebug` 成功、7 个单测全绿、APK 已产出；三个系统 TTS 配置 Activity 也已补齐。**剩下的唯一断点是真机验证**——设备当前未连接（`adb devices` 为空），所以界面与系统调用都还没有在设备上跑过。
+**一句话状态：** `ui/MultiTtsScreen.kt` 已按新 `MainViewModel` 重建（1270 行，五页：工作台/语音包/角色/替换/设置），`:app:assembleDebug` 成功、13 个单测全绿、APK 已产出；三个系统 TTS 配置 Activity 也已补齐。**剩下的唯一断点是真机验证**——设备当前未连接（`adb devices` 为空），所以界面与系统调用都还没有在设备上跑过。
 
 新会话请按以下顺序行动：
 
@@ -47,11 +47,11 @@
 
 ## 2. 当前状态一句话总结
 
-数据层、原版语音包解析、统一音色注册表、Edge 引擎、微软嵌入式引擎、文本/角色/替换管线和系统 TTS 服务主体已经写完，相关纯 Kotlin 测试已通过；**界面重写尚未完成，当前仓库因此处于暂时不可编译的中间状态**。
+数据层、原版语音包解析、统一音色注册表、Edge 引擎、微软嵌入式引擎、文本/角色/替换管线和系统 TTS 服务主体已经写完，相关纯 Kotlin 测试已通过；界面已按新 `MainViewModel` 重建（`ui/MultiTtsScreen.kt`，1270 行，五页），仓库**已恢复可编译**，`assembleDebug` 与 13 个单测都通过。
 
-最直接的断点：
+最直接的待办：
 
-- `app/src/main/java/org/nobody/multitts/replica/ui/MultiTtsScreen.kt` 已被删除，等待按新 `MainViewModel` 重写。
+- 真机验收尚未进行（设备未连接），界面与系统 TTS 调用都还没在设备上跑过。
 - `MainActivity.kt` 仍然调用：
   ```kotlin
   MultiTtsScreen(
@@ -353,12 +353,13 @@ synthesizer.SpeakSsml(ssml)
 
 ### 3.11 测试状态
 
-最后一次完整单测结果：`7 tests completed`，全部通过。
+最后一次完整单测结果：`13 tests completed`（TextPipeline / EdgeGec / PackYaml），全部通过。
 
 测试文件：
 
 - `app/src/test/java/.../engine/edge/EdgeGecTest.kt`
 - `app/src/test/java/.../domain/TextPipelineTest.kt`
+- `app/src/test/java/.../data/voicepack/PackYamlTest.kt`
 
 已覆盖：
 
@@ -369,6 +370,12 @@ synthesizer.SpeakSsml(ssml)
 - 角色规则优先级。
 - 替换顺序和正则分组。
 - 纯标点过滤。
+- 原版 YAML 解析：根节点/列表项的 `!!` 类型标签剥离、引擎 supported 标记、locale 推断、
+  `type` 与 edgetts 的在线判定、`packId` 稳定性（同一 YAML 必得同一 ID）。
+
+另用真实包做过手工核对（未入库）：`【在线】 EdgeTTS（中文+英文）.zip` 解析出 61 个在线音色，
+`【离线】 微软官方语音（晓晓+云希）(1).zip` 解析出 2 个离线音色（`param` 为
+`Microsoft Xiaoxiao (Natural) - ...`，模型目录落在 `microsoft/<code>`，与 zip 内布局一致）。
 
 界面重建后已重新跑全量构建与单测，结果见 §4 P0。
 

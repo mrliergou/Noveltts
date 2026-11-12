@@ -6,7 +6,7 @@
 
 复刻版包名 `org.nobody.multitts.replica`，可与原版共存安装，方便真机对照。
 
-> **当前状态**：`:app:assembleDebug` 通过，7 个单元测试全绿，APK 可产出；
+> **当前状态**：`:app:assembleDebug` 通过，13 个单元测试全绿，APK 可产出；
 > **但真机运行尚未验证**（Edge 是否真能出声、系统 TTS 是否真调到本应用、界面截图验收都还没做）。
 > 详见 [HANDOFF.md](HANDOFF.md) 的状态与卡点章节。
 
