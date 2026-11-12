@@ -145,6 +145,13 @@ adb shell am start --es catalog "http://127.0.0.1:8765/catalog.json" -n app.nove
   `multitts:<packId>:<engineCode>:<voiceCode>` 不变——它同时被第三方阅读器、系统设置和本应用设置记住，
   改前缀会让所有已选音色失效。计划功能稳定后统一迁移，迁移清单见
   [docs/VOICE_PACKS.md](docs/VOICE_PACKS.md) 的「前缀为什么没跟着改名」一节。
+- **离线音色（微软 Embedded）需要额外两个条件**：
+  1. Microsoft Embedded Speech 许可证（设置页粘贴，Keystore 加密存储）；
+  2. 微软嵌入式语音的原生库（`embedded.tts`、`embedded.tts.runtime`、`telemetry` 与 `libc++_shared`）——
+     Maven 上的 `client-sdk` AAR **不含**这几个库，仓库也不分发它们。把对应 `.so` 放进
+     `app/src/main/jniLibs/arm64-v8a/` 后才能出声；缺少时合成会报
+     `SPXERR_EXTENSION_LIBRARY_NOT_FOUND`。原生库版本需与 `client-sdk` 一致
+     （当前固定在 `1.37.0`，与原版 MultiTTS 内置版本相同）。
 - 真机为 MIUI 且常处于锁屏，`adb shell input` 被系统拒绝，UI 自动化需先解锁或改用模拟器。
 
 ## 下一步

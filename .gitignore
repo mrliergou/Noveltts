@@ -12,3 +12,6 @@ local.properties
 *.log
 voicepacks-local/
 语音包/
+
+# 本地联调用：从原版 APK 提取的微软嵌入式语音原生库（不可提交）
+app/src/main/jniLibs/

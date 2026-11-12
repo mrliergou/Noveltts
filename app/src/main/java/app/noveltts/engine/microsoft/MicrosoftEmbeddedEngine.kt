@@ -110,7 +110,7 @@ class MicrosoftEmbeddedEngine(
                 } finally {
                     result.close()
                 }
-            } catch (error: Exception) {
+            } catch (error: Throwable) {
                 if (!cancelled.get()) {
                     Log.w(TAG, "embedded speech failed", error)
                     listener.onError(
@@ -177,5 +177,11 @@ class MicrosoftEmbeddedEngine(
     private companion object {
         const val TAG = "MicrosoftEmbeddedEngine"
         const val CHUNK_BYTES = 8 * 1024
+
+        init {
+            // 微软 SDK 的原生库依赖 libc++_shared 的符号；不预加载时 dlopen 会报
+            // "cannot locate symbol _ZNKSt6__ndk1..."。库不存在时静默跳过。
+            runCatching { System.loadLibrary("c++_shared") }
+        }
     }
 }

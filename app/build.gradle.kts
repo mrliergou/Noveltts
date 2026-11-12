@@ -33,6 +33,16 @@ android {
             excludes += "/META-INF/*.DSA"
             excludes += "/META-INF/*.RSA"
         }
+        jniLibs {
+            // 本地联调：jniLibs 里放的是原版 APK 提取的微软原生库（不可提交），
+            // 与 AAR 自带的同名库冲突时以本地为准。
+            pickFirsts += listOf(
+                "**/libMicrosoft.CognitiveServices.Speech.core.so",
+                "**/libMicrosoft.CognitiveServices.Speech.extension.*.so",
+                "**/libMicrosoft.CognitiveServices.Speech.java.bindings.so",
+                "**/libc++_shared.so",
+            )
+        }
     }
 
     compileOptions {
@@ -56,7 +66,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
 
-    implementation("com.microsoft.cognitiveservices.speech:client-sdk:1.51.0")
+    implementation("com.microsoft.cognitiveservices.speech:client-sdk:1.37.0")
     implementation("org.yaml:snakeyaml:2.3")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 

@@ -677,3 +677,25 @@ UI：
 5. 编译通过后再做 TTS 配置 Activity。
 6. 真机验证前不要宣称“离线发声已完成”。
 
+### 6.14 离线音色（微软 Embedded）的原生库与 SDK 版本（2026-11-12 实测）
+
+- Maven 的 `com.microsoft.cognitiveservices.speech:client-sdk` **只带 core / java.bindings / kws / codec**，
+  不带 `libMicrosoft.CognitiveServices.Speech.extension.embedded.tts.so`、`...embedded.tts.runtime.so`、
+  `...extension.telemetry.so`，也不带 `libc++_shared.so`。缺 telemetry 时 `EmbeddedSpeechConfig.<init>`
+  直接 `dlopen` 失败；缺 embedded.tts 时 `SpeechSynthesizer` 构造报
+  `SPXERR_EXTENSION_LIBRARY_NOT_FOUND (0x24)`。
+- 版本必须对齐：用 `1.51.0` 的 Java/native 配原版（`1.37.0`）的 embedded 扩展时，`setSpeechSynthesisVoice`
+  会 `No implementation found`，扩展也加载不上。改成 `client-sdk:1.37.0`（与原版 APK 内 native 同版本，
+  原版 `lib...core.so` 里可见 `1.37.0`）后一次通过。
+- `telemetry.so` 的 `DT_NEEDED` 里**没有** `libc++_shared.so`，直接加载会报
+  `cannot locate symbol _ZNKSt6__ndk120__vector_base_commonILb1EE20__throw_length_errorEv`；
+  用 `lief` 给它（以及 `embedded.tts.so`、`embedded.tts.runtime.so`）补一条 `DT_NEEDED libc++_shared.so`
+  即可，另外在 `MicrosoftEmbeddedEngine` 的 companion `init` 里 `System.loadLibrary("c++_shared")`。
+  注意：预加载本身不解决符号解析（Java 的 `loadLibrary` 不把库放进全局组），补 `DT_NEEDED` 才是关键。
+- 这些库是微软的分发物，**不进仓库**：`app/src/main/jniLibs/` 已加入 `.gitignore`，需要时从官方
+  Embedded Speech 包或本地联调环境放入。
+- 已验证：注入许可证后，离线音色「晓晓」真机合成成功（`AudioTrack: stop(...) called with 39600 frames
+  delivered`，24 kHz 单声道 ≈1.65 s），界面状态「朗读完成」。
+- `MainActivity` 新增了两个**仅 debuggable 生效**的 extra：`--es license <许可证>`、`--es narrator <systemName>`，
+  用于自动化验证；正式包忽略它们。
+
