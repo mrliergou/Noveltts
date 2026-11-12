@@ -8,6 +8,11 @@ import java.io.File
  *
  * 系统音色名格式固定为 `multitts:<packId>:<engineCode>:<voiceCode>`，
  * 系统 TTS 回调时也通过同一格式反查，避免依赖可变显示名。
+ *
+ * 注意：应用已改名 NovelTTS，但这个 `multitts:` 前缀**故意保留**——它会被第三方阅读器、
+ * 系统设置以及本应用的已保存设置同时记住，换掉等于让所有已选音色失效。
+ * 计划在功能稳定后统一迁移，届时需要同步改 [systemName]、[find] 的旧 ID 兼容逻辑、
+ * `SettingsStore`/`RulesRepository` 里保存的 voiceId，以及在 UI 上提示用户重选音色。
  */
 class VoiceRegistry(
     context: Context,

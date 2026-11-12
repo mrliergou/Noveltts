@@ -141,6 +141,10 @@ adb shell am start --es catalog "http://127.0.0.1:8765/catalog.json" -n app.nove
 - 打包需排除 netty 的 `META-INF/INDEX.LIST`（微软语音 SDK 的传递依赖各带一份，重复会打不出包）。
 - 语音包目录默认允许明文 HTTP（自建 NAS/局域网场景），公网分发请用 HTTPS 并填写 `sha256`。
 - `values/strings.xml` 与 `values-zh-rCN/strings.xml` 内容相同，默认语言仍是中文。
+- **音色前缀仍是 `multitts:`**：应用已改名 NovelTTS，但系统音色名保持
+  `multitts:<packId>:<engineCode>:<voiceCode>` 不变——它同时被第三方阅读器、系统设置和本应用设置记住，
+  改前缀会让所有已选音色失效。计划功能稳定后统一迁移，迁移清单见
+  [docs/VOICE_PACKS.md](docs/VOICE_PACKS.md) 的「前缀为什么没跟着改名」一节。
 - 真机为 MIUI 且常处于锁屏，`adb shell input` 被系统拒绝，UI 自动化需先解锁或改用模拟器。
 
 ## 下一步

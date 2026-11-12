@@ -83,6 +83,22 @@ packId = "vp-" + sha256(config.yaml + 0x00 + engines.yaml).take(16)
 `packId` 只由两个 YAML 决定，所以同一个包重复导入得到同一 ID，可直接覆盖升级；
 音色系统名稳定，其他应用里保存的音色选择不会因为重装而失效。
 
+> ### 前缀 `multitts:` 为什么没跟着改名（重要）
+>
+> 应用名已改为 **NovelTTS**，但音色前缀仍是 `multitts:`，这是**有意为之**，不是遗漏。
+>
+> 这个字符串同时被三处记住：第三方阅读器/系统设置里保存的音色选择、本应用 `SettingsStore`
+> 里的 `narratorVoiceId`/`dialogueVoiceId`/`systemVoiceId`、角色规则里的 `voiceId`。
+> 一旦换前缀，所有已选音色全部失效、退回默认音色，而外部应用保存的旧名字我们无法回写。
+>
+> **计划**：等功能稳定后再整体迁移。届时必须一次改完这些点：
+>
+> 1. `VoiceRegistry.systemName()` 的生成逻辑（改为新前缀）；
+> 2. `VoiceRegistry.find()` 增加旧 `multitts:` ID 的兼容映射（读旧写新），否则老用户音色瞬间全丢；
+> 3. `SettingsStore`、`RulesRepository` 里持久化的 voiceId 做一次性迁移；
+> 4. 界面里展示「系统音色名」的两处说明文案；
+> 5. 发布说明里告知用户：外部阅读器需要重新选一次音色（这部分无法自动迁移）。
+
 ## 2. 旧版语音包（兼容）
 
 旧版 `pack.json` 只是「音色声明 + 系统引擎绑定」，用于旧版本的历史数据：

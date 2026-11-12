@@ -17,6 +17,7 @@
 
 **改名说明（2026-11-12）：** 应用名 `NovelTTS`，`namespace`/`applicationId` 均为 `app.noveltts`，源码目录 `app/src/main/java/app/noveltts/`。
 系统的音色前缀**仍然是** `multitts:<packId>:<engineCode>:<voiceCode>`——它是已保存的协议标识，改名会让用户已选音色全部失效，所以没有跟着改。
+**这是有意保留，不是遗漏**；用户已明确表示"后期正常后会进行整体更改"，迁移清单见 §6.13，改之前不要动这个前缀。
 包名变化意味着旧的 `org.nobody.multitts.replica` 装不上也升不上，**必须卸载重装**，装完还要在系统设置里重新选一次默认引擎。
 
 **工作区已在提交 `f9da1eb` 收口**（界面重建 + 引擎/管线接入 + 打包修复）。本地 119 MB 测试包 `语音包\【离线】 微软官方语音（晓晓+云希）(1).zip` 已加入 `.gitignore`，**不要提交**。不要执行 `git reset --hard`、`git clean -fdx` 或回滚已完成改动。
@@ -581,6 +582,22 @@ UI 显示名可以变，系统 ID 不能随意变，否则已保存的默认音�
 - 首次依赖下载需要 `-NoOffline` 和网络。
 - `minSdk=26` 是微软 SDK 要求，不要为了兼容降回 23。
 - 当前只打包 `arm64-v8a`；x86_64 模拟器需要临时加 ABI。
+
+### 6.13 音色前缀 `multitts:` 是故意保留的，别顺手改
+
+应用叫 NovelTTS，但 `VoiceRegistry.systemName()` 产出的仍然是 `multitts:<packId>:<engineCode>:<voiceCode>`。
+
+原因：这个字符串是**持久协议标识**，同时存在于第三方阅读器/系统设置保存的音色选择、`SettingsStore` 的
+`narratorVoiceId`/`dialogueVoiceId`/`systemVoiceId`、以及 `RulesRepository` 角色规则的 `voiceId` 里。
+换前缀等于让所有已选音色失效，而外部应用里存的名字我们无法回写。
+
+用户已确认"后期正常后会进行整体更改"。真正迁移时必须一次做完：
+
+1. `VoiceRegistry.systemName()` 改新前缀；
+2. `VoiceRegistry.find()` 保留旧 `multitts:` ID 的兼容映射（读旧写新），否则老用户音色瞬间全丢；
+3. `SettingsStore`/`RulesRepository` 持久化 voiceId 做一次性迁移；
+4. 界面两处「系统音色名」说明文案（`ui/MultiTtsScreen.kt:141`、`:1025`）；
+5. 发布说明提示用户：外部阅读器需要重新选一次音色，这部分无法自动迁移。
 
 ## 7. 关键文件索引
 
