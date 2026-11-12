@@ -164,19 +164,12 @@ class EdgeTtsEngine(
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
-                val frame = bytes.toByteArray()
-                if (frame.size < 2) return
-                val headerLength = ((frame[0].toInt() and 0xFF) shl 8) or (frame[1].toInt() and 0xFF)
-                val headerEnd = findHeaderEnd(frame, headerLength)
-                if (headerEnd < 0) return
-                val header = String(frame, 2, (headerEnd - 2).coerceAtLeast(0), Charsets.ISO_8859_1)
-                val payloadStart = headerEnd + 4
-                if (payloadStart > frame.size || !header.contains("Path:audio")) return
-                if (header.contains("Content-Type") && !header.contains("audio/mpeg")) return
-                if (payloadStart < frame.size) {
-                    audio.write(frame, payloadStart, frame.size - payloadStart)
-                    audioFrames.incrementAndGet()
-                }
+                val parsed = EdgeFrames.parse(bytes.toByteArray()) ?: return
+                if (!parsed.header.contains("Path:audio")) return
+                if (parsed.header.contains("Content-Type") && !parsed.header.contains("audio/mpeg")) return
+                if (parsed.payload.isEmpty()) return
+                audio.write(parsed.payload)
+                audioFrames.incrementAndGet()
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -276,24 +269,6 @@ class EdgeTtsEngine(
     private fun signed(value: Int): String = if (value >= 0) "+$value" else value.toString()
 
     private fun edgeDate(): String = DATE_FORMAT.format(Instant.now())
-
-    private fun findHeaderEnd(frame: ByteArray, declaredLength: Int): Int {
-        val max = minOf(frame.size - 4, maxOf(2 + declaredLength + 4, 512))
-        var index = 2
-        while (index <= max) {
-            if (
-                frame[index] == '\r'.code.toByte() &&
-                frame[index + 1] == '\n'.code.toByte() &&
-                frame[index + 2] == '\r'.code.toByte() &&
-                frame[index + 3] == '\n'.code.toByte()
-            ) {
-                return index
-            }
-            index++
-        }
-        val fallback = 2 + declaredLength
-        return if (fallback + 4 <= frame.size) fallback else -1
-    }
 
     private fun escapeXml(value: String): String = buildString(value.length) {
         value.forEach { char ->

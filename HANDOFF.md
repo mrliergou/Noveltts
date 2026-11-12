@@ -500,35 +500,53 @@ data = ticks.toLong().toString() + TRUSTED_CLIENT_TOKEN
 
 ### 6.5 Edge 端点与参数
 
-旧端点当前会 403：
+**2026-11-12 已修正，此前文档里的 `api.msedgeservices.com` 端点会稳定 403。**
+
+当前必须使用的端点（`SettingsStore.DEFAULT_EDGE_ENDPOINT`）：
 
 ```text
 wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1
 ```
 
-当前默认：
+鉴权参数是 `TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4`，**不是** `Ocp-Apim-Subscription-Key`。
+`SettingsStore` 会把旧的 `api.msedgeservices.com` 值当作"未设置"自动回落到新端点。
+
+版本号必须跟当前 Edge 浏览器一致（`EdgeGec.SEC_MS_GEC_VERSION`）：
 
 ```text
-wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1
+2-143.0.3650.75     // EdgeGec.CHROMIUM_FULL_VERSION = 143.0.3650.75
 ```
 
-鉴权键必须是：
+UA 主版本号要与之匹配，握手还要带这些头，缺一不可：
 
 ```text
-Ocp-Apim-Subscription-Key
+Origin: chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold
+Pragma: no-cache
+Cache-Control: no-cache
+Cookie: MUID=<32 位大写十六进制，随机生成>
 ```
 
-不是 `TrustedClientToken`。  
-版本使用：
+排查方法：`pip install --target .tmp/site edge-tts`（7.3.1），对照 `.tmp/site/edge_tts/constants.py`，
+PC 上能出声就说明服务端没问题，是客户端参数不对。
+
+### 6.6 Edge 音频帧：payload 起点是 `2 + headerLength`，不是 `\r\n\r\n` 之后
+
+**这条踩过两次，第二次的后果是"在线音色全是电音/杂声"。**
+
+帧布局：
 
 ```text
-2-155.0.4283.45
+[2 字节大端 header 长度][header][payload]
 ```
 
-### 6.6 不要用固定偏移裁 Edge 音频帧
+header 是若干 `Key:Value\r\n` 行，**末尾只有一个 CRLF**，payload 紧接其后。
+所以 `payloadStart = 2 + headerLength`（`app/src/main/java/app/noveltts/engine/edge/EdgeFrames.kt`）。
 
-不要使用某些旧 Java 实现的固定 `130` 或 `105` 字节偏移。  
-二进制帧应先读 2 字节大端 header 长度，再找 `\r\n\r\n`，payload 从分隔符之后开始，并确认 header 包含 `Path:audio`。
+不要：
+- 用固定偏移 `130` / `105`；
+- 用 `\r\n\r\n` 定位再 `+4`——这类帧里根本没有空行，找不到就退化成 `2+len`，再 `+4` 会**每帧多跳 4 字节**，正好吃掉 MP3 帧同步头 `FF F3 64 C4`，MediaCodec 一路重新同步，听起来就是电音。
+
+`EdgeFramesTest` 5 个用例守住这条（payload 首字节必须是 `FF F3 64 C4`、大端长度、payload 里出现 CRLF 也不能被误切）。
 
 ### 6.7 Microsoft SDK 方法名大小写
 
