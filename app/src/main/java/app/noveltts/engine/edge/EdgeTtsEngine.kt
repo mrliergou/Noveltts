@@ -199,7 +199,18 @@ class EdgeTtsEngine(
             }
         }
 
-        val ws = client.newWebSocket(Request.Builder().url(buildUrl(requestId)).build(), listener)
+        val ws = client.newWebSocket(
+            Request.Builder()
+                .url(buildUrl(requestId))
+                .header("Pragma", "no-cache")
+                .header("Cache-Control", "no-cache")
+                .header("Origin", ORIGIN)
+                .header("User-Agent", EdgeGec.USER_AGENT)
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Cookie", "MUID=${EdgeGec.muid()}")
+                .build(),
+            listener,
+        )
         socketRef.set(ws)
         try {
             if (!done.await(RECEIVE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
@@ -225,7 +236,7 @@ class EdgeTtsEngine(
         ) {
             configured
         } else {
-            "$configured${separator}Ocp-Apim-Subscription-Key=${EdgeGec.TRUSTED_CLIENT_TOKEN}"
+            "$configured${separator}TrustedClientToken=${EdgeGec.TRUSTED_CLIENT_TOKEN}"
         }
         val joiner = if ('?' in auth) '&' else '?'
         return "$auth${joiner}Sec-MS-GEC=${EdgeGec.token()}" +
@@ -311,6 +322,9 @@ class EdgeTtsEngine(
 
     private companion object {
         const val TAG = "EdgeTtsEngine"
+
+        /** Edge 朗读接口只接受来自该浏览器扩展的 Origin，缺了会 403。 */
+        const val ORIGIN = "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"
         const val CHUNK_BYTES = 8 * 1024
         const val RECEIVE_TIMEOUT_SECONDS = 60L
         val DATE_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern(

@@ -32,7 +32,10 @@ class SettingsStore(context: Context) {
         }
 
     var edgeEndpoint: String
-        get() = preferences.getString(KEY_EDGE_ENDPOINT, DEFAULT_EDGE_ENDPOINT).orEmpty()
+        get() = preferences.getString(KEY_EDGE_ENDPOINT, DEFAULT_EDGE_ENDPOINT)
+            .orEmpty()
+            .takeIf { it.isNotBlank() && it != LEGACY_EDGE_ENDPOINT }
+            ?: DEFAULT_EDGE_ENDPOINT
         set(value) {
             preferences.edit().putString(KEY_EDGE_ENDPOINT, value.trim()).apply()
         }
@@ -58,7 +61,15 @@ class SettingsStore(context: Context) {
     }
 
     companion object {
+        /**
+         * Edge 朗读端点。必须与 edge-tts 参考实现保持一致：
+         * 旧版 `api.msedgeservices.com/tts/cognitiveservices/websocket/v1` 会直接返回 403。
+         */
         const val DEFAULT_EDGE_ENDPOINT =
+            "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1"
+
+        /** 曾经写进默认值/用户设置的旧端点，读取时按"未设置"处理。 */
+        private const val LEGACY_EDGE_ENDPOINT =
             "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
 
         private const val KEY_PUNCTUATION_FILTER = "punctuationFilter"

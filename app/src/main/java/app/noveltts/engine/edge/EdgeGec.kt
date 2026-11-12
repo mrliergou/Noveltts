@@ -14,7 +14,24 @@ import java.util.Locale
  */
 object EdgeGec {
     const val TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-    const val SEC_MS_GEC_VERSION = "2-155.0.4283.45"
+
+    /** Edge 浏览器版本号，服务端用它校验 Sec-MS-GEC-Version，过旧或过新都会被判 403。 */
+    const val CHROMIUM_FULL_VERSION = "143.0.3650.75"
+    const val CHROMIUM_MAJOR_VERSION = "143"
+
+    const val SEC_MS_GEC_VERSION = "2-$CHROMIUM_FULL_VERSION"
+
+    val USER_AGENT: String =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/$CHROMIUM_MAJOR_VERSION.0.0.0 Safari/537.36 " +
+            "Edg/$CHROMIUM_MAJOR_VERSION.0.0.0"
+
+    /** 服务端要求的 Cookie 里的 MUID，32 位大写十六进制随机串。 */
+    fun muid(): String {
+        val bytes = ByteArray(16)
+        java.security.SecureRandom().nextBytes(bytes)
+        return bytes.toHexUpperCase()
+    }
 
     @Volatile
     var clockSkewSeconds: Double = 0.0
