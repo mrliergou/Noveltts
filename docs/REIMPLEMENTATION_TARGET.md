@@ -188,49 +188,75 @@ Android TextToSpeechService -> domain synthesis coordinator
 
 必须支持从现有简单 SharedPreferences 数据升级；迁移失败时保留旧值并提供可恢复错误。在线引擎凭据进入 Android Keystore 加密存储。日志不记录完整文本、账户凭据或语音内容，除非用户明确开启诊断导出。
 
-## 7. 当前 Kotlin 复刻版差距
+## 7. 当前 Kotlin 复刻版进展
 
-当前 `org.nobody.multitts.replica` 有 Compose 工作台、系统默认 TTS 控制、语速/音调/音量、系统 Voice 枚举、简单持久化集合、播放停止状态与 `ACTION_SEND text/plain` 接收。
+`org.nobody.multitts.replica` 已从「委托系统引擎转发」改为**真实引擎实现**：
+自己解析语音包（原版 `config.yaml` + `engines.yaml`），走 Edge 在线与微软嵌入式离线两个后端合成，
+并把结果以系统 `TextToSpeechService` 的身份回传。
 
-与原版目标的关键差距：
+代码证据（2026-11-12）：`:app:compileDebugKotlin` 通过；`:app:testDebugUnitTest` 7 项全绿；
+`:app:assembleDebug` 产出 27.8 MB APK。**运行时仍未验证**（无真机截图、无 Edge 实际发声记录）。
 
-- **P0（2026-11-10 进展）**：已注册 `org.nobody.multitts.replica/.service.MultiTtsService`（action `android.intent.action.TTS_SERVICE` + `category DEFAULT`，permission `BIND_TEXT_TO_SPEECH_SERVICE`），`TextToSpeech` 可枚举、可绑定，`onSynthesizeText` 会把请求委托给设备上其他引擎并回传 PCM。仍未做 `CHECK_TTS_DATA` / `GET_SAMPLE_TEXT` / `CONFIGURE_ENGINE` 的 Activity，系统设置里的“试听/配置”入口尚不可用。
-- **P1**：目前使用系统已安装 Voice；这不能代表原版的本地/在线音色库或引擎管理。
-- **P2**：角色目前是字符串集合，替换规则是两段文字，不具备原版匹配模型、分组、排序、regex、enable 和 speaker 引用。
-- **P2**：音色/引擎数据库、配置导入/导出、搜索和更新功能未实现。
-- **P3**：文本规范化、分句、角色匹配、自动分配、多角色合成、音频拼接、表情过滤尚未实现。
-- **P4**：前台服务通知、Quick Settings tile、后台资源锁、转发协议、日志与诊断未实现。
-- **行为误导风险**：当前“搜狗语音/快速网络/滴滴语音”通道只是保存并显示的标签，实际合成仍由系统默认引擎处理。完成真实路由前应隐藏该选择或标注未接入，不能让用户误以为已切换供应方。
-- **分享行为**：当前版本实现分享文本后朗读；静态 Manifest 暂未证实该流程属于原版，保留为复刻版额外体验时须在产品说明中标注。
+### 7.1 已完成（有代码 + 编译/单测证据）
+
+- **P0 系统 TTS 引擎**：`service.MultiTtsService`（action `TTS_SERVICE` + `CATEGORY_DEFAULT`，permission `BIND_TEXT_TO_SPEECH_SERVICE`），
+  语言/音色查询、语速/音调/音量映射、`onStop` 取消、`onGetVoices` 只暴露 `usable` 音色。
+  另加 `CHECK_TTS_DATA` / `GET_SAMPLE_TEXT` / `CONFIGURE_ENGINE` 三个 `Theme.NoDisplay` Activity（`ui/engine/EngineSupportActivities.kt`）。
+- **P1 本地工作台**：`ui/MultiTtsScreen.kt` 五页（工作台 / 语音包 / 角色 / 替换 / 设置），分段预览、管线告警、音色选择、停止。
+- **P2 数据管理**：语音包安装/删除/在线目录（`VoicePackStore`、`VoicePackCatalog`、`VoiceRegistry`），
+  角色规则与替换规则 JSON 持久化（`data/config/RulesRepository`）、许可证 SecretStore、Edge 端点设置。
+- **P3 语义合成**：`domain/TextPipeline`（替换 → 引号对话识别 → 分句 → 角色匹配 → 纯标点过滤）、
+  `SynthesisPlanBuilder`（音色回退）、`MultiSegmentSynthesizer`（24 kHz/PCM16/单声道串行 + 片段间 80 ms 静音）。
+- **引擎适配**：`EdgeTtsEngine`（WebSocket + `Sec-MS-GEC` + 403 校时重试 + `Mp3PcmDecoder`）、
+  `MicrosoftEmbeddedEngine`（`EmbeddedSpeechConfig.fromPath`，缺许可证直接 `LICENSE_REQUIRED`）。
+
+### 7.2 与原版目标的差距
+
+- **P3 角色识别**：只有显式规则匹配，没有原版的自动人物分配、最近 Voice 记忆、男女名规则。
+- **P4 全部未做**：前台服务通知、Quick Settings tile、后台 WakeLock/WifiLock、缓存与日志导出、转发协议。
+- **语音缓存**：无音频缓存，每次朗读都重新请求/合成。
+- **在线引擎的合规性**：Edge Read Aloud 是非官方接口，可能随时失效；微软离线必须用户自备合法许可证。
+- **旧版 `pack.json`**：仍能安装，但音色不注册给系统（绑定的是别的引擎的语音名）。
+- **界面未做真机验收**：五页只有编译与静态核对，没有截图对照原版。
+- **分享朗读**：`ACTION_SEND text/plain` 保留为复刻版附加能力，未在静态证据中证实属于原版。
+
+### 7.3 本轮修复记录（踩坑）
+
+- service 的 intent-filter 必须含 `CATEGORY_DEFAULT`：`TextToSpeech` 用 `queryIntentServices(..., MATCH_DEFAULT_ONLY)` 枚举引擎，
+  缺失时 `getEngines()` 不含本应用，显式指定引擎会被静默回落到默认引擎。
+- 打包必须排除 netty 的 `META-INF/INDEX.LIST` 等重复资源（微软语音 SDK 的传递依赖各带一份）。
+- `scripts/build.ps1` 需要 UTF-8 BOM，否则 PowerShell 5.1 按 ANSI 读中文会语法报错。
 
 ## 8. 验收清单
 
+勾选只代表**已验证**；编码完成但未上真机的条目标注「（已编码，待真机）」。
+
 ### P0 系统 TTS
 
-- [x] Android TTS 设置能发现并选择 MultiTTS。（引擎可枚举可绑定；系统默认切换需手动，见 §7）
-- [ ] `CHECK_TTS_DATA` 与 `GET_SAMPLE_TEXT` 返回合法结果。
-- [ ] 中英文语言能力与 Voice 列表一致。
-- [x] 标准调用能成功朗读；语速、音调、音量和 Voice 确实传入 engine adapter。（2026-11-10 真机验证：显式引擎路径回环成功）
-- [ ] Stop 会取消网络/本地任务并触发正确状态；Activity 不在前台也能合成。
-- [ ] Voice 不存在、语言不支持、引擎未初始化、超时和离线均有明确错误和恢复路径。
-- [ ] 前台合成通知遵循 Android 版本权限要求；任务结束后无残留服务/锁。
+- [x] Android TTS 设置能发现并选择 MultiTTS。（2026-11-10 真机：引擎可枚举可绑定，手动切换默认引擎成功）
+- [ ] `CHECK_TTS_DATA` 与 `GET_SAMPLE_TEXT` 返回合法结果。（已编码，待真机）
+- [ ] 中英文语言能力与 Voice 列表一致。（已编码，待真机）
+- [x] 标准调用能成功朗读；语速、音调、音量和 Voice 确实传入 engine adapter。（2026-11-10 真机验证的是旧「委托代理」链路；新引擎链路待真机）
+- [ ] Stop 会取消网络/本地任务并触发正确状态；Activity 不在前台也能合成。（已编码，待真机）
+- [ ] Voice 不存在、语言不支持、引擎未初始化、超时和离线均有明确错误和恢复路径。（已编码，待真机）
+- [ ] 前台合成通知遵循 Android 版本权限要求；任务结束后无残留服务/锁。（P4 未做）
 
 ### P1/P2 工作台和数据
 
-- [ ] 输入、粘贴、清空、示例、Voice 搜索和选择可用。
-- [ ] 设置旋转/进程重建后仍正确；数据库迁移有测试。
-- [ ] 引擎/Voice 的新建、编辑、禁用、删除与引用清理正确。
-- [ ] 角色/替换的所有字段可编辑；正则非法时有定位信息。
-- [ ] 导入冲突可选择跳过/覆盖；异常包不会损坏已有数据。
-- [ ] 关键界面中文资源完整，长名称和较大字体不遮挡控件。
+- [ ] 输入、粘贴、清空、示例、Voice 搜索和选择可用。（已编码，待真机）
+- [ ] 设置旋转/进程重建后仍正确；数据库迁移有测试。（规则/设置走 JSON + SharedPreferences，无迁移测试）
+- [ ] 引擎/Voice 的新建、编辑、禁用、删除与引用清理正确。（语音包安装/删除已编码；引用清理未做）
+- [ ] 角色/替换的所有字段可编辑；正则非法时有定位信息。（已编码，待真机）
+- [ ] 导入冲突可选择跳过/覆盖；异常包不会损坏已有数据。（同 ID 覆盖安装已实现；无冲突交互）
+- [ ] 关键界面中文资源完整，长名称和较大字体不遮挡控件。（待真机看截图）
 
 ### P3/P4 语义与后台
 
-- [ ] 同一文本的分句、替换、角色映射有可重复的单元测试。
-- [ ] 自动分配开关关闭时不为未匹配角色静默选择 Voice。
-- [ ] 多音色输出片段顺序正确，采样率转换不造成断音/失速。
-- [ ] 后台通知动作、Quick Settings 和转发流程经真机验证。
-- [ ] 诊断导出明确提示隐私内容并支持用户检查导出范围。
+- [ ] 同一文本的分句、替换、角色映射有可重复的单元测试。（`TextPipelineTest` 已覆盖部分，待补齐角色/过滤用例）
+- [ ] 自动分配开关关闭时不为未匹配角色静默选择 Voice。（无自动分配功能）
+- [ ] 多音色输出片段顺序正确，采样率转换不造成断音/失速。（已编码，待真机听感验收）
+- [ ] 后台通知动作、Quick Settings 和转发流程经真机验证。（P4 未做）
+- [ ] 诊断导出明确提示隐私内容并支持用户检查导出范围。（未做）
 
 ## 9. 未决问题与下一轮逆向工作
 

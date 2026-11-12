@@ -431,10 +431,11 @@ synthesizer.SpeakSsml(ssml)
    - 角色规则命中。
    - 多音字替换。
    - 纯标点过滤开关差异。
-10. 更新：
-    - `README.md`
-    - `docs/VOICE_PACKS.md`
-    - `docs/REIMPLEMENTATION_TARGET.md`
+10. 更新文档（**2026-11-12 已完成一轮，未提交**）：
+    - `README.md` 已按「真引擎」现状重写（对照表、能力/未实现、目录、构建、语音包、系统 TTS 使用、已知限制、下一步）。
+    - `docs/VOICE_PACKS.md` 已重写为原版 YAML 包格式 + 目录协议 + 安装安全边界。
+    - `docs/REIMPLEMENTATION_TARGET.md` §7 改为「进展」并写入本轮踩坑，§8 验收框标注「已编码，待真机」。
+    - 真机验收完成后只需把 §8 的框按实测结果勾选，并把「运行时未验证」的措辞收紧。
 
 ## 6. 绝对不能重复踩的坑
 

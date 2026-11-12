@@ -1,57 +1,95 @@
 # MultiTTS 复刻版
 
-以 Kotlin + Jetpack Compose 重实现 `org.nobody.multitts` 的**系统 TTS 引擎**能力。
-复刻版包名为 `org.nobody.multitts.replica`，可与原版共存安装，便于真机对照。
+用 Kotlin + Jetpack Compose 重实现 [`org.nobody.multitts`](https://github.com/jing332/tts-server-android) 一类的
+**Android TTS 引擎**：应用自己解析语音包、自己合成音频，作为系统 TTS provider 被其他应用调用，
+而不是把朗读转发给别的引擎。
 
-> 当前状态：**P0 引擎链路已打通**。应用已注册 `TextToSpeechService`，可作为系统语音引擎被其他应用绑定；
-> 合成目前**委托给设备上已有的引擎**（默认优先系统默认引擎），自身尚无音色模型。
+复刻版包名 `org.nobody.multitts.replica`，可与原版共存安装，方便真机对照。
+
+> **当前状态**：`:app:assembleDebug` 通过，7 个单元测试全绿，APK 可产出；
+> **但真机运行尚未验证**（Edge 是否真能出声、系统 TTS 是否真调到本应用、界面截图验收都还没做）。
+> 详见 [HANDOFF.md](HANDOFF.md) 的状态与卡点章节。
+
+## 与旧版的区别
+
+旧版本只做「委托代理」：把文本转给设备上另一个 TTS，再把 WAV 回传，本身没有音色。
+现在改为真正的引擎实现：
+
+| 能力 | 旧版 | 现在 |
+| --- | --- | --- |
+| 合成来源 | 转发给系统默认引擎 | 自己解析语音包，走 Edge 在线 / 微软嵌入式离线引擎 |
+| 音色 | 系统已装引擎的音色 | `multitts:<packId>:<engineCode>:<voiceCode>` 稳定音色名 |
+| 文本处理 | 无 | 规范化 → 替换规则 → 引号对话识别 → 分句 → 角色匹配 → 纯标点过滤 |
+| 多音色 | 无 | 旁白/对话/角色各自绑定音色，串行合成后拼接（24 kHz/16-bit/单声道，片段间 80 ms 静音） |
+| 语音包 | 只能声明「引擎 + 语音名」 | 直接吃原版语音包（`config.yaml` + `engines.yaml`），带引擎元数据与音色参数 |
+
+`engine/proxy/SystemProxyEngine.kt` 仍然保留，仅作为旧 `pack.json` 兼容参考，**不再是默认真实现**。
 
 ## 已有能力
 
-- 系统 TTS 引擎：`service.MultiTtsService`（`android.intent.action.TTS_SERVICE`），支持语言/音色查询、语速/音调/音量映射、停止与取消
-- 委托代理合成：把文本转交选定引擎 `synthesizeToFile`，解码 WAV（PCM 8/16/24/32、float32）后按 PCM 分块流式回传
-- Compose 工作台：文本输入、语速/音量/音调滑块、**真实引擎选择**（跟随系统默认 / 任一已装引擎）、音色选择、朗读与停止
-- **语音包**：导入本地 zip、填写在线目录地址后下载安装、查看/应用/删除；包内音色可绑定到"引擎 + 语音名"，应用即切换
-- 分享文本直接朗读（`ACTION_SEND` / `text/plain`）
-- 角色、替换规则、最近文本本地持久化（SharedPreferences）
-- 读取系统已安装语音引擎的音色列表
+- **系统 TTS 引擎**：`service.MultiTtsService`，注册 `android.intent.action.TTS_SERVICE` + `CATEGORY_DEFAULT`，
+  支持语言/音色查询、语速/音调/音量映射、`onStop` 取消，按语音包解析结果合成。
+- **语音包**：导入原版 zip（`config.yaml` + `engines.yaml`）或旧版 `pack.json`；本地 SAF 导入、在线目录下载、
+  sha256 校验、临时目录安装（失败不破坏已装版本）、删除。
+- **音色注册表**：把语音包展开为 `VoiceDescriptor`，离线音色缺许可证时标记 `usable=false` 且**不暴露给系统**。
+- **在线引擎（Edge Read Aloud）**：WebSocket 协议 + `Sec-MS-GEC` 校验 + 403 校时重试，MP3 经 `MediaCodec` 解码为 PCM16。
+- **离线引擎（微软 Embedded Speech）**：`EmbeddedSpeechConfig.fromPath` + 用户在设置里填入的自己合法许可证。
+- **文本管线**：普通/正则替换、中文引号（`“”`/`「」`/`『』`/ASCII）对话切分、句读分句、超长切分、
+  显式角色规则匹配（优先级、仅对话）、纯标点过滤（默认开）。
+- **工作台界面**：五页（工作台 / 语音包 / 角色 / 替换 / 设置），分段预览、管线告警、音色选择、朗读与停止。
+- **系统入口**：`CHECK_TTS_DATA`（回传可用/不可用音色）、`GET_SAMPLE_TEXT`（中英文示例）、`CONFIGURE_ENGINE`（打开应用）。
+- 分享文本直接朗读（`ACTION_SEND` / `text/plain`），`--es packUrl` / `--es catalog` 自动化入口。
 
-## 尚未实现（不要误认为可用）
+## 尚未实现 / 不要误认为可用
 
-- 角色与替换规则只做字符串保存，**从未参与合成**
-- 无多音色分角色朗读、无本地模型、无前台服务/通知/QS 磁贴
-- 引擎只会转发给别的引擎；把系统默认引擎切成复刻版后，若设备上再没有其他引擎，将无音源
+- **未做真机验证**：Edge 真实发声、MP3 解码、系统 TTS 调用、离线包发声都只有编译与单测证据。
+- **微软离线必须用户自己提供合法嵌入式语音许可证**，仓库不携带、也不复制原版 APK 里的授权信息。
+- 旧版 `pack.json` 语音包可以安装，但音色不会进入系统音色列表（需要映射到真实引擎）。
+- 无前台服务/通知/Quick Settings tile/后台资源锁，长文本在后台可能被系统回收。
+- 无自动角色分配、无 LLM 人物识别，未命中的对话一律用默认对话音色；多音字靠替换规则。
+- 不兼容 `tts-server-android` 的 JS 插件与配置格式；不引入 Room（规则 JSON + SharedPreferences）。
+- 界面只做了编译与静态核对，没有截图验收；MiUI 锁屏时 `adb shell input` 被拒，UI 自动化受限。
 
 ## 目录
 
 ```
 app/src/main/java/org/nobody/multitts/replica/
-├── MainActivity.kt          # 入口，处理分享文本
-├── data/                    # SpeechController（系统 TTS 客户端）、SpeechVoice、voicepack/（语音包解析/仓库/在线目录）
-├── engine/                  # 引擎契约（api/EngineApi）、引擎枚举（EngineCatalog）、委托代理（proxy/）
-├── service/                 # MultiTtsService：系统 TextToSpeechService 实现
-├── ui/                      # Compose 界面与 MainViewModel
-└── ui/theme/                # 配色与主题
-docs/REIMPLEMENTATION_TARGET.md   # 原版逆向结论与分期目标
-docs/VOICE_PACKS.md          # 语音包格式、在线目录协议、导入/下载与安全边界
-samples/demo-xiaomi/         # 示例语音包（pack.json）
-scripts/                     # build.ps1 / install.ps1 / make-pack.ps1
+├── MainActivity.kt              # 入口：分享文本、packUrl、catalog、open=voicepacks
+├── data/
+│   ├── config/RulesRepository   # 角色/替换规则 JSON 持久化
+│   ├── settings/                # SettingsStore + SecretStore（许可证）
+│   └── voicepack/               # 原版包解析、安装仓库、在线目录、音色注册表
+├── domain/                      # TextPipeline / SynthesisPlanBuilder / Rules
+├── engine/
+│   ├── api/                     # 引擎契约：SynthesisEngine、Listener、错误码
+│   ├── edge/                    # Edge Read Aloud + GEC 校验 + MP3 解码
+│   ├── microsoft/               # 微软嵌入式离线引擎
+│   ├── EngineManager.kt         # 按 engineCode 选后端
+│   ├── MultiSegmentSynthesizer   # 多段串行 + 拼接
+│   └── proxy/                   # 旧的系统代理实现（兼容参考）
+├── service/MultiTtsService.kt   # 系统 TextToSpeechService
+└── ui/                          # MultiTtsScreen 五页、MainViewModel、引擎配置 Activity、主题
+docs/VOICE_PACKS.md              # 语音包格式、在线目录协议、安全边界
+docs/REIMPLEMENTATION_TARGET.md  # 原版逆向结论与分期目标
+samples/demo-xiaomi/             # 示例语音包（pack.json，旧格式）
+scripts/                         # build.ps1 / install.ps1 / make-pack.ps1
 ```
 
 ## 构建
 
-前置：JDK 17+、Android SDK（`platforms/android-37.0`、`build-tools/36.x`）、已预热的 Gradle 离线缓存。
+前置：JDK 17+、Android SDK（`platforms/android-37.0`、`build-tools/36.x`）、已预热的 Gradle 缓存。
 
 ```powershell
-./scripts/build.ps1                       # 默认 :app:assembleDebug
-./scripts/build.ps1 -Task :app:assembleRelease
-./scripts/build.ps1 -Clean -NoOffline     # 需要联网拉依赖时
+./scripts/build.ps1 -Task ':app:compileDebugKotlin' -NoOffline
+./scripts/build.ps1 -Task ':app:testDebugUnitTest' -NoOffline
+./scripts/build.ps1                                   # 默认 :app:assembleDebug
+./scripts/build.ps1 -Clean -NoOffline                 # 需要联网拉依赖时
 ```
 
 脚本会自动解析 `ANDROID_HOME`、`GRADLE_USER_HOME`（默认 `%LOCALAPPDATA%\MultiTTS\gradle-home`）、
-`GRADLE_RO_DEP_CACHE` 并生成 `local.properties`，不再需要手工 export。
+`GRADLE_RO_DEP_CACHE` 并生成 `local.properties`。产物在 `app/build/outputs/apk/debug/app-debug.apk`。
 
-产物：`app/build/outputs/apk/debug/app-debug.apk`
+脚本带 UTF-8 BOM，`powershell`（5.1）和 `pwsh`（7+）都能直接跑。
 
 ### 构建必须提权的原因
 
@@ -62,8 +100,7 @@ Gradle 启动器需要 JDK 的 NIO selector；JDK 21 在 Windows 上用 AF_UNIX�
 java.io.IOException: Unable to establish loopback connection
 ```
 
-这不是项目配置问题，`--no-daemon`、换 SelectorProvider 均无效。构建时必须以
-`danger-full-access` 权限执行 `scripts/build.ps1`。
+这不是项目配置问题，`--no-daemon`、换 SelectorProvider 均无效。构建时需以 `danger-full-access` 权限执行。
 
 ## 安装
 
@@ -72,55 +109,46 @@ java.io.IOException: Unable to establish loopback connection
 ./scripts/install.ps1              # 只安装现有 APK
 ```
 
-设备签名不一致时脚本会提示先 `uninstall`，因为旧的复刻版安装包使用了不同的调试签名。
-
-## 已知限制
-
-- **服务必须声明 `android.intent.category.DEFAULT`**：`TextToSpeech` 用 `queryIntentServices(..., MATCH_DEFAULT_ONLY)` 枚举引擎，
-  少了该 category 时 `getEngines()` 不含本应用，显式指定引擎会被静默回落到默认引擎（实测踩过）
-- 系统默认引擎切换无法用 adb 完成（MIUI 拒绝 `WRITE_SECURE_SETTINGS`），需在“设置 → 语音合成”手动选择
-- 无测试依赖（离线缓存中缺少 JUnit/AndroidX Test），单测需联网补齐后再接入
-- 语音包目录默认允许明文 HTTP（自建 NAS/局域网场景），公网分发请用 HTTPS 并填写 `sha256`
-- `values/strings.xml` 与 `values-zh-rCN/strings.xml` 内容相同，默认语言仍是中文
-- 真机为 MIUI 且常处于锁屏，`adb shell input` 被系统拒绝，UI 自动化需先解锁或改用模拟器
-
-## 真机验证（2026-11-10）
-
-```powershell
-# 用显式引擎启动（不改系统默认），随后观察 logcat
-adb shell am start -a android.intent.action.SEND -t text/plain `
-  --es android.intent.extra.TEXT "复刻版引擎自检。" `
-  --es engine org.nobody.multitts.replica `
-  -n org.nobody.multitts.replica/.MainActivity
-adb logcat -s MultiTtsService
-```
-
-预期日志：`Sucessfully bound to org.nobody.multitts.replica` → `delegating synthesis to <engine>` →
-`streaming pcm: 24000Hz fmt=2 ch=1` → `synthesis finished`，同时客户端进程出现 `AudioTrack` 播放。
-
 ## 语音包
 
-详见 [`docs/VOICE_PACKS.md`](docs/VOICE_PACKS.md)。最简流程：
+原版语音包 zip 的根目录有 `config.yaml`（引擎代码 → 音色列表）与 `engines.yaml`（引擎元数据），
+直接导入即可；旧版 `pack.json` 仍能安装。格式、字段与在线目录协议见
+[`docs/VOICE_PACKS.md`](docs/VOICE_PACKS.md)。
 
 ```powershell
-# 1) 打包（输出 zip 路径与可直接粘贴进 catalog.json 的字段）
-./scripts/make-pack.ps1 -SourceDir ./samples/demo-xiaomi -OutputDir ./dist
-
-# 2) 本地联调：起一个静态服务并让设备回环访问
+# 本地联调：静态服务 + 设备回环
 adb reverse tcp:8765 tcp:8765
-python -m http.server 8765   # 在 dist 所在目录
+python -m http.server 8765
 
-# 3) 直接安装 zip 直链 / 指定在线目录
-adb shell am start --es packUrl "http://127.0.0.1:8765/demo-xiaomi-1.0.0.zip" -n org.nobody.multitts.replica/.MainActivity
+# 直接安装 zip 直链 / 设置在线目录
+adb shell am start --es packUrl "http://127.0.0.1:8765/pack.zip" -n org.nobody.multitts.replica/.MainActivity
 adb shell am start --es catalog "http://127.0.0.1:8765/catalog.json" -n org.nobody.multitts.replica/.MainActivity
 ```
 
-应用内「语音包」界面同样支持 SAF 导入本地 zip 与在线下载（含 sha256 校验、临时目录安装、失败不破坏已装版本）。
+## 作为系统 TTS 使用
 
-## 后续规划
+1. 安装并打开应用，在「语音包」里导入语音包；
+2. 系统设置 → 语音合成（部分 ROM 在「无障碍」）→ 首选引擎选 **MultiTTS 复刻版**；
+3. 其他应用调用 TTS 时，系统只会看到 `usable=true` 的 `multitts:...` 音色；
+4. 想验证引擎被调用：`adb logcat -s MultiTtsService`，应看到 `synthesize` 相关日志。
 
-分阶段目标见 [`docs/REIMPLEMENTATION_TARGET.md`](docs/REIMPLEMENTATION_TARGET.md)：
-P0 引擎注册 → P1 工作台收口 → P2 数据层与 CRUD → P3 语义合成（分句/角色/多音色）→ P4 系统体验 → P5 在线扩展。
+## 已知限制
 
-当前 P0 采用**委托代理**策略：`TextToSpeechService` 把请求转发给设备上已安装的其他引擎，
-先把引擎契约、参数映射与真机链路打通；本地模型引擎作为独立模块后续接入。
+- **服务必须声明 `android.intent.category.DEFAULT`**：`TextToSpeech` 用
+  `queryIntentServices(..., MATCH_DEFAULT_ONLY)` 枚举引擎，少了该 category 时 `getEngines()` 不含本应用，
+  显式指定引擎会被静默回落到默认引擎（实测踩过）。
+- 系统默认引擎切换无法用 adb 完成（MIUI 拒绝 `WRITE_SECURE_SETTINGS`），需手动在设置里选。
+- 打包需排除 netty 的 `META-INF/INDEX.LIST`（微软语音 SDK 的传递依赖各带一份，重复会打不出包）。
+- 语音包目录默认允许明文 HTTP（自建 NAS/局域网场景），公网分发请用 HTTPS 并填写 `sha256`。
+- `values/strings.xml` 与 `values-zh-rCN/strings.xml` 内容相同，默认语言仍是中文。
+- 真机为 MIUI 且常处于锁屏，`adb shell input` 被系统拒绝，UI 自动化需先解锁或改用模拟器。
+
+## 下一步
+
+按 [HANDOFF.md](HANDOFF.md) §5 的顺序推进，当前第一件事是真机验收：
+
+1. 安装 APK，五页界面截图验收；
+2. 导入 Edge 语音包，确认音色出现在系统 TTS 列表并能出声；
+3. 导入离线微软包，确认无许可证时可见但不可用、且不暴露给系统；
+4. 用小说文本验证旁白/对话分段、角色规则、多音字替换、纯标点过滤；
+5. 再做 P4（前台通知/QS tile/后台锁）与本地模型扩展。
