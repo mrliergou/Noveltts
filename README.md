@@ -2,8 +2,6 @@
 
 NovelTTS 是一个 Android 文本转语音引擎。它可以导入语音包并使用在线 Edge Read Aloud 或微软 Embedded Speech 合成音频，也可以作为 Android 系统 TTS 引擎供阅读器等应用调用。
 
-> 当前仓库没有可下载的 GitHub Release。请按下方说明从源码构建 APK。
-
 ## 功能
 
 - 作为系统 TTS 引擎提供语言、音色查询和文本合成。
@@ -21,34 +19,6 @@ NovelTTS 是一个 Android 文本转语音引擎。它可以导入语音包并�
 - 当前 APK 仅打包 `arm64-v8a`。
 - Edge 在线语音需要网络连接。
 - 微软 Embedded Speech 离线语音需要用户自行提供合法许可证、模型文件和匹配版本的原生库。相关资源不随本仓库分发。
-
-## 从源码构建
-
-构建环境需要 JDK 17 或更高版本、Android SDK，以及项目所需的 Android SDK 平台和构建工具。Windows 项目脚本会自动查找 SDK 和 Gradle 缓存；也可以通过参数指定路径。
-
-在 PowerShell 中运行：
-
-```powershell
-./scripts/build.ps1
-```
-
-运行单元测试：
-
-```powershell
-./scripts/build.ps1 -Task ':app:testDebugUnitTest'
-```
-
-构建产物位于：
-
-```text
-app/build/outputs/apk/debug/app-debug.apk
-```
-
-连接并授权 Android 设备后，构建、安装并启动：
-
-```powershell
-./scripts/install.ps1 -Rebuild
-```
 
 ## 安装语音包与设置系统 TTS
 
@@ -71,4 +41,3 @@ app/build/outputs/apk/debug/app-debug.apk
 - 微软离线语音只有在本地模型、原生库和合法许可证均已配置时才能合成。
 - 角色识别依赖用户配置的显式规则；应用不会自动识别小说人物或自动分配角色音色。
 - 不支持原版 MultiTTS 的 JavaScript 插件与配置扩展。
-- 当前没有发布版 APK；请从源码自行构建。

@@ -101,21 +101,21 @@ packId = "vp-" + sha256(config.yaml + 0x00 + engines.yaml).take(16)
 
 ## 2. 旧版语音包（兼容）
 
-旧版 `pack.json` 只是「音色声明 + 系统引擎绑定」，用于旧版本的历史数据：
+旧版 `pack.json` 只是「音色声明 + 系统引擎绑定」，用于兼容旧版本数据。它不包含 NovelTTS 的合成音源：
 
 ```json
 {
-  "id": "demo-xiaomi",
-  "name": "示例语音包",
+  "id": "legacy-example",
+  "name": "旧格式示例",
   "version": "1.0.0",
-  "author": "MultiTTS",
-  "description": "绑定已装系统引擎的示例语音包",
+  "author": "Example",
+  "description": "旧版语音包格式示例",
   "voices": [
     {
-      "id": "mibrain-default",
-      "name": "小米系统音色",
+      "id": "external-default",
+      "name": "外部系统音色",
       "locale": "zh-CN",
-      "engine": "com.xiaomi.mibrain.speech",
+      "engine": "com.example.tts",
       "voiceName": null,
       "requiresNetwork": false
     }
@@ -126,8 +126,6 @@ packId = "vp-" + sha256(config.yaml + 0x00 + engines.yaml).take(16)
 - `id` 必须匹配 `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`；
 - 这类包可以安装、可以展示，但**不会**注册 `multitts:*` 音色给系统（它绑定的是别的引擎的语音）；
 - 新项目请优先用原版 YAML 格式。
-
-`samples/demo-xiaomi/pack.json` 是一个可直接导入的示例，`scripts/make-pack.ps1` 能把它打成 zip。
 
 ## 3. 在线目录
 
