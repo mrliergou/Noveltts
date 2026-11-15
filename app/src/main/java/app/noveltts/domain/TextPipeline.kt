@@ -24,6 +24,8 @@ object TextPipeline {
         roles: List<RoleRule>,
         replacements: List<ReplacementRule>,
         filterPurePunctuation: Boolean,
+        roleGroups: List<RuleGroup> = emptyList(),
+        replacementGroups: List<RuleGroup> = emptyList(),
     ): TextPipelineResult {
         val normalized = normalize(text)
         if (normalized.isBlank()) {
@@ -31,7 +33,12 @@ object TextPipeline {
         }
 
         val issues = mutableListOf<PipelineIssue>()
-        val transformed = applyReplacements(normalized, replacements, issues)
+        val transformed = applyReplacements(
+            normalized,
+            activeReplacements(replacements, replacementGroups),
+            issues,
+        )
+        val roleMatcher = RoleMatcher(activeRoles(roles, roleGroups), issues)
         val segments = mutableListOf<PipelineSegment>()
 
         quotedSpans(transformed).forEach { span ->
@@ -40,16 +47,13 @@ object TextPipeline {
                 if (cleaned.isEmpty()) return@forEach
                 if (filterPurePunctuation && cleaned.none { it.isLetterOrDigit() }) return@forEach
 
-                val role = if (span.isDialogue) {
-                    matchRole(cleaned, roles, issues)
-                } else {
-                    matchNarrationRole(cleaned, roles, issues)
-                }
+                val match = roleMatcher.match(cleaned, span.isDialogue)
                 val voiceId = when {
-                    !role?.voiceId.isNullOrBlank() -> role?.voiceId
+                    match != null -> match.voiceId
                     span.isDialogue -> dialogueVoiceId?.takeIf { it.isNotBlank() }
                     else -> narratorVoiceId?.takeIf { it.isNotBlank() }
                 }
+                val role = match?.rule
                 segments += PipelineSegment(
                     text = cleaned,
                     isDialogue = span.isDialogue,
@@ -82,7 +86,7 @@ object TextPipeline {
         issues: MutableList<PipelineIssue>,
     ): String {
         var result = text
-        replacements.filter { it.enabled }.sortedBy { it.order }.forEach { rule ->
+        replacements.forEach { rule ->
             if (rule.find.isEmpty()) return@forEach
             if (!rule.isRegex) {
                 result = result.replace(rule.find, rule.replaceWith)
@@ -199,35 +203,83 @@ object TextPipeline {
     private fun cleanupChunk(text: String): String =
         text.trim().trim('“', '”', '「', '」', '『', '』', '"').trim()
 
-    private fun matchRole(
-        text: String,
-        rules: List<RoleRule>,
+    /** 启用且所在分组未停用的替换规则，按 (分组 order, sortIndex) 排序。未知分组按默认分组处理。 */
+    private fun activeReplacements(
+        rules: List<ReplacementRule>,
+        groups: List<RuleGroup>,
+    ): List<ReplacementRule> {
+        val byId = groups.associateBy { it.id }
+        return rules
+            .filter { it.enabled && byId[it.groupId]?.enabled != false }
+            .sortedWith(
+                compareBy<ReplacementRule> { byId[it.groupId]?.order ?: RuleGroup.DEFAULT.order }
+                    .thenBy { it.sortIndex },
+            )
+    }
+
+    /** 启用、所在分组未停用且至少有一个音色的角色规则，按优先级降序，再按 (分组 order, sortIndex)。 */
+    private fun activeRoles(rules: List<RoleRule>, groups: List<RuleGroup>): List<RoleRule> {
+        val byId = groups.associateBy { it.id }
+        return rules
+            .filter { it.enabled && it.primaryVoiceId != null && byId[it.groupId]?.enabled != false }
+            .sortedWith(
+                compareByDescending<RoleRule> { it.priority }
+                    .thenBy { byId[it.groupId]?.order ?: RuleGroup.DEFAULT.order }
+                    .thenBy { it.sortIndex },
+            )
+    }
+
+    private class RoleMatch(val rule: RoleRule, val voiceId: String)
+
+    /**
+     * 单次 [build] 内的角色匹配器。正则在构造时一次性编译（无效正则只报告一次），
+     * 轮转计数按规则在列表中的位置记录，不依赖 id 唯一。
+     */
+    private class RoleMatcher(
+        private val rules: List<RoleRule>,
         issues: MutableList<PipelineIssue>,
-    ): RoleRule? = rules
-        .filter { it.enabled && it.voiceId.isNotBlank() }
-        .sortedWith(compareByDescending<RoleRule> { it.priority })
-        .firstOrNull { rule ->
-            compile(rule, issues)?.containsMatchIn(text) == true
+    ) {
+        private val regexes: List<Regex?> = rules.map { compile(it, issues) }
+        private val hits = IntArray(rules.size)
+
+        fun match(text: String, isDialogue: Boolean): RoleMatch? {
+            val index = rules.indices.firstOrNull { i ->
+                (isDialogue || !rules[i].onlyDialogue) && matches(i, text)
+            } ?: return null
+            return RoleMatch(rules[index], pickVoice(index))
         }
 
-    private fun matchNarrationRole(
-        text: String,
-        rules: List<RoleRule>,
-        issues: MutableList<PipelineIssue>,
-    ): RoleRule? = matchRole(text, rules.filter { !it.onlyDialogue }, issues)
+        private fun matches(index: Int, text: String): Boolean {
+            val regex = regexes[index] ?: return false
+            return when (rules[index].matchMode) {
+                RoleMatchMode.REGEX_CONTAINS, RoleMatchMode.REGEX_SUFFIX -> regex.containsMatchIn(text)
+                RoleMatchMode.REGEX_PREFIX -> regex.toPattern().matcher(text).lookingAt()
+                RoleMatchMode.EXACT -> regex.matches(text)
+            }
+        }
 
-    private fun compile(rule: RoleRule, issues: MutableList<PipelineIssue>): Regex? =
-        runCatching { Regex(rule.pattern) }.getOrElse { error ->
-            val id = "role:${rule.id}"
-            if (issues.none { it.ruleId == id }) {
+        private fun pickVoice(index: Int): String {
+            val rule = rules[index]
+            val voices = rule.voiceIds.filter { it.isNotBlank() }
+            if (rule.voiceSelectionMode == VoiceSelectionMode.FIXED || voices.size == 1) return voices.first()
+            return voices[hits[index]++ % voices.size]
+        }
+
+        private fun compile(rule: RoleRule, issues: MutableList<PipelineIssue>): Regex? {
+            val source = when (rule.matchMode) {
+                RoleMatchMode.REGEX_SUFFIX -> "(?:${rule.pattern})\\z"
+                else -> rule.pattern
+            }
+            return runCatching { Regex(source) }.getOrElse { error ->
                 issues += PipelineIssue(
                     field = "role",
                     message = "「${rule.name}」正则无效：${error.message}",
-                    ruleId = id,
+                    ruleId = "role:${rule.id}",
                 )
+                null
             }
-            null
         }
+    }
 
     private data class RawSpan(val text: String, val isDialogue: Boolean)
 }

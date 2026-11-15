@@ -13,8 +13,8 @@ object SynthesisPlanBuilder {
         text: String,
         narratorVoiceId: String?,
         dialogueVoiceId: String?,
-        roles: List<RoleRule>,
-        replacements: List<ReplacementRule>,
+        roles: RuleSet<RoleRule>,
+        replacements: RuleSet<ReplacementRule>,
         filterPurePunctuation: Boolean,
         voices: List<VoiceDescriptor>,
     ): BuiltSynthesisPlan {
@@ -29,9 +29,11 @@ object SynthesisPlanBuilder {
             text = text,
             narratorVoiceId = narrator?.systemName,
             dialogueVoiceId = dialogue?.systemName,
-            roles = roles,
-            replacements = replacements,
+            roles = roles.items,
+            replacements = replacements.items,
             filterPurePunctuation = filterPurePunctuation,
+            roleGroups = roles.groups,
+            replacementGroups = replacements.groups,
         )
         val segments = pipeline.segments.mapNotNull { segment ->
             val fallbackVoice = if (segment.isDialogue) dialogue else narrator

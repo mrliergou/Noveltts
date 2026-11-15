@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import app.noveltts.data.config.RulesRepository
+import app.noveltts.data.config.RulesStoreException
 import app.noveltts.data.settings.SettingsStore
 import app.noveltts.data.voicepack.CatalogEntry
 import app.noveltts.data.voicepack.VoiceDescriptor
@@ -28,6 +29,8 @@ import app.noveltts.data.voicepack.VoiceRegistry
 import app.noveltts.domain.PipelineIssue
 import app.noveltts.domain.ReplacementRule
 import app.noveltts.domain.RoleRule
+import app.noveltts.domain.RuleGroup
+import app.noveltts.domain.RuleSet
 import app.noveltts.domain.SynthesisPlanBuilder
 import app.noveltts.domain.TextPipeline
 import app.noveltts.engine.EngineManager
@@ -44,6 +47,8 @@ enum class AppSection(val label: String) {
     REPLACEMENTS("替换"),
     SETTINGS("设置"),
 }
+
+internal const val PACK_BUSY_IMPORT = "import"
 
 data class PreviewSegment(
     val text: String,
@@ -65,6 +70,11 @@ data class MainUiState(
     val packs: List<VoicePack> = emptyList(),
     val roles: List<RoleRule> = emptyList(),
     val replacements: List<ReplacementRule> = emptyList(),
+    val roleGroups: List<RuleGroup> = listOf(RuleGroup.DEFAULT),
+    val replacementGroups: List<RuleGroup> = listOf(RuleGroup.DEFAULT),
+    /** 角色规则文件读取失败的原因；非空时禁止保存角色规则，避免覆盖待恢复的文件。 */
+    val rolesLoadError: String? = null,
+    val replacementsLoadError: String? = null,
     val preview: List<PreviewSegment> = emptyList(),
     val pipelineIssues: List<PipelineIssue> = emptyList(),
     val punctuationFilter: Boolean = true,
@@ -81,6 +91,9 @@ data class MainUiState(
     val packStatus: String? = null,
 ) {
     val usableVoices: List<VoiceDescriptor> get() = voices.filter { it.usable }
+    val isImportingPack: Boolean get() = packBusyId == PACK_BUSY_IMPORT
+    val roleSet: RuleSet<RoleRule> get() = RuleSet(roleGroups, roles)
+    val replacementSet: RuleSet<ReplacementRule> get() = RuleSet(replacementGroups, replacements)
 }
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -195,8 +208,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             text = state.text,
             narratorVoiceId = state.narratorVoiceId,
             dialogueVoiceId = state.dialogueVoiceId,
-            roles = state.roles,
-            replacements = state.replacements,
+            roles = state.roleSet,
+            replacements = state.replacementSet,
             filterPurePunctuation = state.punctuationFilter,
             voices = state.voices,
         )
@@ -287,12 +300,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val systemVoice = voices.firstOrNull {
             it.usable && it.systemName == settings.systemVoice
         } ?: narrator
+        val roles = loadRules { rulesRepository.loadRoles() }
+        val replacements = loadRules { rulesRepository.loadReplacements() }
         _uiState.update {
             it.copy(
                 packs = packs,
                 voices = voices,
-                roles = rulesRepository.loadRoles(),
-                replacements = rulesRepository.loadReplacements(),
+                roles = roles.getOrNull()?.items ?: it.roles,
+                roleGroups = roles.getOrNull()?.groups ?: it.roleGroups,
+                rolesLoadError = roles.exceptionOrNull()?.message,
+                replacements = replacements.getOrNull()?.items ?: it.replacements,
+                replacementGroups = replacements.getOrNull()?.groups ?: it.replacementGroups,
+                replacementsLoadError = replacements.exceptionOrNull()?.message,
                 narratorVoiceId = narrator?.systemName.orEmpty(),
                 dialogueVoiceId = dialogue?.systemName.orEmpty(),
                 systemVoiceId = systemVoice?.systemName.orEmpty(),
@@ -311,19 +330,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val rules = _uiState.value.roles.toMutableList()
         val index = rules.indexOfFirst { it.id == rule.id }
         if (index >= 0) rules[index] = rule else rules += rule
-        val sorted = rules.sortedWith(
-            compareByDescending<RoleRule> { it.priority }.thenBy { it.name },
-        )
-        rulesRepository.saveRoles(sorted)
-        _uiState.update { it.copy(roles = sorted, statusMessage = "角色规则已保存") }
-        refreshPreview()
+        persistRoles(rules, "角色规则已保存")
     }
 
     fun deleteRole(rule: RoleRule) {
-        val rules = _uiState.value.roles.filterNot { it.id == rule.id }
-        rulesRepository.saveRoles(rules)
-        _uiState.update { it.copy(roles = rules, statusMessage = "已删除角色规则「${rule.name}」") }
-        refreshPreview()
+        persistRoles(_uiState.value.roles.filterNot { it.id == rule.id }, "已删除角色规则「${rule.name}」")
     }
 
     fun toggleRole(rule: RoleRule, enabled: Boolean) {
@@ -334,19 +345,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val rules = _uiState.value.replacements.toMutableList()
         val index = rules.indexOfFirst { it.id == rule.id }
         if (index >= 0) rules[index] = rule else rules += rule
-        val sorted = rules.sortedBy { it.order }
-        rulesRepository.saveReplacements(sorted)
-        _uiState.update { it.copy(replacements = sorted, statusMessage = "替换规则已保存") }
-        refreshPreview()
+        persistReplacements(rules, "替换规则已保存")
     }
 
     fun deleteReplacement(rule: ReplacementRule) {
-        val rules = _uiState.value.replacements.filterNot { it.id == rule.id }
-        rulesRepository.saveReplacements(rules)
-        _uiState.update {
-            it.copy(replacements = rules, statusMessage = "已删除替换规则「${rule.name}」")
-        }
-        refreshPreview()
+        persistReplacements(
+            _uiState.value.replacements.filterNot { it.id == rule.id },
+            "已删除替换规则「${rule.name}」",
+        )
     }
 
     fun toggleReplacement(rule: ReplacementRule, enabled: Boolean) {
@@ -360,6 +366,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         roles = emptyList(),
         replacements = _uiState.value.replacements,
         filterPurePunctuation = false,
+        replacementGroups = _uiState.value.replacementGroups,
     ).transformedText
 
     fun setCatalogUrl(url: String) {
@@ -540,6 +547,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             roles = state.roles,
             replacements = state.replacements,
             filterPurePunctuation = state.punctuationFilter,
+            roleGroups = state.roleGroups,
+            replacementGroups = state.replacementGroups,
         )
         val names = state.voices.associate { it.systemName to it.displayName }
         val preview = result.segments.map { segment ->
@@ -551,6 +560,56 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         _uiState.update { it.copy(preview = preview, pipelineIssues = result.issues) }
+    }
+
+    private fun <T> loadRules(load: () -> RuleSet<T>): Result<RuleSet<T>> =
+        try {
+            Result.success(load())
+        } catch (error: RulesStoreException) {
+            Log.w(TAG, "rules load failed", error)
+            Result.failure(error)
+        }
+
+    /** 当前编辑界面仍按「优先级降序、同级按名称」排列角色；sortIndex 随之重排。 */
+    private fun persistRoles(rules: List<RoleRule>, successMessage: String) {
+        val state = _uiState.value
+        state.rolesLoadError?.let { error ->
+            _uiState.update { it.copy(statusMessage = "角色规则文件无法读取，已阻止保存：$error") }
+            return
+        }
+        val sorted = rules
+            .sortedWith(compareByDescending<RoleRule> { it.priority }.thenBy { it.name })
+            .mapIndexed { index, rule -> rule.copy(sortIndex = index) }
+        try {
+            rulesRepository.saveRoles(RuleSet(state.roleGroups, sorted))
+        } catch (error: RulesStoreException) {
+            Log.w(TAG, "saveRoles failed", error)
+            _uiState.update { it.copy(statusMessage = "角色规则保存失败：${error.message}") }
+            return
+        }
+        _uiState.update { it.copy(roles = sorted, statusMessage = successMessage) }
+        refreshPreview()
+    }
+
+    /** 当前编辑界面仍以「顺序」字段控制替换先后；sortIndex 按 order 升序重排。 */
+    private fun persistReplacements(rules: List<ReplacementRule>, successMessage: String) {
+        val state = _uiState.value
+        state.replacementsLoadError?.let { error ->
+            _uiState.update { it.copy(statusMessage = "替换规则文件无法读取，已阻止保存：$error") }
+            return
+        }
+        val sorted = rules
+            .sortedBy { it.order }
+            .mapIndexed { index, rule -> rule.copy(sortIndex = index) }
+        try {
+            rulesRepository.saveReplacements(RuleSet(state.replacementGroups, sorted))
+        } catch (error: RulesStoreException) {
+            Log.w(TAG, "saveReplacements failed", error)
+            _uiState.update { it.copy(statusMessage = "替换规则保存失败：${error.message}") }
+            return
+        }
+        _uiState.update { it.copy(replacements = sorted, statusMessage = successMessage) }
+        refreshPreview()
     }
 
     private fun loadBaseState(): MainUiState = MainUiState(
@@ -649,7 +708,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         const val KEY_VOLUME = "volume"
         const val KEY_PITCH = "pitch"
         const val KEY_CATALOG_URL = "catalogUrl"
-        const val PACK_BUSY_IMPORT = "import"
         const val PACK_BUSY_CATALOG = "catalog"
     }
 }

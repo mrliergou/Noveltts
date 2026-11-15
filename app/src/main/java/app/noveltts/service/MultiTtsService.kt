@@ -14,11 +14,13 @@ import android.speech.tts.TextToSpeechService
 import android.speech.tts.Voice
 import android.util.Log
 import app.noveltts.data.config.RulesRepository
+import app.noveltts.data.config.RulesStoreException
 import app.noveltts.data.settings.SettingsStore
 import app.noveltts.data.voicepack.VoiceDescriptor
 import app.noveltts.data.voicepack.VoicePackEvents
 import app.noveltts.data.voicepack.VoicePackStore
 import app.noveltts.data.voicepack.VoiceRegistry
+import app.noveltts.domain.RuleSet
 import app.noveltts.domain.SynthesisPlanBuilder
 import app.noveltts.engine.EngineManager
 import app.noveltts.engine.MultiSegmentSynthesizer
@@ -144,8 +146,8 @@ class MultiTtsService : TextToSpeechService() {
             text = text,
             narratorVoiceId = narrator?.systemName,
             dialogueVoiceId = dialogue?.systemName,
-            roles = rules.loadRoles(),
-            replacements = rules.loadReplacements(),
+            roles = loadRulesOrEmpty("roles") { rules.loadRoles() },
+            replacements = loadRulesOrEmpty("replacements") { rules.loadReplacements() },
             filterPurePunctuation = settings.punctuationFilter,
             voices = descriptors,
         )
@@ -293,6 +295,15 @@ class MultiTtsService : TextToSpeechService() {
 
     private fun resolveVolume(params: Bundle?): Float =
         (params?.getFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1f) ?: 1f).coerceIn(0f, 1f)
+
+    /** 规则文件损坏或版本过新时不阻断系统朗读：本次按无规则处理，文件原样保留等待应用内修复。 */
+    private fun <T> loadRulesOrEmpty(label: String, load: () -> RuleSet<T>): RuleSet<T> =
+        try {
+            load()
+        } catch (error: RulesStoreException) {
+            Log.w(TAG, "$label unavailable, synthesizing without rules: ${error.message}")
+            RuleSet()
+        }
 
     private fun safeError(callback: SynthesisCallback) {
         runCatching {
