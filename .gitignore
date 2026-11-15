@@ -21,3 +21,5 @@ app/src/main/jniLibs/
 
 # UI/UX 本地预览输出（Compose 截图、临时导出，不提交源代码资产）
 .ui-preview/
+/HANDOFF.md
+/docs/REIMPLEMENTATION_TARGET.md
