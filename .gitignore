@@ -23,3 +23,10 @@ app/src/main/jniLibs/
 .ui-preview/
 /HANDOFF.md
 /docs/REIMPLEMENTATION_TARGET.md
+/docs/VOICE_PACKS.md
+/docs/UI_EFFECT_ATLAS.md
+/build.gradle.kts
+/settings.gradle.kts
+/gradle.properties
+/app/build.gradle.kts
+/app/src/test/
