@@ -13,5 +13,11 @@ local.properties
 voicepacks-local/
 语音包/
 
+# Claude Code 本地目录（计划文件、本地设置）
+.claude/
+
 # 本地联调用：从原版 APK 提取的微软嵌入式语音原生库（不可提交）
 app/src/main/jniLibs/
+
+# UI/UX 本地预览输出（Compose 截图、临时导出，不提交源代码资产）
+.ui-preview/

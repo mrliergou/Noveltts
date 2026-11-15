@@ -1,10 +1,13 @@
 # NovelTTS 开发交接
 
-最后更新：2026-11-12（第三次更新：项目改名 NovelTTS，包名迁移到 `app.noveltts`）  
+最后更新：2026-11-15（第六次更新：完成 Effect Atlas UI 规划与顶栏菜单/关闭图标资产，见 §0.3；阶段 0+1 改动仍未提交）
 项目根目录：`F:\codex\MultiTTS`  
 目标设备：`M2102J2SC`，Android 13 / SDK 33，arm64-v8a，adb 序列号记录为 `5cb24277`
 
 ## 0. 新会话先看这里
+
+> **最新进展先看 §0.3（2026-11-15）**：已完成 Effect Atlas 交互规划和顶栏菜单/关闭图标资产，尚未接入页面；§0.2 的界面拆分与 schema v2 改动仍未提交。
+> 下面这段「一句话状态」写于 2026-11-12，其中界面结构、单测数量已过时。
 
 **一句话状态：** `ui/MultiTtsScreen.kt` 已按新 `MainViewModel` 重建（1270 行，五页：工作台/语音包/角色/替换/设置），`:app:assembleDebug` 成功、13 个单测全绿、APK 已产出；三个系统 TTS 配置 Activity 也已补齐。**剩下的唯一断点是真机验证**——设备当前未连接（`adb devices` 为空），所以界面与系统调用都还没有在设备上跑过。
 
@@ -27,6 +30,157 @@
 - Edge 在线真实发声、MP3 解码、系统 TTS 调用、离线包导入后的真机发声都尚未验证（目前只有编译与单测证据）。
 - 微软离线引擎在没有用户合法 Embedded Speech 许可证时只验证了“缺许可证会报错”，不能宣称真实离线发声已完成。
 - 界面只做了静态核对与编译验证，**没有截图验收**。
+
+## 0.1 2026-11-14 会话记录：音色前缀迁移（只出了计划，代码未动）
+
+**状态：** 计划已写好并保存在 `.claude/plan/voice-prefix-migration.md`，**产品代码一行没改**，
+`VoiceRegistry.systemName()` 仍然产出 `multitts:`。执行方式：新会话运行
+`/ccg:execute .claude/plan/voice-prefix-migration.md`。
+
+**计划要点**（细节以计划文件为准）：
+
+- 新前缀 `noveltts:<packId>:<engineCode>:<voiceCode>`；新增纯 Kotlin 的 `VoiceIds.canonicalize()`，只替换开头的 `multitts:`。
+- 迁移挂在 `SettingsStore` / `RulesRepository` 的 `init` 里，不新建 `Application`；幂等，不加"已迁移"标记。
+- `roles.json` 升到 schema 2；`replacements.json` 保持 schema 1。
+- 系统 `onGetVoices()` 只列新名字；旧名字只在 `onIsValidVoiceName` / `onLoadVoice` / `onSynthesizeText` 里兼容。
+- 界面只改两处文案并加一行说明，不做弹窗。
+- **不改**：SharedPreferences 文件名 `"multitts"`、`SecretStore` 别名、类名、线程名、原版包 YAML 标签。
+
+**执行前要知道的事：**
+
+- 外部阅读器遇到旧名字的表现（保留 / 回落默认音色 / 报错）只是推断，**没有在设备上验证**，验收时要实测并写回 §6.13。
+- `roles.json` 迁移没有 JVM 单测：项目只有 `junit` 一个测试依赖，本地单测里 `org.json` 是桩。
+  计划用真机验收覆盖；若要 JVM 覆盖需加 `testImplementation("org.json:json")`，属于新增依赖，先问用户。
+- 本次会话的 Git Bash 里 `adb` 不在 PATH（`adb: command not found`），设备是否连接没查到；真机验收前先确认 adb 路径。
+- 多模型调用：codex 分析成功（`CODEX_SESSION: 01a1da99-0886-7592-b572-85a149ff493f`）；
+  gemini 启动即退出（退出码 41，缺 `GEMINI_API_KEY`），计划里的界面部分没有 gemini 的意见。
+
+**本文件里已过时、尚未修订的章节**（以 §6.5、§6.6、§6.14 和 git 记录为准）：
+
+- §0 一句话状态、§4 P2：写的是"设备未连接、Edge 与离线发声未验证"；之后的提交 `01d4829`、`0138ab3`、`ba632fa`
+  已修掉 Edge 握手 403 和电音问题，§6.14 记录离线「晓晓」真机合成成功。
+- §2、§7、§8：仍写 `MultiTtsScreen.kt` 缺失，实际已重建。
+- §3.1：`client-sdk:1.51.0` 实际已是 `1.37.0`。
+- §3.7：端点与鉴权参数是旧的，正确值见 §6.5。
+- §3.11：测试文件还有 `EdgeFramesTest.kt`，单测数量多于 13。
+- 文档仍未记录的验证项：系统 TTS 被其他应用调用能否出声、五页截图验收、小说文本的角色/替换/纯标点过滤实测。
+
+## 0.2 2026-11-15 会话记录：深度功能计划阶段 0 + 1（已实施，未提交）
+
+**计划文件：** `.claude/plan/noveltts-deep-features.md`（共 9 个阶段 0–8）。用户本轮只批准了**阶段 0（拆包）+ 阶段 1（规则 schema v2）**，
+直接在 `main` 上改，**尚未提交**。下一批按计划顺序是阶段 3（单段试听 + 朗读进度）→ 阶段 6（音色选择器增强）。
+执行方式：`/ccg:execute .claude/plan/noveltts-deep-features.md`，并告诉它从阶段 3 开始。
+
+**验证结果（只有编译和单测，没有真机）：**
+
+- `:app:testDebugUnitTest` → 5 个测试类共 **40 个**测试全部通过（RulesRepositoryMigrationTest 13、TextPipelineTest 13、PackYamlTest 6、EdgeFramesTest 5、EdgeGecTest 3）。
+- `:app:assembleDebug` → `BUILD SUCCESSFUL`；改动文件里没有编译警告。
+- 拆包后的界面、音色选择器 Sheet、删除确认弹窗、v1→v2 迁移都**没有在设备上跑过**。
+
+### 阶段 0：界面拆包
+
+| 位置 | 内容 |
+|------|------|
+| `ui/MultiTtsScreen.kt` | 只剩外壳：抽屉 `AppDrawer`、顶栏、`BottomPanel`。签名不变（`MainActivity` 依赖它）。 |
+| `ui/workbench/` | `WorkbenchPage.kt`（含 `SliderRow`、`SAMPLE_TEXT`）、`PreviewRow.kt` |
+| `ui/packs/` | `PacksPage.kt`（含 `PackCard`、删除语音包二次确认）、`CatalogRow.kt` |
+| `ui/rules/` | `RulesPageScaffold.kt`（单一 `LazyColumn` 骨架 + 加载失败横幅 + `RuleCard`）、`RolesPage.kt`、`ReplacementsPage.kt` |
+| `ui/settings/` | `SettingsPage.kt`（拆出 `EdgeEndpointCard`、`LicenseCard`） |
+| `ui/common/` | `SectionCard`/`SectionTitle`、`Badge`、`EmptyState`、`ConfirmDialog`、`SearchField`、`FilterChipRow`、`VoiceField`、`VoicePickerSheet`、`MenuCloseIcon`、`Formatters.kt`（`formatSize`/`voiceStatusLabel`/`voiceSubtitle`） |
+
+- `ui/VoicePackDialog.kt` **已删除**（没有引用，和主界面代码重复）。
+- 角色/替换列表从 `verticalScroll + forEach` 改为单一 `LazyColumn`，条目 key 是 `"rule:${id}"`；这是阶段 2 拖拽排序的前提。
+- `VoicePickerSheet` 取代旧的 `AlertDialog` 选择器：可搜索（显示名/包名/引擎/音色代码/系统名）、全部/在线/离线筛选、不可用音色灰显并显示原因。
+  整个 Sheet 是一个 `LazyColumn`（避免横屏时列表被压成 0 高度）；选中后先回调 `onSelect`，播完收起动画再回调 `onDismiss`，**调用方只在 `onDismiss` 里关闭**。
+- 删除规则、删除语音包都改为先弹 `ConfirmDialog`。
+- `PACK_BUSY_IMPORT` 现在是 `MainViewModel.kt` 里的 `internal const`，界面通过 `MainUiState.isImportingPack` 读，不要在 UI 再写一份 `"import"`。
+
+### 阶段 1：规则 schema v2
+
+**数据模型（`domain/Rules.kt`）：**
+
+- 新增 `RuleGroup(id, name, enabled, order)`，默认分组 `RuleGroup.DEFAULT`（id `"default"`，名称「默认」，order 100）。
+- 新增 `RuleSet<T>(groups, items)`；`RulesRepository` 的读写接口都改用它。
+- `RoleRule.voiceId: String` → **`voiceIds: List<String>`**，取首个非空音色用 `primaryVoiceId`；新增 `groupId`（非空，默认 `"default"`）、`matchMode`、`voiceSelectionMode`、`sortIndex`。
+- `ReplacementRule` 新增 `sortIndex`、`groupId`；`order` 保留为 v1 兼容字段。
+- `RoleMatchMode`：`REGEX_CONTAINS`（v1 行为）/ `REGEX_PREFIX`（`lookingAt`）/ `REGEX_SUFFIX`（`(?:p)\z`）/ `EXACT`（整段 `matches`）。
+- `VoiceSelectionMode`：`FIXED`（v1 行为）/ `ROUND_ROBIN`（同一次 `build()` 内该规则每命中一次换下一个音色）。
+
+**文本管线（`domain/TextPipeline.kt`）：**
+
+- `build()` 新增可选参数 `roleGroups`、`replacementGroups`（默认空列表，旧调用方不受影响）。
+- 规则生效条件：`enabled` 且所在分组没有停用；**不认识的分组按默认分组处理**（排序也用默认分组的 order）。
+- 替换执行顺序：(分组 order, sortIndex)。角色匹配顺序：priority 降序 → 分组 order → sortIndex。
+- 没有任何非空音色的角色规则会被跳过。
+- `RoleMatcher` 在构造时一次性编译全部正则（无效正则只报一个 issue），轮转计数按规则在列表中的位置记，不依赖 id 唯一。
+- `SynthesisPlanBuilder.build()` 的 `roles`/`replacements` 参数改为 `RuleSet`。
+
+**仓库（`data/config/RulesRepository.kt`）：**
+
+- 主构造函数改为 `RulesRepository(directory: File)`（供 JVM 单测），`RulesRepository(context)` 作为次构造函数保留。
+- 文件格式 `{"schema":2,"groups":[...],"items":[...]}`；v2 条目里**额外写一份 `voiceId`（首个音色）**，旧版本回装时还能读。
+- 迁移：`schema` 缺失或为 1 → 读取时迁移并**立即写回 v2**，原 v1 内容留在 `.bak`。
+  角色 sortIndex 按「优先级降序、同级保持文件顺序」生成；替换 sortIndex 按 `order` 升序生成。
+- 出错处理（新异常 `RulesStoreException : IOException`）：
+  - JSON 解析失败、缺 `items` 数组、`items` 里有非对象元素 → 原文件复制为 `.corrupt` 后抛异常，**原文件不动**；
+  - `schema > 2` → 直接抛异常，文件、`.bak`、`.corrupt` 都不碰；
+  - 文件不存在 → 返回只含默认分组的空集合。
+- 归一化：保证默认分组存在、分组 id 去重、条目引用不存在的分组时改为 `"default"`；
+  **重复的规则 id 会改名为 `id#2`、`id#3`…**（v1 在 id 缺失时回落成规则名，同名规则共享 id，列表以 id 为 key 会崩溃）。
+- 写入：`File.createTempFile` 生成唯一临时文件 → 重新解析校验 → 旧文件复制为 `.bak` → `Files.move(ATOMIC_MOVE)`，不支持原子移动时退回普通替换；临时文件在 `finally` 里删除。
+- 读写都持有一个**进程内**的全局锁 `LOCK`（见下方「已知限制」）。
+
+**调用方：**
+
+- `MainUiState` 新增 `roleGroups`、`replacementGroups`、`rolesLoadError`、`replacementsLoadError`，以及派生属性 `roleSet`/`replacementSet`/`isImportingPack`。
+- 某类规则加载失败时：`MainViewModel` 保留上一次的内存数据、记录错误，`persistRoles`/`persistReplacements` 拒绝保存；规则页显示红色横幅，新增/编辑/删除/开关全部禁用。
+- 保存时 ViewModel 会重排 sortIndex：角色按「优先级降序、同级按名称」，替换按 `order` 升序（界面仍按旧的优先级/顺序字段编辑，阶段 2 改成拖拽后再换）。
+- 编辑既有规则用 `rule.copy(...)`，**分组、匹配模式、轮转音色等 v2 字段会原样保留**；编辑对话框只改首个音色，其余轮转音色显示「另有 N 个轮转音色保持不变」。
+- `MultiTtsService` 加载规则失败时记日志，本次按没有规则合成（`loadRulesOrEmpty`），不阻断系统朗读。
+- `app/build.gradle.kts` 新增 `testImplementation("org.json:json:20240303")`：Android 自带的 `org.json` 在 JVM 单测里是空桩，规则仓库测试需要真实实现。只影响测试，不进 APK。
+
+### 已知限制（有意保留）
+
+- **只防同一进程内的并发写入。** `LOCK` 是 JVM 静态锁；目前 Manifest 里没有 `android:process`，界面和 `MultiTtsService` 在同一进程，所以现在不会出问题。
+  以后如果把服务放到独立进程，两边同时迁移或保存可能互相覆盖、`.bak` 也可能被冲掉——那时要加跨进程文件锁，并在保存前检查文件版本。
+- **新字段还没有编辑界面。** 分组、匹配模式、多音色、轮转在数据层和管线里都已生效，要到阶段 2（规则管理 UI 重构）才能在界面上编辑。
+
+### 与前缀迁移计划（§0.1）的冲突 —— 执行那个计划前必须先改它
+
+`.claude/plan/voice-prefix-migration.md` 写于本轮之前，里面的假设已经过时：
+
+1. 它计划把 `roles.json` 升到 **schema 2**——现在 schema 2 已被分组/多音色占用，前缀迁移需要改成 schema 3，或者不升版本、在 v2 里幂等地替换前缀。
+2. 它按单值 `voiceId` 写迁移逻辑——现在是 `voiceIds` 列表，外加一个冗余的 `voiceId`，两处都要替换。
+3. 它说 `roles.json` 迁移没有 JVM 单测、加 `org.json` 测试依赖需要先问用户——这个依赖本轮已经加上，可以直接写 JVM 单测。
+4. 它引用的界面行号（`ui/MultiTtsScreen.kt:145`、`:1028`）已失效：「系统音色名」文案现在在 `ui/MultiTtsScreen.kt` 的 `AppDrawer` 和 `ui/settings/SettingsPage.kt` 的「系统集成」卡片里。
+
+### 多模型协作记录
+
+- codex（`CODEX_SESSION: 01a1dd7f-a7ab-7110-a24a-281c110709e5`）：出了阶段 1 原型并做后端审计。采纳的修复：无效正则重复报错、重复 id 串用正则缓存和轮转计数、未知分组排到最后、非对象条目被静默丢弃。跨进程锁只记录、未实施（见上）。
+- gemini（`GEMINI_SESSION: 769e1742-acbd-4969-bb58-3a93c3dbeb61`）：本轮可用（§0.1 里的 `GEMINI_API_KEY` 问题已不存在），出了公共组件原型并做前端审计。采纳的修复：重复 id 导致列表崩溃、横屏时 Sheet 列表高度为 0、收起动画缺失、开关的读屏标签、48dp 触控区、`PACK_BUSY_IMPORT` 重复定义。
+  gemini 读不到 `.claude/plan/` 下的文件（被它的忽略规则挡住），需要把计划要点直接写进提示词。
+
+## 0.3 2026-11-15 会话记录：Effect Atlas UI 规划与图标资产
+
+**状态：** 已完成设计规划和一个可复用的 Compose 图标组件，未接入现有页面，未添加依赖，未修改业务逻辑。
+
+- `docs/UI_EFFECT_ATLAS.md` 记录了从 Effect Atlas 选取的可迁移交互模式、适用页面、采用边界、图标位置清单和后续落地顺序。
+- Effect Atlas 只作为交互灵感来源；Android 实现使用 Compose 状态、手势和动画，不接入网页 JavaScript、CSS、GSAP 或 hover 行为。
+- 已绘制 `app/src/main/java/app/noveltts/ui/common/MenuCloseIcon.kt`：顶栏菜单按钮的两条线在抽屉展开时交叉为关闭符号，图形为 24dp 单色线性风格，颜色跟随 Material 主题。
+- 组件使用 `animateFloatAsState` 驱动状态变化，并提供“打开导航菜单/关闭导航菜单”和展开状态的语义描述。接入时应由至少 48dp 的 `IconButton` 承载，并与 `drawerState` 共用展开状态。
+- 工作台、语音包、角色、替换、设置、日志等页面的通用图标仍等 UI 框架定稿后从同一套 Material 风格图标集中映射；不混用 emoji、Unicode 字符或临时手绘图标。
+- `.gitignore` 新增 `.ui-preview/`，用于忽略未来 Compose 截图或临时导出的本地 UI 预览；`MenuCloseIcon.kt` 和 `docs/UI_EFFECT_ATLAS.md` 属于项目源文件，必须保留在版本控制中。
+
+**本轮核对：** 已检查新组件和文档，`git diff --check -- docs/UI_EFFECT_ATLAS.md` 通过；未运行构建、单测、截图验收或真机验证。
+
+**下一步：** UI 框架定稿后，将 `MultiTtsScreen.kt` 顶栏的文字“菜单”替换为 48dp `IconButton` + `MenuCloseIcon(expanded = drawerState.isOpen)`，然后再按图标位置清单逐页接入统一图标集。
+
+### 待办（按优先级）
+
+1. [ ] 真机验证：放一份旧的 v1 `roles.json`（可以带两条同名、没有 id 的规则），打开应用后确认规则都在、`files/config/` 下生成了 `.bak`、重复 id 被改名为 `#2`。
+2. [ ] 真机检查音色选择器的搜索、筛选、横屏显示、收起动画，以及删除确认弹窗。
+3. [ ] 提交本轮改动（用户说「提交」或执行 `/ccg:commit` 时才做）。`.gitignore` 和本文件里有本轮之前就存在的未提交改动，提交前一起检查。
+4. [ ] 继续深度功能计划：阶段 3 → 阶段 6 → 阶段 2 → …
 
 ## 1. 我们在做什么
 
@@ -209,7 +363,7 @@ multitts:<packId>:<engineCode>:<voiceCode>
 - 许可证用 Android Keystore AES-GCM 加密后存 SharedPreferences，不写明文，不打印日志。
 - 角色规则存 `files/config/roles.json`。
 - 替换规则存 `files/config/replacements.json`。
-- JSON 带 `schema=1`，写入使用 `.tmp` 并保留 `.bak`。
+- ~~JSON 带 `schema=1`，写入使用 `.tmp` 并保留 `.bak`。~~ **2026-11-15 起为 schema 2**（分组 + 多音色 + 自动迁移 + 损坏保护），详见 §0.2。
 
 ### 3.5 文本管线
 
@@ -231,6 +385,8 @@ multitts:<packId>:<engineCode>:<voiceCode>
 9. 生成有序 `PlannedSegment(text, VoiceDescriptor)`。
 
 正则规则非法时返回带规则名的 `PipelineIssue`，不会让整个合成崩溃。
+
+**2026-11-15 更新：** 第 2、7 步改为按分组和 sortIndex 排序、支持分组停用、四种匹配模式和轮转音色，详见 §0.2「文本管线」。
 
 已测试：
 
@@ -357,6 +513,8 @@ synthesizer.SpeakSsml(ssml)
 **当前缺的是与这个 ViewModel 对应的新 Compose 页面。**
 
 ### 3.11 测试状态
+
+**最新（2026-11-15）：40 个测试全部通过**，新增 `data/config/RulesRepositoryMigrationTest.kt`（13 个），`TextPipelineTest` 增至 13 个；明细见 §0.2。以下是旧记录：
 
 最后一次完整单测结果：`13 tests completed`（TextPipeline / EdgeGec / PackYaml），全部通过。
 
@@ -598,6 +756,9 @@ UI 显示名可以变，系统 ID 不能随意变，否则已保存的默认音�
   ```
 - 受限沙箱不能完成 Gradle/JDK 回环管道，必须提权。
 - 首次依赖下载需要 `-NoOffline` 和网络。
+- **2026-11-15 实测：** 直接跑 `./gradlew` 会去下载 `gradle-9.6.0-bin.zip`（`~/.gradle` 下没有完整的分发包），中途打断会留下 `.lck`/`.part`，下次报 `Timeout ... waiting for exclusive access`。
+  一律用项目脚本，它会指向带离线缓存的 Gradle Home：
+  `pwsh -NoProfile -File scripts/build.ps1 -Task ':app:testDebugUnitTest' -NoOffline`（在 Git Bash 里要写 pwsh 的完整路径 `"/c/Program Files/PowerShell/7/pwsh.exe"`）。
 - `minSdk=26` 是微软 SDK 要求，不要为了兼容降回 23。
 - 当前只打包 `arm64-v8a`；x86_64 模拟器需要临时加 ABI。
 
@@ -613,9 +774,13 @@ UI 显示名可以变，系统 ID 不能随意变，否则已保存的默认音�
 
 1. `VoiceRegistry.systemName()` 改新前缀；
 2. `VoiceRegistry.find()` 保留旧 `multitts:` ID 的兼容映射（读旧写新），否则老用户音色瞬间全丢；
-3. `SettingsStore`/`RulesRepository` 持久化 voiceId 做一次性迁移；
-4. 界面两处「系统音色名」说明文案（`ui/MultiTtsScreen.kt:141`、`:1025`）；
+3. `SettingsStore`/`RulesRepository` 持久化 voiceId 做一次性迁移（`roles.json` 现在是 schema 2，要同时改 `voiceIds` 列表和冗余的 `voiceId`，见 §0.2）；
+4. 界面两处「系统音色名」说明文案（现位于 `ui/MultiTtsScreen.kt` 的 `AppDrawer` 和 `ui/settings/SettingsPage.kt` 的「系统集成」卡片）；
 5. 发布说明提示用户：外部阅读器需要重新选一次音色，这部分无法自动迁移。
+
+**2026-11-14：** 上述迁移已出完整实施计划（`.claude/plan/voice-prefix-migration.md`），**尚未实施**，本节"别顺手改"的约束在计划执行前仍然有效。
+计划对清单的两处细化：第 2 条的兼容不只在 `find()`，`SynthesisPlanBuilder` 和 `MultiTtsService` 的精确比较点也要归一；
+第 4 条的行号现为 `ui/MultiTtsScreen.kt:145`、`:1028`。概况见 §0.1。
 
 ## 7. 关键文件索引
 
@@ -651,15 +816,26 @@ UI 显示名可以变，系统 ID 不能随意变，否则已保存的默认音�
 
 UI：
 
-- `.../ui/MainViewModel.kt` 已完成
-- `.../ui/MultiTtsScreen.kt` 缺失，必须重建
-- `.../ui/VoicePackDialog.kt` 是旧界面，未被新 ViewModel 使用，可暂留或删除
-- `.../MainActivity.kt` 仍引用缺失的 `MultiTtsScreen`
+（2026-11-15 已按阶段 0 拆包，下面是现状）
+
+- `.../ui/MainViewModel.kt`：状态与业务入口
+- `.../ui/MultiTtsScreen.kt`：外壳（抽屉 / 顶栏 / 底部面板），签名由 `MainActivity` 固定
+- `.../ui/workbench/`、`ui/packs/`、`ui/rules/`、`ui/settings/`：各页面
+- `.../ui/common/`：公共组件（`VoicePickerSheet`、`ConfirmDialog`、`EmptyState`、`MenuCloseIcon` 等）
+- `.../ui/engine/EngineSupportActivities.kt`：系统 TTS 配置 Activity
+- ~~`ui/VoicePackDialog.kt`~~ 已删除
+
+文档：
+
+- `docs/UI_EFFECT_ATLAS.md`：Effect Atlas 交互模式适配记录、图标位置清单和 UI 落地顺序
 
 测试：
 
 - `app/src/test/java/app/noveltts/engine/edge/EdgeGecTest.kt`
+- `app/src/test/java/app/noveltts/engine/edge/EdgeFramesTest.kt`
 - `app/src/test/java/app/noveltts/domain/TextPipelineTest.kt`
+- `app/src/test/java/app/noveltts/data/voicepack/PackYamlTest.kt`
+- `app/src/test/java/app/noveltts/data/config/RulesRepositoryMigrationTest.kt`
 
 ## 8. 新会话推荐开场动作
 
