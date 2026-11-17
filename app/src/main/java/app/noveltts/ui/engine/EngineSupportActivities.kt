@@ -4,10 +4,14 @@ import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import java.util.Locale
 import app.noveltts.MainActivity
 import app.noveltts.data.settings.SettingsStore
 import app.noveltts.data.voicepack.VoicePackStore
 import app.noveltts.data.voicepack.VoiceRegistry
+import app.noveltts.engine.Category
+import app.noveltts.engine.DiagnosticsLog
+import app.noveltts.service.TtsLanguageProtocol
 
 /**
  * 系统「文字转语音」设置里点「检查语音数据」时被调起
@@ -20,17 +24,21 @@ class TtsCheckDataActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val registry = VoiceRegistry(this, VoicePackStore(this))
-        val licenseConfigured = SettingsStore(this).hasLicense()
-        val descriptors = registry.voices(licenseConfigured)
-
-        val available = ArrayList(descriptors.filter { it.usable }.map { it.systemName })
-        val unavailable = ArrayList(descriptors.filterNot { it.usable }.map { it.systemName })
-
+        DiagnosticsLog.attachStore(filesDir)
+        val checked = runCatching {
+            val settings = SettingsStore(this)
+            VoiceRegistry(this, VoicePackStore(this)).voices(settings.hasLicense(), settings.localTtsEnginePackage)
+                .map { TtsLanguageProtocol.Language(it.localeTag, it.usable) }
+                .let(TtsLanguageProtocol::check)
+        }.getOrElse { error ->
+            DiagnosticsLog.error(Category.ENGINE, "系统语音数据检查失败", error.message)
+            TtsLanguageProtocol.CheckResult(emptyList(), emptyList())
+        }
         val result = Intent()
-            .putStringArrayListExtra(TextToSpeech.Engine.EXTRA_AVAILABLE_VOICES, available)
-            .putStringArrayListExtra(TextToSpeech.Engine.EXTRA_UNAVAILABLE_VOICES, unavailable)
-        setResult(RESULT_OK, result)
+            .putStringArrayListExtra(TextToSpeech.Engine.EXTRA_AVAILABLE_VOICES, ArrayList(checked.available))
+            .putStringArrayListExtra(TextToSpeech.Engine.EXTRA_UNAVAILABLE_VOICES, ArrayList(checked.unavailable))
+        setResult(if (checked.available.isEmpty()) TextToSpeech.Engine.CHECK_VOICE_DATA_FAIL
+            else TextToSpeech.Engine.CHECK_VOICE_DATA_PASS, result)
         finish()
     }
 }
@@ -45,12 +53,20 @@ class TtsSampleTextActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val language = intent?.getStringExtra(EXTRA_LANGUAGE).orEmpty().lowercase()
+        val language = intent?.getStringExtra(EXTRA_LANGUAGE).orEmpty().lowercase(Locale.ROOT)
+        val supported = runCatching {
+            val settings = SettingsStore(this)
+            VoiceRegistry(this, VoicePackStore(this)).voices(settings.hasLicense(), settings.localTtsEnginePackage)
+                .filter { it.usable }.mapNotNull { TtsLanguageProtocol.locale(it.localeTag) }
+                .any { language.isBlank() || TtsLanguageProtocol.matches(it, language,
+                    intent?.getStringExtra("country"), intent?.getStringExtra("variant")) }
+        }.getOrDefault(false)
         val text = when {
             language.startsWith("en") -> SAMPLE_EN
             else -> SAMPLE_ZH
         }
-        setResult(RESULT_OK, Intent().putExtra(TextToSpeech.Engine.EXTRA_SAMPLE_TEXT, text))
+        setResult(if (supported) TextToSpeech.LANG_AVAILABLE else TextToSpeech.LANG_NOT_SUPPORTED,
+            Intent().putExtra(TextToSpeech.Engine.EXTRA_SAMPLE_TEXT, text))
         finish()
     }
 
@@ -73,7 +89,7 @@ class TtsConfigureActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        startActivity(Intent(this, MainActivity::class.java))
+        startActivity(Intent(this, MainActivity::class.java).putExtra("open", "integration"))
         finish()
     }
 }

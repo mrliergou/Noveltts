@@ -1,6 +1,7 @@
 package app.noveltts.ui
 
 import android.net.Uri
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
@@ -17,6 +18,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
@@ -25,18 +27,26 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import app.noveltts.ui.common.AppIcon
+import app.noveltts.ui.common.AppIconGlyph
+import app.noveltts.ui.common.BackgroundNotificationPermission
+import app.noveltts.ui.common.MenuCloseIcon
+import app.noveltts.ui.log.LogEventBar
+import app.noveltts.ui.log.LogPage
 import app.noveltts.ui.packs.PacksPage
 import app.noveltts.ui.rules.ReplacementsPage
 import app.noveltts.ui.rules.RolesPage
@@ -57,17 +67,29 @@ import kotlinx.coroutines.launch
 fun MultiTtsScreen(
     viewModel: MainViewModel,
     onOpenSystemSpeechSettings: () -> Unit,
-    openVoicePacksOnStart: Boolean = false,
+    openSectionOnStart: AppSection? = null,
+    openLogsOnStart: Boolean = false,
+    openIntegrationOnStart: Boolean = false,
+    openSettingsDetailOnStart: String? = null,
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    BackgroundNotificationPermission(active = state.isSpeaking || state.forwardRunning)
     val drawerState = rememberDrawerState(DrawerValue.Closed)
+    var showLogs by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    BackHandler(enabled = showLogs) { showLogs = false }
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri != null) viewModel.importPack(uri)
     }
 
-    LaunchedEffect(openVoicePacksOnStart) {
-        if (openVoicePacksOnStart) viewModel.selectSection(AppSection.PACKS)
+    LaunchedEffect(openSectionOnStart, openLogsOnStart) {
+        if (openLogsOnStart) showLogs = true
+        if (openSectionOnStart != null) viewModel.selectSection(openSectionOnStart)
+    }
+
+    if (showLogs) {
+        LogPage(onBack = { showLogs = false })
+        return
     }
 
     ModalNavigationDrawer(
@@ -77,6 +99,10 @@ fun MultiTtsScreen(
                 current = state.section,
                 onSelect = { section ->
                     viewModel.selectSection(section)
+                    scope.launch { drawerState.close() }
+                },
+                onOpenLogs = {
+                    showLogs = true
                     scope.launch { drawerState.close() }
                 },
                 onOpenSystemSpeechSettings = {
@@ -90,7 +116,9 @@ fun MultiTtsScreen(
             topBar = {
                 TopAppBar(
                     navigationIcon = {
-                        TextButton(onClick = { scope.launch { drawerState.open() } }) { Text("菜单") }
+                        IconButton(onClick = { scope.launch { drawerState.open() } }) {
+                            MenuCloseIcon(expanded = drawerState.isOpen)
+                        }
                     },
                     title = {
                         Column {
@@ -104,7 +132,13 @@ fun MultiTtsScreen(
                     },
                 )
             },
-            bottomBar = { BottomPanel(state = state, viewModel = viewModel) },
+            bottomBar = {
+                BottomPanel(
+                    state = state,
+                    viewModel = viewModel,
+                    onOpenLogs = { showLogs = true },
+                )
+            },
         ) { innerPadding ->
             Column(
                 modifier = Modifier
@@ -129,17 +163,31 @@ fun MultiTtsScreen(
                         state = state,
                         viewModel = viewModel,
                         onOpenSystemSpeechSettings = onOpenSystemSpeechSettings,
+                        openIntegration = openIntegrationOnStart,
+                        openDetail = openSettingsDetailOnStart,
+                        backEnabled = !drawerState.isOpen,
                     )
                 }
             }
         }
     }
+    BackHandler(enabled = drawerState.isOpen) { scope.launch { drawerState.close() } }
+}
+
+/** 抽屉页面到线性图标的映射：图标仅作辅助，文字标签始终保留。 */
+private fun AppSection.icon(): AppIcon = when (this) {
+    AppSection.WORKBENCH -> AppIcon.TEXT
+    AppSection.PACKS -> AppIcon.FOLDER
+    AppSection.ROLES -> AppIcon.PERSON
+    AppSection.REPLACEMENTS -> AppIcon.SWAP
+    AppSection.SETTINGS -> AppIcon.GEAR
 }
 
 @Composable
 private fun AppDrawer(
     current: AppSection,
     onSelect: (AppSection) -> Unit,
+    onOpenLogs: () -> Unit,
     onOpenSystemSpeechSettings: () -> Unit,
 ) {
     ModalDrawerSheet(modifier = Modifier.width(272.dp)) {
@@ -165,6 +213,7 @@ private fun AppDrawer(
             AppSection.entries.forEach { section ->
                 NavigationDrawerItem(
                     label = { Text(section.label) },
+                    icon = { AppIconGlyph(section.icon()) },
                     selected = current == section,
                     onClick = { onSelect(section) },
                     modifier = Modifier.padding(horizontal = 12.dp),
@@ -174,7 +223,15 @@ private fun AppDrawer(
             HorizontalDivider(modifier = Modifier.padding(horizontal = 20.dp))
             Spacer(Modifier.height(8.dp))
             NavigationDrawerItem(
+                label = { Text("诊断日志") },
+                icon = { AppIconGlyph(AppIcon.TERMINAL) },
+                selected = false,
+                onClick = onOpenLogs,
+                modifier = Modifier.padding(horizontal = 12.dp),
+            )
+            NavigationDrawerItem(
                 label = { Text("打开系统语音设置") },
+                icon = { AppIconGlyph(AppIcon.EXTERNAL) },
                 selected = false,
                 onClick = onOpenSystemSpeechSettings,
                 modifier = Modifier.padding(horizontal = 12.dp),
@@ -191,7 +248,11 @@ private fun AppDrawer(
 }
 
 @Composable
-private fun BottomPanel(state: MainUiState, viewModel: MainViewModel) {
+private fun BottomPanel(
+    state: MainUiState,
+    viewModel: MainViewModel,
+    onOpenLogs: () -> Unit,
+) {
     Surface(color = MaterialTheme.colorScheme.surface, shadowElevation = 8.dp) {
         Column(
             modifier = Modifier
@@ -202,16 +263,38 @@ private fun BottomPanel(state: MainUiState, viewModel: MainViewModel) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (state.isSpeaking) {
                         OutlinedButton(onClick = viewModel::stop, modifier = Modifier.weight(1f)) {
-                            Text("停止朗读")
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                AppIconGlyph(AppIcon.STOP, size = 20.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("停止朗读")
+                            }
                         }
                     } else {
                         Button(onClick = viewModel::speak, modifier = Modifier.weight(1f)) {
-                            Text("开始朗读")
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                AppIconGlyph(AppIcon.PLAY, size = 20.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("开始朗读")
+                            }
                         }
                     }
                 }
                 Spacer(Modifier.height(6.dp))
+                if (state.isSpeaking && !state.isPreview || state.isPaused) {
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        androidx.compose.material3.TextButton(onClick = viewModel::previousSegment, modifier = Modifier.weight(1f)) { Text("上一段") }
+                        androidx.compose.material3.TextButton(onClick = if (state.isPaused) viewModel::resume else viewModel::pause,
+                            modifier = Modifier.weight(1f)) { Text(if (state.isPaused) "继续朗读" else "暂停") }
+                        androidx.compose.material3.TextButton(onClick = viewModel::nextSegment, modifier = Modifier.weight(1f)) { Text("下一段") }
+                    }
+                }
+                if (state.playbackError && state.isPaused) Row(modifier = Modifier.fillMaxWidth()) {
+                    androidx.compose.material3.TextButton(onClick = viewModel::retryCurrentSegment, modifier = Modifier.weight(1f)) { Text("重试当前段") }
+                    androidx.compose.material3.TextButton(onClick = viewModel::useStandbyVoice, modifier = Modifier.weight(1f)) { Text("使用备用音色") }
+                }
             }
+            LogEventBar(onClick = onOpenLogs)
+            Spacer(Modifier.height(4.dp))
             Text(
                 text = state.statusMessage,
                 style = MaterialTheme.typography.labelSmall,

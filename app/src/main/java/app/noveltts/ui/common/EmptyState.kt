@@ -17,12 +17,13 @@ import androidx.compose.ui.unit.dp
 import app.noveltts.ui.theme.Accent
 import app.noveltts.ui.theme.Muted
 
-/** 空状态卡片；可选的引导动作避免用户在空页面无路可走。 */
+/** 空状态卡片；可选的语义图标与引导动作避免用户在空页面无路可走。 */
 @Composable
 fun EmptyState(
     message: String,
     actionLabel: String? = null,
     onAction: (() -> Unit)? = null,
+    icon: AppIcon? = null,
 ) {
     Surface(
         shape = RoundedCornerShape(14.dp),
@@ -33,6 +34,9 @@ fun EmptyState(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 18.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            if (icon != null) {
+                AppIconGlyph(icon, size = 20.dp, tint = Muted)
+            }
             Text(text = message, style = MaterialTheme.typography.bodySmall, color = Muted)
             if (actionLabel != null && onAction != null) {
                 TextButton(

@@ -1,5 +1,6 @@
 package app.noveltts.ui.common
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -21,6 +22,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,19 +40,25 @@ import app.noveltts.ui.theme.Ink
 import app.noveltts.ui.theme.Muted
 import kotlinx.coroutines.launch
 
-private enum class VoiceFilter(val label: String) {
+internal enum class VoiceFilter(val label: String) {
     ALL("全部"),
     ONLINE("在线"),
     OFFLINE("离线"),
 }
 
+/** 记住上次的筛选条件：弹窗关闭后重开仍是同一筛选，避免每次都回到「全部」。 */
+internal object VoicePickerMemory {
+    var filter: VoiceFilter = VoiceFilter.ALL
+}
+
 /**
- * 音色选择底部弹窗：可搜索、可按在线/离线筛选。
+ * 音色选择底部弹窗：可搜索、可按在线/离线筛选，按语音包分组（吸顶组头）。
  * 不可用音色灰显并给出原因但仍保留在列表里，让用户知道它存在、缺什么。
+ * 当前选中的音色排在所在分组最前；传入 [onPreview] 时每个音色带「试听」按钮。
  *
  * 选中后先回调 [onSelect]，再播完收起动画后回调 [onDismiss]；调用方只需在 [onDismiss] 里关闭。
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun VoicePickerSheet(
     title: String,
@@ -58,11 +66,16 @@ fun VoicePickerSheet(
     selectedId: String,
     onSelect: (String) -> Unit,
     onDismiss: () -> Unit,
+    onPreview: ((VoiceDescriptor) -> Unit)? = null,
+    onStopPreview: (() -> Unit)? = null,
+    previewVoiceId: String? = null,
+    previewStatus: String = "",
 ) {
+    DisposableEffect(Unit) { onDispose { onStopPreview?.invoke() } }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
     var query by rememberSaveable { mutableStateOf("") }
-    var filter by rememberSaveable { mutableStateOf(VoiceFilter.ALL) }
+    var filter by rememberSaveable { mutableStateOf(VoicePickerMemory.filter) }
 
     val visible = remember(voices, query, filter) {
         voices.filter { voice ->
@@ -72,6 +85,18 @@ fun VoicePickerSheet(
                 VoiceFilter.OFFLINE -> voice.isOffline
             }
             matchesFilter && voice.matchesQuery(query)
+        }
+    }
+    // 按语音包分组：组顺序取音色原始出现顺序，组内「当前」置顶、可用优先、再按名称。
+    val groups: List<Pair<String, List<VoiceDescriptor>>> = remember(visible, selectedId) {
+        visible.map { it.packName }.distinct().map { pack ->
+            pack to visible
+                .filter { it.packName == pack }
+                .sortedWith(
+                    compareByDescending<VoiceDescriptor> { it.systemName == selectedId }
+                        .thenByDescending { it.usable }
+                        .thenBy { it.displayName },
+                )
         }
     }
     val hideThenDismiss: () -> Unit = {
@@ -94,7 +119,10 @@ fun VoicePickerSheet(
                         color = Ink,
                         modifier = Modifier.weight(1f),
                     )
-                    TextButton(onClick = hideThenDismiss) { Text("关闭") }
+                    TextButton(onClick = hideThenDismiss) {
+                        AppIconGlyph(icon = AppIcon.CLOSE, size = 18.dp, modifier = Modifier.padding(end = 4.dp))
+                        Text("关闭")
+                    }
                 }
             }
             item(key = "search") {
@@ -104,10 +132,14 @@ fun VoicePickerSheet(
                 FilterChipRow(
                     options = VoiceFilter.entries.map { it to it.label },
                     selected = filter,
-                    onSelect = { filter = it },
+                    onSelect = {
+                        filter = it
+                        VoicePickerMemory.filter = it
+                    },
                 )
             }
             item(key = "count") {
+                if (previewVoiceId != null) Text(previewStatus, style = MaterialTheme.typography.bodySmall, color = Ink)
                 Text(
                     text = "${visible.size} / ${voices.size} 个音色",
                     style = MaterialTheme.typography.labelSmall,
@@ -125,15 +157,24 @@ fun VoicePickerSheet(
                     )
                 }
             } else {
-                items(visible, key = { "voice:${it.systemName}" }) { voice ->
-                    VoiceOptionCard(
-                        voice = voice,
-                        selected = voice.systemName == selectedId,
-                        onClick = {
-                            onSelect(voice.systemName)
-                            hideThenDismiss()
-                        },
-                    )
+                groups.forEach { (pack, packVoices) ->
+                    stickyHeader(key = "pack:$pack") {
+                        PackHeader(name = pack, count = packVoices.size)
+                    }
+                    items(packVoices, key = { "voice:${it.systemName}" }) { voice ->
+                        VoiceOptionCard(
+                            voice = voice,
+                            selected = voice.systemName == selectedId,
+                            onClick = {
+                                onSelect(voice.systemName)
+                                hideThenDismiss()
+                            },
+                            onPreview = onPreview?.takeIf { voice.usable }?.let { preview ->
+                                { if (previewVoiceId == voice.systemName) onStopPreview?.invoke() else preview(voice) }
+                            },
+                            playing = previewVoiceId == voice.systemName,
+                        )
+                    }
                 }
             }
         }
@@ -141,7 +182,38 @@ fun VoicePickerSheet(
 }
 
 @Composable
-private fun VoiceOptionCard(voice: VoiceDescriptor, selected: Boolean, onClick: () -> Unit) {
+internal fun PackHeader(name: String, count: Int) {
+    Surface(color = MaterialTheme.colorScheme.surface) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = name,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = Ink,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = "$count 个音色",
+                style = MaterialTheme.typography.labelSmall,
+                color = Muted,
+            )
+        }
+    }
+}
+
+@Composable
+internal fun VoiceOptionCard(
+    voice: VoiceDescriptor,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onPreview: (() -> Unit)? = null,
+    playing: Boolean = false,
+) {
     Surface(
         shape = RoundedCornerShape(12.dp),
         color = if (selected) {
@@ -166,6 +238,9 @@ private fun VoiceOptionCard(voice: VoiceDescriptor, selected: Boolean, onClick: 
                     color = if (voice.usable) Ink else Muted,
                     modifier = Modifier.weight(1f),
                 )
+                if (onPreview != null) {
+                    TextButton(onClick = onPreview) { Text(if (playing) "停止试听" else "试听") }
+                }
                 if (selected) {
                     Spacer(Modifier.width(6.dp))
                     Badge(text = "当前", highlight = true)
@@ -183,7 +258,7 @@ private fun VoiceOptionCard(voice: VoiceDescriptor, selected: Boolean, onClick: 
     }
 }
 
-private fun VoiceDescriptor.matchesQuery(query: String): Boolean {
+internal fun VoiceDescriptor.matchesQuery(query: String): Boolean {
     val needle = query.trim()
     if (needle.isEmpty()) return true
     return listOf(displayName, packName, engineCode, voiceCode, systemName)

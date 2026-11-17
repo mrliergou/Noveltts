@@ -1,31 +1,30 @@
 package app.noveltts.ui.rules
 
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import app.noveltts.data.config.RulesImportPreview
+import app.noveltts.data.config.RulesKind
 import app.noveltts.domain.ReplacementRule
+import app.noveltts.domain.RuleGroup
 import app.noveltts.ui.MainUiState
 import app.noveltts.ui.MainViewModel
 import app.noveltts.ui.common.Badge
@@ -33,69 +32,214 @@ import app.noveltts.ui.common.ConfirmDialog
 import app.noveltts.ui.common.EmptyState
 import app.noveltts.ui.theme.Ink
 import app.noveltts.ui.theme.Muted
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.geometry.Rect
+
+/** 分组弹窗状态：group 为 null 表示新建。 */
+private data class ReplacementGroupDialogState(val group: RuleGroup?)
 
 @Composable
 fun ReplacementsPage(state: MainUiState, viewModel: MainViewModel) {
-    var creating by remember { mutableStateOf(false) }
-    var editing by remember { mutableStateOf<ReplacementRule?>(null) }
-    var pendingDelete by remember { mutableStateOf<ReplacementRule?>(null) }
     val editable = state.replacementsLoadError == null
+    var query by rememberSaveable { mutableStateOf("") }
+    var filter by rememberSaveable { mutableStateOf(RulesFilter.ALL) }
+    var collapsed by remember { mutableStateOf(setOf<String>()) }
+    var editor by remember { mutableStateOf<RuleEditorTarget?>(viewModel.replacementDraft()?.let { RuleEditorTarget.Replacement(it.rule, it.rule.groupId, it.newGroupName, true, it.fields) }) }
+    var groupDialog by remember { mutableStateOf<ReplacementGroupDialogState?>(null) }
+    var pendingGroupDelete by remember { mutableStateOf<RuleGroup?>(null) }
+    var pendingDelete by remember { mutableStateOf<ReplacementRule?>(null) }
+    var pendingImport by remember { mutableStateOf<RulesImportPreview<ReplacementRule>?>(null) }
+    var importError by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            scope.launch {
+                viewModel.prepareReplacementImport(uri).fold(
+                    onSuccess = { pendingImport = it },
+                    onFailure = { importError = it.message ?: "导入失败，文件可能不是有效的规则 JSON" },
+                )
+            }
+        }
+    }
+    val exportLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+            if (uri != null) {
+                scope.launch { viewModel.exportRulesTo(uri, RulesKind.REPLACEMENT) }
+            }
+        }
+
+    val groups = remember(state.replacementGroups) { sortedRuleGroups(state.replacementGroups) }
+    val controller = remember(viewModel) {
+        RuleDragController { ruleId, groupId, index -> viewModel.moveReplacement(ruleId, groupId, index) }
+    }
+    val listState = rememberLazyListState()
+    val groupNames = remember(groups) { groups.associate { it.id to it.name } }
+    val needle = query.trim()
+    val visibleReplacements = state.replacements.filter { rule ->
+        val byFilter = when (filter) {
+            RulesFilter.ALL -> true
+            RulesFilter.ENABLED -> rule.enabled
+            RulesFilter.DISABLED -> !rule.enabled
+        }
+        val byQuery = needle.isEmpty() ||
+            rule.name.contains(needle, ignoreCase = true) ||
+            rule.find.contains(needle, ignoreCase = true) ||
+            rule.replaceWith.contains(needle, ignoreCase = true) ||
+            (groupNames[rule.groupId] ?: "").contains(needle, ignoreCase = true)
+        byFilter && byQuery
+    }
 
     RulesPageScaffold(
         title = "替换规则",
-        description = "按「顺序」从小到大执行；多音字可用普通替换或正则分组。",
+        description = "长按条目拖拽排序；规则按分组顺序与组内顺序依次应用。",
+        listState = listState,
+        dragController = controller,
         loadError = state.replacementsLoadError,
-        onCreate = { creating = true },
+        query = query,
+        onQueryChange = { query = it },
+        filter = filter,
+        onFilterChange = { filter = it },
+        onCreate = {
+            editor = RuleEditorTarget.Replacement(
+                rule = null,
+                groupId = groups.firstOrNull()?.id ?: RuleGroup.DEFAULT_ID,
+            )
+        },
+        onCreateGroup = { groupDialog = ReplacementGroupDialogState(null) },
+        onImport = {
+            importLauncher.launch(
+                arrayOf("application/json", "text/plain", "application/octet-stream", "*/*"),
+            )
+        },
+        onExport = { exportLauncher.launch(viewModel.exportFileName(RulesKind.REPLACEMENT)) },
     ) {
-        if (state.replacements.isEmpty() && editable) {
-            item(key = "empty") { EmptyState("还没有替换规则。") }
+        if (state.replacements.isEmpty()) {
+            item(key = "empty") {
+                EmptyState(
+                    message = "还没有替换规则。朗读前可自动替换人名、称呼或标点。",
+                    actionLabel = "新建替换规则",
+                    onAction = {
+                        editor = RuleEditorTarget.Replacement(
+                            rule = null,
+                            groupId = groups.firstOrNull()?.id ?: RuleGroup.DEFAULT_ID,
+                        )
+                    },
+                )
+            }
+        } else if (visibleReplacements.isEmpty()) {
+            item(key = "no-match") { EmptyState("没有匹配的规则，换个关键词或筛选条件试试。") }
         }
-        items(state.replacements, key = { "rule:${it.id}" }) { rule ->
-            RuleCard(
-                label = rule.name,
-                enabled = rule.enabled,
-                editable = editable,
-                onToggle = { viewModel.toggleReplacement(rule, it) },
-                onEdit = { editing = rule },
-                onDelete = { pendingDelete = rule },
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(text = rule.name, fontWeight = FontWeight.SemiBold, color = Ink)
-                    if (rule.isRegex) {
-                        Spacer(Modifier.width(6.dp))
-                        Badge(text = "正则", highlight = true)
+        groups.forEach { group ->
+            val allGroupRules = state.replacements.filter { it.groupId == group.id }.sortedBy { it.sortIndex }
+            val groupRules = visibleReplacements.filter { it.groupId == group.id }.sortedBy { it.sortIndex }
+            val filtering = needle.isNotEmpty() || filter != RulesFilter.ALL
+            if (groupRules.isEmpty() && filtering) return@forEach
+            val expanded = group.id !in collapsed
+            item(key = "group:" + group.id) {
+                RuleGroupHeader(
+                    group = group,
+                    count = state.replacements.count { it.groupId == group.id },
+                    expanded = expanded,
+                    highlighted = controller.hoveredGroupId == group.id,
+                    editable = editable,
+                    canDelete = group.id != RuleGroup.DEFAULT_ID,
+                    onToggleExpand = {
+                        collapsed = if (expanded) collapsed + group.id else collapsed - group.id
+                    },
+                    onToggleEnabled = { viewModel.saveReplacementGroup(group.copy(enabled = it)) },
+                    onRename = { groupDialog = ReplacementGroupDialogState(group) },
+                    onDelete = { pendingGroupDelete = group },
+                    onBounds = { bounds -> controller.registerHeader(group.id, bounds) },
+                    onBoundsRemoved = { controller.unregisterHeader(group.id) },
+                )
+            }
+            if (expanded) {
+                itemsIndexed(groupRules, key = { _, rule -> "rule:" + rule.id }) { _, rule ->
+                    val index = allGroupRules.indexOfFirst { it.id == rule.id }
+                    DraggableRuleRow(
+                        rowKey = "replacement:" + rule.id,
+                        groupId = group.id,
+                        index = index,
+                        enabled = rule.enabled,
+                        editable = editable,
+                        controller = controller,
+                        draggable = editable && !filtering,
+                        groups = groups,
+                        onMoveUp = if (index > 0) ({ viewModel.moveReplacement(rule.id, group.id, index - 1) }) else null,
+                        onMoveDown = if (index < allGroupRules.lastIndex) ({ viewModel.moveReplacement(rule.id, group.id, index + 2) }) else null,
+                        onMoveGroup = { viewModel.moveReplacement(rule.id, it, Int.MAX_VALUE) },
+                        onToggle = { viewModel.toggleReplacement(rule, it) },
+                        onEdit = { editor = RuleEditorTarget.Replacement(rule, group.id) },
+                        onDelete = { pendingDelete = rule },
+                        modifier = Modifier.animateItem(),
+                    ) {
+                        ReplacementRowContent(rule = rule)
                     }
                 }
-                Text(
-                    text = "${rule.find}  →  ${rule.replaceWith}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Ink,
-                )
-                Text(text = "顺序 ${rule.order}", style = MaterialTheme.typography.labelSmall, color = Muted)
             }
         }
     }
 
-    if (creating || editing != null) {
-        ReplacementEditorDialog(
-            rule = editing,
-            onTest = viewModel::testReplacements,
-            onDismiss = {
-                creating = false
-                editing = null
+    editor?.let { target ->
+        RuleEditorSheet(
+            target = target,
+            groups = groups,
+            voices = state.voices,
+            roles = state.roles,
+            onDismiss = { viewModel.stopPreview(); editor = null },
+            onSaveRole = { _, _ -> false },
+            onSaveReplacement = { rule, newGroup ->
+                val saved = withContext(Dispatchers.IO) { viewModel.saveReplacement(rule, newGroup) }
+                if (saved) { viewModel.clearRuleDraft(RulesKind.REPLACEMENT); viewModel.stopPreview(); editor = null }
+                saved
             },
-            onSave = { rule ->
-                viewModel.saveReplacement(rule)
-                creating = false
-                editing = null
+            onTestRole = { text, rule, all -> withContext(Dispatchers.Default) { viewModel.testRoleMatch(text, rule, all) } },
+            onTestReplacement = { text, rule, all -> withContext(Dispatchers.Default) { viewModel.testReplacements(text, rule, all) } },
+            onPreviewVoice = viewModel::previewVoice,
+            onStopPreview = viewModel::stopPreview,
+            onRoleDraftChange = { _, _, _ -> },
+            onReplacementDraftChange = viewModel::rememberReplacementDraft,
+            onDiscardDraft = { viewModel.clearRuleDraft(RulesKind.REPLACEMENT) },
+        )
+    }
+
+    groupDialog?.let { dialog ->
+        val existing = dialog.group
+        RuleGroupDialog(
+            title = if (existing == null) "新建分组" else "重命名分组",
+            initialName = existing?.name.orEmpty(),
+            onDismiss = { groupDialog = null },
+            onConfirm = { name ->
+                viewModel.saveReplacementGroup(existing?.copy(name = name) ?: RuleGroup(name = name))
+                groupDialog = null
             },
+        )
+    }
+
+    pendingGroupDelete?.let { group ->
+        ConfirmDialog(
+            title = "删除分组",
+            message = "删除分组「" + group.name + "」？组内规则会移到默认分组，不会被删除。",
+            dangerous = false,
+            onConfirm = {
+                viewModel.deleteReplacementGroup(group)
+                pendingGroupDelete = null
+            },
+            onDismiss = { pendingGroupDelete = null },
         )
     }
 
     pendingDelete?.let { rule ->
         ConfirmDialog(
             title = "删除替换规则",
-            message = "确定删除「${rule.name}」？此操作不可撤销。",
+            message = "确定删除「" + rule.name + "」？此操作不可撤销。",
             dangerous = true,
             onConfirm = {
                 viewModel.deleteReplacement(rule)
@@ -104,102 +248,56 @@ fun ReplacementsPage(state: MainUiState, viewModel: MainViewModel) {
             onDismiss = { pendingDelete = null },
         )
     }
+
+    pendingImport?.let { preview ->
+        ImportConflictSheet(
+            kindLabel = RulesKind.REPLACEMENT.label,
+            preview = preview,
+            nameOf = { rule: ReplacementRule -> rule.name },
+            onApply = { strategy ->
+                viewModel.applyReplacementImport(preview, strategy).fold(
+                    onSuccess = { pendingImport = null },
+                    onFailure = {
+                        importError = it.message ?: "导入失败"
+                    },
+                )
+            },
+            onDismiss = { pendingImport = null },
+        )
+    }
+
+    importError?.let { message ->
+        AlertDialog(
+            onDismissRequest = { importError = null },
+            title = { Text("导入失败") },
+            text = { Text(message) },
+            confirmButton = { TextButton(onClick = { importError = null }) { Text("知道了") } },
+        )
+    }
 }
 
 @Composable
-private fun ReplacementEditorDialog(
-    rule: ReplacementRule?,
-    onTest: (String) -> String,
-    onDismiss: () -> Unit,
-    onSave: (ReplacementRule) -> Unit,
-) {
-    var name by remember { mutableStateOf(rule?.name.orEmpty()) }
-    var find by remember { mutableStateOf(rule?.find.orEmpty()) }
-    var replaceWith by remember { mutableStateOf(rule?.replaceWith.orEmpty()) }
-    var isRegex by remember { mutableStateOf(rule?.isRegex ?: false) }
-    var order by remember { mutableStateOf((rule?.order ?: 100).toString()) }
-    var enabled by remember { mutableStateOf(rule?.enabled ?: true) }
-    var testInput by remember { mutableStateOf("") }
-    var testOutput by remember { mutableStateOf("") }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(if (rule == null) "新增替换" else "编辑替换") },
-        text = {
-            Column(
-                modifier = Modifier
-                    .heightIn(max = 520.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    label = { Text("名称") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = find,
-                    onValueChange = { find = it },
-                    label = { Text(if (isRegex) "查找（正则）" else "查找") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = replaceWith,
-                    onValueChange = { replaceWith = it },
-                    label = { Text("替换为") },
-                    supportingText = { Text("正则可用 \$1 引用分组") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                LabeledSwitch("使用正则", isRegex) { isRegex = it }
-                OutlinedTextField(
-                    value = order,
-                    onValueChange = { value -> order = value.filter { it.isDigit() }.take(4) },
-                    label = { Text("顺序（越小越先执行）") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                LabeledSwitch("启用", enabled) { enabled = it }
-
-                HorizontalDivider()
-                OutlinedTextField(
-                    value = testInput,
-                    onValueChange = { testInput = it },
-                    label = { Text("测试文本（用已保存规则）") },
-                    minLines = 2,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = { testOutput = onTest(testInput) }, enabled = testInput.isNotBlank()) {
-                        Text("测试")
-                    }
-                }
-                if (testOutput.isNotBlank()) {
-                    Text(text = "结果：$testOutput", style = MaterialTheme.typography.bodySmall, color = Ink)
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                enabled = name.isNotBlank() && find.isNotBlank(),
-                onClick = {
-                    val base = rule ?: ReplacementRule(name = "", find = "", replaceWith = "")
-                    onSave(
-                        base.copy(
-                            name = name.trim(),
-                            find = find,
-                            replaceWith = replaceWith,
-                            isRegex = isRegex,
-                            enabled = enabled,
-                            order = order.toIntOrNull() ?: 100,
-                        ),
-                    )
-                },
-            ) { Text("保存") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+private fun ReplacementRowContent(rule: ReplacementRule) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(text = rule.name, fontWeight = FontWeight.SemiBold, color = Ink)
+        if (rule.isRegex) {
+            Spacer(Modifier.width(6.dp))
+            Badge(text = "正则", highlight = true)
+        }
+    }
+    Text(
+        text = "查找：" + rule.find,
+        style = MaterialTheme.typography.labelSmall,
+        color = Muted,
+    )
+    Text(
+        text = "替换为：" + rule.replaceWith.ifEmpty { "（删除匹配内容）" },
+        style = MaterialTheme.typography.labelSmall,
+        color = Muted,
+    )
+    Text(
+        text = "顺序 " + rule.sortIndex,
+        style = MaterialTheme.typography.labelSmall,
+        color = Muted,
     )
 }

@@ -1,5 +1,6 @@
 package app.noveltts.ui.packs
 
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -25,6 +26,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -33,6 +35,8 @@ import androidx.compose.ui.unit.dp
 import app.noveltts.data.voicepack.VoicePack
 import app.noveltts.ui.MainUiState
 import app.noveltts.ui.MainViewModel
+import app.noveltts.ui.common.AppIcon
+import app.noveltts.ui.common.AppIconGlyph
 import app.noveltts.ui.common.Badge
 import app.noveltts.ui.common.ConfirmDialog
 import app.noveltts.ui.common.EmptyState
@@ -40,11 +44,13 @@ import app.noveltts.ui.common.SectionTitle
 import app.noveltts.ui.theme.Ink
 import app.noveltts.ui.theme.Muted
 
-private const val VOICE_PREVIEW_LIMIT = 6
+private const val VOICE_COLLAPSED_LIMIT = 2
+private const val VOICE_EXPANDED_LIMIT = 10
 
 @Composable
 fun PacksPage(state: MainUiState, viewModel: MainViewModel, onImport: () -> Unit) {
     var pendingRemoval by remember { mutableStateOf<VoicePack?>(null) }
+    var browsingPackId by rememberSaveable { mutableStateOf<String?>(null) }
 
     Column(
         modifier = Modifier
@@ -66,7 +72,11 @@ fun PacksPage(state: MainUiState, viewModel: MainViewModel, onImport: () -> Unit
         )
 
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedButton(onClick = onImport, enabled = state.packBusyId == null) { Text("导入本地 zip") }
+            OutlinedButton(onClick = onImport, enabled = state.packBusyId == null) {
+                AppIconGlyph(AppIcon.DOWNLOAD, size = 18.dp)
+                Spacer(Modifier.width(6.dp))
+                Text("导入本地 zip")
+            }
             if (state.isImportingPack) {
                 CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
             }
@@ -78,10 +88,15 @@ fun PacksPage(state: MainUiState, viewModel: MainViewModel, onImport: () -> Unit
                 onValueChange = viewModel::setCatalogUrl,
                 label = { Text("在线目录地址") },
                 placeholder = { Text("https://…/catalog.json") },
+                leadingIcon = { AppIconGlyph(AppIcon.GLOBE, size = 18.dp, tint = Muted) },
                 singleLine = true,
                 modifier = Modifier.weight(1f),
             )
-            Button(onClick = { viewModel.refreshCatalog() }, enabled = state.packBusyId == null) { Text("刷新") }
+            Button(onClick = { viewModel.refreshCatalog() }, enabled = state.packBusyId == null) {
+                AppIconGlyph(AppIcon.REFRESH, size = 18.dp)
+                Spacer(Modifier.width(6.dp))
+                Text("刷新")
+            }
         }
 
         if (state.packProgress in 0..100) {
@@ -96,12 +111,14 @@ fun PacksPage(state: MainUiState, viewModel: MainViewModel, onImport: () -> Unit
 
         SectionTitle("已安装（${state.packs.size}）")
         if (state.packs.isEmpty()) {
-            EmptyState("还没有语音包。可导入本地 zip，或填写在线目录后刷新下载。")
+            EmptyState("还没有语音包。可导入本地 zip，或填写在线目录后刷新下载。", icon = AppIcon.FOLDER)
         }
         state.packs.forEach { pack ->
             PackCard(
                 pack = pack,
                 busy = state.packBusyId != null,
+                browsableCount = state.voices.count { it.packId == pack.id },
+                onBrowse = { browsingPackId = pack.id },
                 onRemove = { pendingRemoval = pack },
             )
         }
@@ -121,6 +138,16 @@ fun PacksPage(state: MainUiState, viewModel: MainViewModel, onImport: () -> Unit
         }
     }
 
+    // 按 id 取当前包：包被删除或重新导入后，弹窗随状态关闭或刷新。
+    state.packs.firstOrNull { it.id == browsingPackId }?.let { pack ->
+        PackVoicesSheet(
+            pack = pack,
+            state = state,
+            viewModel = viewModel,
+            onDismiss = { browsingPackId = null },
+        )
+    }
+
     pendingRemoval?.let { pack ->
         ConfirmDialog(
             title = "删除语音包",
@@ -136,7 +163,9 @@ fun PacksPage(state: MainUiState, viewModel: MainViewModel, onImport: () -> Unit
 }
 
 @Composable
-private fun PackCard(pack: VoicePack, busy: Boolean, onRemove: () -> Unit) {
+private fun PackCard(pack: VoicePack, busy: Boolean, browsableCount: Int, onBrowse: () -> Unit, onRemove: () -> Unit) {
+    // 展开状态只属于这张卡片；全量列表放在 PackVoicesSheet 的 LazyColumn 里，卡片内最多铺 10 行。
+    var expanded by remember(pack.id) { mutableStateOf(false) }
     Surface(
         shape = RoundedCornerShape(16.dp),
         color = MaterialTheme.colorScheme.surfaceVariant,
@@ -144,6 +173,8 @@ private fun PackCard(pack: VoicePack, busy: Boolean, onRemove: () -> Unit) {
     ) {
         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                AppIconGlyph(AppIcon.FOLDER, size = 18.dp, tint = Muted)
+                Spacer(Modifier.width(6.dp))
                 Text(
                     text = "${pack.name}  v${pack.version}",
                     fontWeight = FontWeight.SemiBold,
@@ -161,13 +192,21 @@ private fun PackCard(pack: VoicePack, busy: Boolean, onRemove: () -> Unit) {
                 Text(text = pack.description, style = MaterialTheme.typography.bodySmall, color = Muted)
             }
             if (pack.engines.isNotEmpty()) {
-                Text(
-                    text = "引擎：" + pack.engines.joinToString { "${it.code}${if (it.supported) "" else "（未支持）"}" },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = Muted,
-                )
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    pack.engines.forEach { engine ->
+                        val count = pack.voices.count { it.engineCode == engine.code }
+                        Badge(
+                            text = "${engine.code} $count" + if (engine.supported) "" else " · 未支持",
+                            highlight = engine.supported,
+                        )
+                    }
+                }
             }
-            pack.voices.take(VOICE_PREVIEW_LIMIT).forEach { voice ->
+            val shown = if (expanded) VOICE_EXPANDED_LIMIT else VOICE_COLLAPSED_LIMIT
+            pack.voices.take(shown).forEach { voice ->
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(text = voice.name, style = MaterialTheme.typography.bodySmall, color = Ink)
                     Spacer(Modifier.width(8.dp))
@@ -180,15 +219,31 @@ private fun PackCard(pack: VoicePack, busy: Boolean, onRemove: () -> Unit) {
                     Badge(text = if (voice.isOnline) "在线" else "离线")
                 }
             }
-            if (pack.voices.size > VOICE_PREVIEW_LIMIT) {
+            if (expanded && pack.voices.size > VOICE_EXPANDED_LIMIT) {
                 Text(
-                    text = "… 还有 ${pack.voices.size - VOICE_PREVIEW_LIMIT} 个音色",
+                    text = "… 还有 ${pack.voices.size - VOICE_EXPANDED_LIMIT} 个音色，可在「查看全部」中浏览",
                     style = MaterialTheme.typography.labelSmall,
                     color = Muted,
                 )
             }
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                TextButton(onClick = onRemove, enabled = !busy) { Text("删除") }
+            if (pack.voices.size > VOICE_COLLAPSED_LIMIT) {
+                TextButton(onClick = { expanded = !expanded }) {
+                    Text(if (expanded) "收起" else "展开更多")
+                    Spacer(Modifier.width(4.dp))
+                    AppIconGlyph(if (expanded) AppIcon.CHEVRON_UP else AppIcon.CHEVRON_DOWN, size = 16.dp)
+                }
+            }
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                // 只有引擎受支持的音色才进入音色列表，数量以实际可浏览的为准。
+                if (browsableCount > 0) {
+                    TextButton(onClick = onBrowse) { Text("查看全部 $browsableCount 个音色") }
+                }
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onRemove, enabled = !busy) {
+                    AppIconGlyph(AppIcon.DELETE, size = 18.dp)
+                    Spacer(Modifier.width(6.dp))
+                    Text("删除")
+                }
             }
         }
     }

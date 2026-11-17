@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 启动图标底色：与 ui/theme/Color.kt 的 TealDark 一致 -->
+    <color name="ic_launcher_background">#005B57</color>
+    <!-- 启动窗口底色：与 Compose 浅色背景一致，避免冷启动白闪 -->
+    <color name="app_background">#F4F7F5</color>
+</resources>

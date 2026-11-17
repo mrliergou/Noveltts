@@ -1,75 +1,128 @@
 package app.noveltts.ui.workbench
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import app.noveltts.data.config.RulesKind
+import app.noveltts.domain.BuiltInRole
+import app.noveltts.domain.RoleRule
+import app.noveltts.ui.AppSection
 import app.noveltts.ui.MainUiState
 import app.noveltts.ui.MainViewModel
+import app.noveltts.ui.common.AppIcon
+import app.noveltts.ui.common.AppIconGlyph
 import app.noveltts.ui.common.EmptyState
 import app.noveltts.ui.common.SectionCard
 import app.noveltts.ui.common.SectionTitle
-import app.noveltts.ui.common.VoiceField
+import app.noveltts.ui.rules.RuleEditorSheet
+import app.noveltts.ui.rules.RuleEditorTarget
+import app.noveltts.ui.rules.sortedRuleGroups
 import app.noveltts.ui.theme.Accent
 import app.noveltts.ui.theme.Ink
 import app.noveltts.ui.theme.Muted
 import kotlin.math.roundToInt
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
-private const val SAMPLE_TEXT =
-    "你好，欢迎使用 NovelTTS。选择喜欢的声音，让每一段文字都变得生动。\n\n" +
-        "他压低声音说：“今晚的月色真美。”"
+private const val MAX_CUSTOM_ROLE_ROWS = 6
 
 @Composable
 fun WorkbenchPage(state: MainUiState, viewModel: MainViewModel) {
-    Column(
+    val rolesEditable = state.rolesLoadError == null
+    var sheetTarget by rememberSaveable(stateSaver = RoleSheetTarget.Saver) { mutableStateOf<RoleSheetTarget?>(null) }
+    val disabledGroups = remember(state.roleGroups) { state.roleGroups.filterNot { it.enabled }.mapTo(HashSet()) { it.id } }
+    var advancedRule by remember { mutableStateOf<RoleRule?>(null) }
+    val voiceNames = remember(state.voices) { state.voices.associate { it.systemName to it.displayName } }
+    val roleGroups = remember(state.roleGroups) { sortedRuleGroups(state.roleGroups) }
+    // 与角色规则页同序：先按分组顺序，再按组内 sortIndex。
+    val customRoles = remember(state.roles, roleGroups) {
+        val groupOrder = roleGroups.withIndex().associate { it.value.id to it.index }
+        state.roles.sortedWith(
+            compareBy<RoleRule> { groupOrder[it.groupId] ?: Int.MAX_VALUE }.thenBy { it.sortIndex },
+        )
+    }
+    val voiceLabel: (String?) -> String = { id ->
+        if (id.isNullOrBlank()) "未选择" else voiceNames[id] ?: "音色不可用"
+    }
+
+    LazyColumn(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("文字 · 声音 · 表达", style = MaterialTheme.typography.labelMedium, color = Accent)
-        Text(
-            text = "让文字，开口说话。",
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.Bold,
-            color = Ink,
-        )
-        Text(
-            text = "输入一段文字，为旁白和对话选择不同音色。",
-            style = MaterialTheme.typography.bodySmall,
-            color = Muted,
-        )
-
-        SectionCard {
-            SliderRow("语速", "慢", "快", state.speed, viewModel::updateSpeed)
-            SliderRow("音量", "轻", "响", state.volume, viewModel::updateVolume)
-            SliderRow("音调", "低", "高", state.pitch, viewModel::updatePitch)
+        // 全局语速/音量/音调置顶：先调全局再选角色，避免每次滚到底部。
+        item(key = "global") {
+            val expanded = state.globalControlsExpanded
+            SectionCard {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .clickable(
+                            onClickLabel = if (expanded) "折叠全局调节" else "展开全局调节",
+                            role = Role.Button,
+                        ) { viewModel.setGlobalControlsExpanded(!expanded) }
+                        .semantics { stateDescription = if (expanded) "已展开" else "已折叠" },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("全局调节", fontWeight = FontWeight.SemiBold, color = Ink)
+                        Text(
+                            text = "语速 ${state.speed} · 音量 ${state.volume} · 音调 ${state.pitch}，对所有角色生效",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Muted,
+                        )
+                    }
+                    AppIconGlyph(if (expanded) AppIcon.CHEVRON_UP else AppIcon.CHEVRON_DOWN, size = 18.dp, tint = Muted)
+                }
+                if (expanded) {
+                    SliderRow(AppIcon.SPEED, "语速", "慢", "快", state.speed, viewModel::updateSpeed)
+                    SliderRow(AppIcon.VOLUME, "音量", "轻", "响", state.volume, viewModel::updateVolume)
+                    SliderRow(AppIcon.TUNE, "音调", "低", "高", state.pitch, viewModel::updatePitch)
+                }
+            }
         }
 
-        SectionTitle("朗读音色")
-        VoiceField("旁白音色", state.narratorVoiceId, state.voices, viewModel::selectNarrator)
-        VoiceField("对话音色", state.dialogueVoiceId, state.voices, viewModel::selectDialogue)
-
+        item(key = "input") { Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("试听文本", fontWeight = FontWeight.SemiBold, color = Ink, modifier = Modifier.weight(1f))
-            TextButton(onClick = { viewModel.updateText(SAMPLE_TEXT) }) { Text("填入示例") }
+            TextButton(onClick = { viewModel.updateText(SampleTexts.random(exclude = state.text)) }) {
+                AppIconGlyph(AppIcon.TEXT, size = 16.dp)
+                Spacer(Modifier.width(4.dp))
+                Text("填入示例")
+            }
         }
         OutlinedTextField(
             value = state.text,
@@ -79,25 +132,173 @@ fun WorkbenchPage(state: MainUiState, viewModel: MainViewModel) {
             maxLines = 12,
             modifier = Modifier.fillMaxWidth(),
         )
+        } }
 
-        SectionTitle("分段预览（${state.preview.size}）")
-        if (state.preview.isEmpty()) {
-            EmptyState("输入文本后，这里会显示旁白与对话的分段结果。")
-        } else {
-            state.preview.forEach { segment -> PreviewRow(segment) }
+        item(key = "roles-title") {
+            Column {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("朗读角色", fontWeight = FontWeight.SemiBold, color = Ink, modifier = Modifier.weight(1f))
+                    TextButton(onClick = { sheetTarget = RoleSheetTarget.New }, enabled = rolesEditable) {
+                        AppIconGlyph(AppIcon.ADD, size = 16.dp)
+                        Spacer(Modifier.width(4.dp))
+                        Text("添加角色")
+                    }
+                }
+                HorizontalDivider()
+                if (!rolesEditable) {
+                    Text(
+                        text = "角色规则读取失败，自定义角色暂不可修改；旁白与对话仍可调整。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Accent,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+            }
         }
-        state.pipelineIssues.forEach { issue ->
+        item(key = "role-builtin:narrator") {
+            val settings = state.builtInRoles.narrator
+            RoleCard(
+                name = "旁白",
+                voiceLabel = voiceLabel(settings.voiceId),
+                summary = rolePlaybackSummary(settings.rate, settings.pitch, settings.volume),
+                required = true,
+                onClick = { sheetTarget = RoleSheetTarget.BuiltIn(BuiltInRole.NARRATOR) },
+            )
+        }
+        item(key = "role-builtin:dialogue") {
+            val settings = state.builtInRoles.dialogue
+            RoleCard(
+                name = "对话",
+                voiceLabel = voiceLabel(settings.voiceId),
+                summary = rolePlaybackSummary(settings.rate, settings.pitch, settings.volume),
+                required = true,
+                onClick = { sheetTarget = RoleSheetTarget.BuiltIn(BuiltInRole.DIALOGUE) },
+            )
+        }
+        items(customRoles.take(MAX_CUSTOM_ROLE_ROWS), key = { "role-custom:" + it.id }) { rule ->
+            val voiceCount = rule.voiceIds.count { it.isNotBlank() }
+            RoleCard(
+                name = rule.name,
+                voiceLabel = voiceLabel(rule.primaryVoiceId) + if (voiceCount > 1) " 等 $voiceCount 个" else "",
+                summary = rolePlaybackSummary(rule.speechRate, rule.speechPitch, rule.speechVolume),
+                matchLabel = "匹配「${literalKeyword(rule) ?: rule.pattern}」" +
+                    if (rule.groupId in disabledGroups) " · 所在分组已停用，不会生效" else "",
+                roleEnabled = rule.enabled,
+                editable = rolesEditable,
+                onClick = { sheetTarget = RoleSheetTarget.Custom(rule.id) },
+                onToggle = { viewModel.toggleRole(rule, it) },
+            )
+        }
+        if (customRoles.size > MAX_CUSTOM_ROLE_ROWS) {
+            item(key = "roles-all") {
+                TextButton(onClick = { viewModel.selectSection(AppSection.ROLES) }) {
+                    Text("查看全部角色（${customRoles.size}）")
+                    Spacer(Modifier.width(2.dp))
+                    AppIconGlyph(AppIcon.CHEVRON_RIGHT, size = 16.dp)
+                }
+            }
+        }
+
+        item(key = "preview-title") {
+        SectionTitle(if (state.previewBusy) "正在更新分段预览…" else "分段预览（${state.preview.size}）")
+        if (state.isSpeaking && state.totalSegments > 0) SegmentProgress(state)
+        }
+        if (state.preview.isEmpty()) {
+            item(key = "empty") { EmptyState("输入文本后，这里会显示旁白与对话的分段结果。") }
+        } else {
+            itemsIndexed(state.preview, key = { _, segment -> segment.id }) { index, segment ->
+                PreviewRow(
+                    segment = segment,
+                    index = index,
+                    isPlaying = state.playingSegmentIndex == index,
+                    onPreview = { viewModel.previewSegment(index) },
+                )
+            }
+        }
+        state.pipelineIssues.forEach { issue -> item {
             Text(
                 text = "⚠ ${issue.field}：${issue.message}",
                 style = MaterialTheme.typography.labelSmall,
                 color = Accent,
             )
-        }
+        } }
     }
+
+    sheetTarget?.let { target ->
+        RoleConfigSheet(
+            target = target,
+            state = state,
+            viewModel = viewModel,
+            onDismiss = { sheetTarget = null },
+            onOpenAdvanced = { rule ->
+                sheetTarget = null
+                // 角色规则页留有未处理的草稿时先去处理它，否则这里打开编辑器会把那份草稿覆盖掉。
+                if (viewModel.roleDraft() != null) viewModel.selectSection(AppSection.ROLES) else advancedRule = rule
+            },
+        )
+    }
+
+    // 「高级规则…」复用角色规则页的编辑器，接线与 RolesPage 一致（含草稿保存与丢弃）。
+    advancedRule?.let { rule ->
+        RuleEditorSheet(
+            target = RuleEditorTarget.Role(rule, rule.groupId),
+            groups = roleGroups,
+            voices = state.voices,
+            roles = state.roles,
+            onDismiss = { viewModel.stopPreview(); advancedRule = null },
+            onSaveRole = { edited, newGroup ->
+                val saved = withContext(Dispatchers.IO) { viewModel.saveRole(edited, newGroup) }
+                if (saved) { viewModel.clearRuleDraft(RulesKind.ROLE); viewModel.stopPreview(); advancedRule = null }
+                saved
+            },
+            onSaveReplacement = { _, _ -> false },
+            onTestRole = { text, draft, all -> withContext(Dispatchers.Default) { viewModel.testRoleMatch(text, draft, all) } },
+            onTestReplacement = { text, draft, all -> withContext(Dispatchers.Default) { viewModel.testReplacements(text, draft, all) } },
+            onPreviewVoice = { voice -> viewModel.previewVoice(voice) },
+            onStopPreview = viewModel::stopPreview,
+            onRoleDraftChange = viewModel::rememberRoleDraft,
+            onReplacementDraftChange = { _, _, _ -> },
+            onDiscardDraft = { viewModel.clearRuleDraft(RulesKind.ROLE) },
+        )
+    }
+}
+
+/** 朗读进度：进度条 + 「第 N/M 段 · 旁白 · 音色名」状态行。 */
+@Composable
+private fun SegmentProgress(state: MainUiState) {
+    val total = state.totalSegments
+    val index = state.currentSegmentIndex
+    LinearProgressIndicator(
+        progress = {
+            if (total <= 0) 0f else (state.completedSegments.toFloat() / total).coerceIn(0f, 1f)
+        },
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(6.dp),
+    )
+    Spacer(Modifier.height(2.dp))
+    Text(
+        text = segmentProgressLabel(state),
+        style = MaterialTheme.typography.labelSmall,
+        color = Muted,
+    )
+}
+
+private fun segmentProgressLabel(state: MainUiState): String {
+    val total = state.totalSegments
+    if (total <= 0) return ""
+    val index = state.currentSegmentIndex
+    if (index < 0) return "准备朗读 · 共 $total 段"
+    val kind = if (state.playbackIsDialogue) "对话" else "旁白"
+    val voice = state.playbackVoiceName
+    val suffix = if (voice.isBlank()) "" else " · $voice"
+    return (if (state.isPreview) "单段试听 · $kind$suffix" else "第 ${index + 1}/$total 段 · $kind$suffix") +
+        (state.playbackFallbackReason?.let { " · $it" } ?: "")
 }
 
 @Composable
 private fun SliderRow(
+    icon: AppIcon,
     label: String,
     startLabel: String,
     endLabel: String,
@@ -105,6 +306,8 @@ private fun SliderRow(
     onChange: (Int) -> Unit,
 ) {
     Row(verticalAlignment = Alignment.CenterVertically) {
+        AppIconGlyph(icon, size = 18.dp, tint = Muted)
+        Spacer(Modifier.width(6.dp))
         Text(label, fontWeight = FontWeight.SemiBold, color = Ink)
         Spacer(Modifier.width(10.dp))
         Text(startLabel, style = MaterialTheme.typography.labelSmall, color = Muted)

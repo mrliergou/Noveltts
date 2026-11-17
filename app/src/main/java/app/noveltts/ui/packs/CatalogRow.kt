@@ -2,9 +2,11 @@ package app.noveltts.ui.packs
 
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -17,6 +19,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import app.noveltts.data.voicepack.CatalogEntry
+import app.noveltts.ui.common.AppIcon
+import app.noveltts.ui.common.AppIconGlyph
 import app.noveltts.ui.common.formatSize
 import app.noveltts.ui.theme.Ink
 import app.noveltts.ui.theme.Muted
@@ -60,8 +64,16 @@ fun CatalogRow(
             }
             when {
                 busy -> CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                installed -> Text(text = "已安装", style = MaterialTheme.typography.labelMedium, color = Muted)
-                else -> TextButton(onClick = onDownload, enabled = enabled) { Text("下载") }
+                installed -> Row(verticalAlignment = Alignment.CenterVertically) {
+                    AppIconGlyph(AppIcon.CHECK, size = 16.dp, tint = Muted)
+                    Spacer(Modifier.width(4.dp))
+                    Text(text = "已安装", style = MaterialTheme.typography.labelMedium, color = Muted)
+                }
+                else -> TextButton(onClick = onDownload, enabled = enabled) {
+                    AppIconGlyph(AppIcon.DOWNLOAD, size = 16.dp)
+                    Spacer(Modifier.width(4.dp))
+                    Text("下载")
+                }
             }
         }
     }

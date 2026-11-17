@@ -8,7 +8,11 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.noveltts.data.settings.SettingsStore
+import app.noveltts.engine.DiagnosticsLog
+import app.noveltts.ui.AppSection
 import app.noveltts.ui.MainViewModel
 import app.noveltts.ui.MultiTtsScreen
 import app.noveltts.ui.theme.MultiTtsTheme
@@ -18,18 +22,33 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        app.noveltts.data.backup.ConfigurationRecovery.recover(this)
         Log.i(TAG, "onCreate intent=$intent")
+        // 诊断日志落盘：只挂载不 detach，进程活着就一直异步追加；目录不可写时静默退化为纯内存。
+        DiagnosticsLog.attachStore(filesDir)
+        DiagnosticsLog.restoreRecent()
         handleDebugExtras(intent)
         handleSharedText(intent)
         handlePackInstall(intent)
         handleCatalogIntent(intent)
 
         setContent {
-            MultiTtsTheme {
+            val state by viewModel.uiState.collectAsStateWithLifecycle()
+            MultiTtsTheme(themeMode = state.themeMode) {
                 MultiTtsScreen(
                     viewModel = viewModel,
                     onOpenSystemSpeechSettings = ::openSystemSpeechSettings,
-                    openVoicePacksOnStart = intent?.getStringExtra(EXTRA_OPEN) == OPEN_VOICE_PACKS,
+                    openSectionOnStart = openSection(intent),
+                    openLogsOnStart = intent?.getStringExtra(EXTRA_OPEN)?.trim()?.lowercase() == OPEN_LOGS,
+                    openIntegrationOnStart = intent?.getStringExtra(EXTRA_OPEN) == "integration",
+                    openSettingsDetailOnStart = when (intent?.getStringExtra(EXTRA_OPEN)) {
+                        "external" -> "EXTERNAL_CALL"
+                        "reading" -> "READING"
+                        "data" -> "DATA"
+                        "synthesis" -> "SYNTHESIS"
+                        "bgm" -> "BACKGROUND_MUSIC"
+                        else -> null
+                    },
                 )
             }
         }
@@ -43,6 +62,25 @@ class MainActivity : ComponentActivity() {
         handleSharedText(intent)
         handlePackInstall(intent)
         handleCatalogIntent(intent)
+        // 运行中再次收到「直达页面」请求时重建一次，让 onCreate 的启动路由生效。
+        if (handleOpenExtra(intent)) recreate()
+    }
+
+    /** `--es open <页面>` 是否属于本 Activity 需要处理的直达请求。 */
+    private fun handleOpenExtra(intent: Intent?): Boolean =
+        openSection(intent) != null || intent?.getStringExtra(EXTRA_OPEN)?.trim()?.lowercase() == OPEN_LOGS
+
+    /**
+     * 支持通过 `--es open <workbench|voicepacks|roles|replacements|settings|logs>` 直达页面，
+     * 便于分发链接与自动化验证；未知取值回落到工作台。
+     */
+    private fun openSection(intent: Intent?): AppSection? = when (intent?.getStringExtra(EXTRA_OPEN)?.trim()?.lowercase()) {
+        OPEN_WORKBENCH -> AppSection.WORKBENCH
+        OPEN_VOICE_PACKS, "packs" -> AppSection.PACKS
+        "roles" -> AppSection.ROLES
+        "replacements" -> AppSection.REPLACEMENTS
+        "settings", "integration", "external", "reading", "data", "synthesis", "bgm" -> AppSection.SETTINGS
+        else -> null
     }
 
     private fun handleSharedText(intent: Intent?) {
@@ -59,7 +97,7 @@ class MainActivity : ComponentActivity() {
      */
     private fun handlePackInstall(intent: Intent?) {
         val url = intent?.getStringExtra(EXTRA_PACK_URL)?.trim().orEmpty()
-        Log.i(TAG, "handlePackInstall url='$url'")
+        Log.i(TAG, "handlePackInstall hasUrl=${url.isNotEmpty()}")
         if (url.isEmpty()) return
         viewModel.installPackFromUrl(url)
     }
@@ -75,6 +113,10 @@ class MainActivity : ComponentActivity() {
         if (intent == null) return
         val debuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
         if (!debuggable) return
+        if (intent.hasExtra("keepAwake")) {
+            if (intent.getBooleanExtra("keepAwake", false)) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
         val store = SettingsStore(this)
         val license = intent.getStringExtra(EXTRA_LICENSE)?.trim().orEmpty()
         if (license.isNotEmpty()) {
@@ -101,7 +143,9 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_PACK_URL = "packUrl"
         const val EXTRA_CATALOG_URL = "catalog"
         const val EXTRA_OPEN = "open"
+        const val OPEN_WORKBENCH = "workbench"
         const val OPEN_VOICE_PACKS = "voicepacks"
+        const val OPEN_LOGS = "logs"
         const val EXTRA_LICENSE = "license"
         const val EXTRA_NARRATOR = "narrator"
     }

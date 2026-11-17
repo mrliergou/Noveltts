@@ -2,8 +2,10 @@ package app.noveltts.ui.common
 
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -29,6 +31,11 @@ fun VoiceField(
     voiceId: String,
     voices: List<VoiceDescriptor>,
     onSelect: (String) -> Unit,
+    onPreview: ((VoiceDescriptor) -> Unit)? = null,
+    onStopPreview: (() -> Unit)? = null,
+    previewVoiceId: String? = null,
+    previewStatus: String = "",
+    enabled: Boolean = true,
 ) {
     var showPicker by remember { mutableStateOf(false) }
     val selected = voices.firstOrNull { it.systemName == voiceId && it.usable }
@@ -42,6 +49,8 @@ fun VoiceField(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            AppIconGlyph(AppIcon.VOICE, size = 20.dp, tint = Muted)
+            Spacer(Modifier.width(10.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(label, style = MaterialTheme.typography.labelSmall, color = Muted)
                 Text(
@@ -59,8 +68,12 @@ fun VoiceField(
             }
             TextButton(
                 onClick = { showPicker = true },
-                enabled = voices.any { it.usable },
-            ) { Text("选择") }
+                enabled = enabled && voices.any { it.usable },
+            ) {
+                Text("选择")
+                Spacer(Modifier.width(2.dp))
+                AppIconGlyph(AppIcon.CHEVRON_DOWN, size = 16.dp)
+            }
         }
     }
 
@@ -70,7 +83,11 @@ fun VoiceField(
             voices = voices,
             selectedId = voiceId,
             onSelect = onSelect,
-            onDismiss = { showPicker = false },
+            onDismiss = { onStopPreview?.invoke(); showPicker = false },
+            onPreview = onPreview,
+            onStopPreview = onStopPreview,
+            previewVoiceId = previewVoiceId,
+            previewStatus = previewStatus,
         )
     }
 }

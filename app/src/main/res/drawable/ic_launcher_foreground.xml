@@ -1,0 +1,38 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 气泡主体：说话这件事本身 -->
+    <path
+        android:fillColor="#F4F7F5"
+        android:pathData="M38,30 L70,30 A14,14 0 0 1 84,44 L84,60 A14,14 0 0 1 70,74 L52,74 L34,86 L34,74 L38,74 A14,14 0 0 0 24,60 L24,44 A14,14 0 0 0 38,30 Z" />
+
+    <!-- 声波：外面两根短、里面对称，中间一根强调色 -->
+    <path
+        android:strokeColor="#007770"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:pathData="M38,58 L38,46" />
+    <path
+        android:strokeColor="#007770"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:pathData="M45,62 L45,42" />
+    <path
+        android:strokeColor="#BE5C2A"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:pathData="M52,66 L52,38" />
+    <path
+        android:strokeColor="#007770"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:pathData="M59,62 L59,42" />
+    <path
+        android:strokeColor="#007770"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:pathData="M66,58 L66,46" />
+</vector>
