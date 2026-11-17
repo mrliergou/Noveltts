@@ -10,6 +10,8 @@ import com.microsoft.cognitiveservices.speech.SpeechSynthesizer
 import com.microsoft.cognitiveservices.speech.audio.AudioConfig
 import app.noveltts.data.settings.SettingsStore
 import app.noveltts.data.voicepack.VoiceDescriptor
+import app.noveltts.engine.Category
+import app.noveltts.engine.DiagnosticsLog
 import app.noveltts.engine.api.SynthesisError
 import app.noveltts.engine.api.SynthesisHandle
 import app.noveltts.engine.api.SynthesisListener
@@ -52,11 +54,13 @@ class MicrosoftEmbeddedEngine(
             return handle
         }
         if (modelDirectory == null || !modelDirectory.isDirectory) {
+            DiagnosticsLog.error(Category.ENGINE, "离线语音模型目录不存在", DiagnosticsLog.pathHint(modelDirectory?.absolutePath))
             listener.onError(SynthesisError.BAD_REQUEST, "离线语音模型目录不存在")
             return handle
         }
         val license = settings.license()
         if (license.isNullOrBlank()) {
+            DiagnosticsLog.warn(Category.ENGINE, "离线音色缺少许可证：${descriptor.systemName}")
             listener.onError(
                 SynthesisError.LICENSE_REQUIRED,
                 "该离线音色需要 Microsoft Embedded Speech 许可证，请先在设置中配置",
@@ -111,6 +115,7 @@ class MicrosoftEmbeddedEngine(
                     result.close()
                 }
             } catch (error: Throwable) {
+                DiagnosticsLog.error(Category.ENGINE, "嵌入式语音初始化或合成失败：${descriptor.systemName}", error.message?.take(200))
                 if (!cancelled.get()) {
                     Log.w(TAG, "embedded speech failed", error)
                     listener.onError(

@@ -23,6 +23,7 @@ data class VoiceDescriptor(
     val usable: Boolean,
     val modelDirectory: File?,
     val unusableReason: String? = null,
+    val contentRevision: String = "",
 ) {
     val isOffline: Boolean get() = !isOnline
 }

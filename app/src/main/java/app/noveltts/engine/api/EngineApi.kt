@@ -32,7 +32,12 @@ data class SynthesisRequest(
     val rate: Float = 1f,
     val pitch: Float = 1f,
     val volume: Float = 1f,
+    val options: EngineRequestOptions? = null,
+    val requestId: String? = null,
+    val segmentId: String? = null,
 )
+
+data class EngineRequestOptions(val edgeEndpoint: String, val timeoutSec: Int, val localEnginePackage: String)
 
 /** 合成结果回调。除 [onStart] 之外，所有回调都在同一个后台线程上串行触发。 */
 interface SynthesisListener {

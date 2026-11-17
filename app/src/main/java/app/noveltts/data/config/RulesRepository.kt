@@ -2,6 +2,8 @@ package app.noveltts.data.config
 
 import android.content.Context
 import app.noveltts.domain.ReplacementRule
+import app.noveltts.domain.RoleMatchScope
+import app.noveltts.domain.ReplacementScope
 import app.noveltts.domain.RoleMatchMode
 import app.noveltts.domain.RoleRule
 import app.noveltts.domain.RuleGroup
@@ -18,6 +20,8 @@ import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 
 /** 规则文件损坏、版本过新或无法写入。调用方不得把它当作「空配置」继续保存。 */
 class RulesStoreException(message: String, cause: Throwable? = null) : IOException(message, cause)
+
+internal val CONFIGURATION_LOCK = Any()
 
 /**
  * 角色与替换规则的 JSON 仓库（schema v2：`{schema, groups, items}`）。
@@ -75,6 +79,61 @@ class RulesRepository(private val directory: File) {
         writeReplacements(normalizeReplacements(ruleSet))
     }
 
+    fun recoveryCandidates(): List<RuleRecoveryCandidate> = synchronized(LOCK) { RuleRecovery.list(directory) }
+    fun <T> withConfigurationLock(block: () -> T): T = synchronized(LOCK, block)
+    fun transactionFiles(): List<File> = listOf(ROLES_FILE, REPLACEMENTS_FILE).flatMap { base ->
+        (listOf("") + RuleRecovery.suffixes).map { File(directory, base + it) } }
+    fun restoreCandidate(candidate: RuleRecoveryCandidate) = synchronized(LOCK) {
+        val fresh = RuleRecovery.read(directory, candidate.fileName, candidate.kind)
+        check(fresh.valid && fresh.modified == candidate.modified && fresh.bytes == candidate.bytes) { "恢复来源已变化或不可读，请重新预览" }
+        val base = if (candidate.kind == RulesKind.ROLE) ROLES_FILE else REPLACEMENTS_FILE
+        val source = File(directory, candidate.fileName)
+        if (source.name != "$base.recovery.bak") Files.copy(source.toPath(), File(directory, "$base.recovery.bak").toPath(), REPLACE_EXISTING)
+        val target = File(directory, base)
+        if (target.isFile) Files.copy(target.toPath(), File(directory, "$base.before-recovery.bak").toPath(), REPLACE_EXISTING)
+        if (candidate.kind == RulesKind.ROLE) writeRoles(normalizeRoles(requireNotNull(fresh.roles)))
+        else writeReplacements(normalizeReplacements(requireNotNull(fresh.replacements)))
+    }
+
+    /**
+     * 备份还原：角色与替换两个文件要么一起更新，要么都保持原样。
+     *
+     * 先把现有文件复制为 `<name>.restore.bak`，再走正常的原子写（内部还会留一份
+     * `<name>.bak`）；任何一步失败都用备份把已写入的文件回滚。
+     */
+    fun restoreAll(roles: RuleSet<RoleRule>, replacements: RuleSet<ReplacementRule>) = synchronized(LOCK) {
+        val rolesFile = File(directory, ROLES_FILE)
+        val replacementsFile = File(directory, REPLACEMENTS_FILE)
+        val rolesBackup = File(directory, "$ROLES_FILE.restore.bak")
+        val replacementsBackup = File(directory, "$REPLACEMENTS_FILE.restore.bak")
+        val rolesExisted = rolesFile.isFile
+        val replacementsExisted = replacementsFile.isFile
+        if (rolesExisted) Files.copy(rolesFile.toPath(), rolesBackup.toPath(), REPLACE_EXISTING)
+        if (replacementsExisted) {
+            Files.copy(replacementsFile.toPath(), replacementsBackup.toPath(), REPLACE_EXISTING)
+        }
+        try {
+            writeRoles(normalizeRoles(roles))
+            writeReplacements(normalizeReplacements(replacements))
+        } catch (error: Exception) {
+            rollbackFile(rolesFile, rolesBackup, rolesExisted)
+            rollbackFile(replacementsFile, replacementsBackup, replacementsExisted)
+            throw if (error is RulesStoreException) error
+            else RulesStoreException("还原失败，已回滚原有规则：${error.message}", error)
+        }
+    }
+
+    /** 回滚单个文件；回滚本身失败时不掩盖原始异常，`.restore.bak` 仍可人工恢复。 */
+    private fun rollbackFile(target: File, backup: File, existed: Boolean) {
+        runCatching {
+            if (existed && backup.isFile) {
+                Files.copy(backup.toPath(), target.toPath(), REPLACE_EXISTING)
+            } else if (!existed) {
+                target.delete()
+            }
+        }
+    }
+
     // ---- 解码 ---------------------------------------------------------------
 
     private fun decodeRole(item: JSONObject, index: Int, schema: Int): RoleRule? {
@@ -95,6 +154,11 @@ class RulesRepository(private val directory: File) {
             groupId = if (schema >= 2) item.optString("groupId") else RuleGroup.DEFAULT_ID,
             matchMode = item.optEnum("matchMode", RoleMatchMode.REGEX_CONTAINS),
             voiceSelectionMode = item.optEnum("voiceSelectionMode", VoiceSelectionMode.FIXED),
+            matchScope = item.optEnum("matchScope", RoleMatchScope.SEGMENT),
+            contextChars = item.optInt("contextChars", 200).coerceIn(1, 2000),
+            speechRate = item.optDouble("speechRate", 1.0).toFloat().takeIf { it.isFinite() }?.coerceIn(0.25f, 4f) ?: 1f,
+            speechPitch = item.optDouble("speechPitch", 1.0).toFloat().takeIf { it.isFinite() }?.coerceIn(0.25f, 4f) ?: 1f,
+            speechVolume = item.optDouble("speechVolume", 1.0).toFloat().takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 1f,
             sortIndex = item.optInt("sortIndex", index),
         )
     }
@@ -108,6 +172,8 @@ class RulesRepository(private val directory: File) {
             find = find,
             replaceWith = item.optString("replaceWith"),
             isRegex = item.optBoolean("isRegex", false),
+            scope = item.optEnum("scope", ReplacementScope.ALL),
+            targetRoleId = item.optString("targetRoleId"),
             enabled = item.optBoolean("enabled", true),
             order = item.optInt("order", 100),
             sortIndex = item.optInt("sortIndex", index),
@@ -223,6 +289,11 @@ class RulesRepository(private val directory: File) {
         .put("groupId", rule.groupId)
         .put("matchMode", rule.matchMode.name)
         .put("voiceSelectionMode", rule.voiceSelectionMode.name)
+        .put("matchScope", rule.matchScope.name)
+        .put("contextChars", rule.contextChars)
+        .put("speechRate", rule.speechRate)
+        .put("speechPitch", rule.speechPitch)
+        .put("speechVolume", rule.speechVolume)
         .put("sortIndex", rule.sortIndex)
 
     private fun encodeReplacement(rule: ReplacementRule) = JSONObject()
@@ -231,6 +302,8 @@ class RulesRepository(private val directory: File) {
         .put("find", rule.find)
         .put("replaceWith", rule.replaceWith)
         .put("isRegex", rule.isRegex)
+        .put("scope", rule.scope.name)
+        .put("targetRoleId", rule.targetRoleId)
         .put("enabled", rule.enabled)
         .put("order", rule.order)
         .put("sortIndex", rule.sortIndex)
@@ -307,7 +380,7 @@ class RulesRepository(private val directory: File) {
 
     private companion object {
         /** 应用进程与系统 TTS 服务可能同时触发迁移/写入，按进程全局串行化。 */
-        val LOCK = Any()
+        val LOCK = CONFIGURATION_LOCK
         const val SCHEMA = 2
         const val ROLES_FILE = "roles.json"
         const val REPLACEMENTS_FILE = "replacements.json"

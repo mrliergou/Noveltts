@@ -13,6 +13,7 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.TextToSpeechService
 import android.speech.tts.Voice
 import android.util.Log
+import app.noveltts.data.cache.AudioCache
 import app.noveltts.data.config.RulesRepository
 import app.noveltts.data.config.RulesStoreException
 import app.noveltts.data.settings.SettingsStore
@@ -22,14 +23,20 @@ import app.noveltts.data.voicepack.VoicePackStore
 import app.noveltts.data.voicepack.VoiceRegistry
 import app.noveltts.domain.RuleSet
 import app.noveltts.domain.SynthesisPlanBuilder
+import app.noveltts.engine.Category
+import app.noveltts.engine.DiagnosticsLog
 import app.noveltts.engine.EngineManager
 import app.noveltts.engine.MultiSegmentSynthesizer
+import app.noveltts.engine.RetryPolicy
 import app.noveltts.engine.api.SynthesisHandle
 import app.noveltts.engine.api.SynthesisListener
+import java.io.File
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * MultiTTS 自己的 Android TextToSpeechService。
@@ -43,7 +50,16 @@ class MultiTtsService : TextToSpeechService() {
     private val registry by lazy { VoiceRegistry(this, packStore) }
     private val rules by lazy { RulesRepository(this) }
     private val engines by lazy { EngineManager(this, settings) }
-    private val synthesizer by lazy { MultiSegmentSynthesizer(engines) }
+    // spool 目录开启“先落盘再回放”：单段失败可换备用音色，取消时能直接丢弃半成品。
+    private val synthesizer by lazy {
+        MultiSegmentSynthesizer(
+            engines,
+            spoolDir = File(cacheDir, "spool"),
+            cacheDir = File(cacheDir, AudioCache.DIR_NAME),
+            cacheMaxMb = settings.cacheMaxMb,
+            cacheEnabled = settings.cacheEnabled,
+        )
+    }
     private val voiceLock = Any()
 
     @Volatile
@@ -52,8 +68,22 @@ class MultiTtsService : TextToSpeechService() {
     @Volatile
     private var cachedDescriptors: List<VoiceDescriptor> = emptyList()
 
+    /** 上面两份缓存是按哪个本地引擎包名算出来的：设置一改就要重算。 */
+    private var cachedLocalEnginePackage: String? = null
+    private var cachedLicenseConfigured: Boolean? = null
+    private val stopGeneration = AtomicLong()
+
     @Volatile
     private var active: ActiveSynthesis? = null
+
+    @Volatile private var loadedVoiceName: String? = null
+
+    private val stopPlaybackReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == PlaybackSession.ACTION_STOP_SYNTHESIS &&
+                intent.getStringExtra(PlaybackSession.EXTRA_SESSION_ID) == null) onStop()
+        }
+    }
 
     private val refreshReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -62,30 +92,43 @@ class MultiTtsService : TextToSpeechService() {
     }
 
     override fun onCreate() {
+        app.noveltts.data.backup.ConfigurationRecovery.recover(this)
         super.onCreate()
+        DiagnosticsLog.attachStore(filesDir)
+        DiagnosticsLog.restoreRecent()
         val filter = IntentFilter(VoicePackEvents.ACTION_CHANGED)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(refreshReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(stopPlaybackReceiver, IntentFilter(PlaybackSession.ACTION_STOP_SYNTHESIS), Context.RECEIVER_NOT_EXPORTED)
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(refreshReceiver, filter)
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(stopPlaybackReceiver, IntentFilter(PlaybackSession.ACTION_STOP_SYNTHESIS))
         }
-        refreshVoices()
+        runCatching { refreshVoices() }.onFailure {
+            DiagnosticsLog.error(Category.ENGINE, "系统音色扫描失败", it.message)
+        }
     }
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(refreshReceiver) }
-        active?.handle?.cancel()
-        active?.latch?.countDown()
+        runCatching { unregisterReceiver(stopPlaybackReceiver) }
+        stopGeneration.incrementAndGet()
+        active?.cancel()
         active = null
-        synthesizer.shutdown()
+        runCatching { synthesizer.shutdown() }
         super.onDestroy()
     }
 
     // ---- 语言与音色 -------------------------------------------------------
 
     override fun onGetLanguage(): Array<String> {
-        val locale = refreshVoices().firstOrNull()?.locale ?: Locale.SIMPLIFIED_CHINESE
+        val voices = refreshVoices()
+        val locale = voices.firstOrNull { it.name == loadedVoiceName }?.locale
+            ?: voices.firstOrNull { it.name == settings.systemVoice }?.locale
+            ?: voices.firstOrNull { it.locale.language == "zh" }?.locale
+            ?: voices.firstOrNull()?.locale ?: Locale.SIMPLIFIED_CHINESE
         return arrayOf(locale.isO3Language, locale.isO3Country, locale.variant)
     }
 
@@ -100,11 +143,15 @@ class MultiTtsService : TextToSpeechService() {
     override fun onIsValidVoiceName(voiceName: String?): Int =
         if (refreshVoices().any { it.name == voiceName }) TextToSpeech.SUCCESS else TextToSpeech.ERROR
 
-    override fun onLoadVoice(voiceName: String?): Int = onIsValidVoiceName(voiceName)
+    override fun onLoadVoice(voiceName: String?): Int = onIsValidVoiceName(voiceName).also {
+        if (it == TextToSpeech.SUCCESS) loadedVoiceName = voiceName
+    }
 
     override fun onGetDefaultVoiceNameFor(lang: String?, country: String?, variant: String?): String {
         val voices = refreshVoices()
-        val configured = settings.systemVoice.takeIf { id -> voices.any { it.name == id } }
+        val configured = settings.systemVoice.takeIf { id -> voices.any {
+            it.name == id && matches(it.locale, lang, country, variant)
+        } }
         return configured
             ?: voices.firstOrNull { matches(it.locale, lang, country, variant) }?.name
             ?: voices.firstOrNull()?.name
@@ -120,37 +167,44 @@ class MultiTtsService : TextToSpeechService() {
     // ---- 合成 -------------------------------------------------------------
 
     override fun onSynthesizeText(request: SynthesisRequest, callback: SynthesisCallback) {
+        runCatching { synthesizeRequest(request, callback) }.onFailure {
+            DiagnosticsLog.error(Category.SPEECH, "系统合成请求失败", it.message)
+            safeError(callback)
+        }
+    }
+
+    private fun synthesizeRequest(request: SynthesisRequest, callback: SynthesisCallback) {
         val text = request.charSequenceText?.toString().orEmpty()
         if (text.isBlank()) {
             safeError(callback)
             return
         }
 
-        val descriptors = descriptors()
-        if (descriptors.none { it.usable }) {
-            Log.w(TAG, "synthesize rejected: no usable voice")
-            safeError(callback)
-            return
+        val generation = stopGeneration.get()
+        val requestId = java.util.UUID.randomUUID().toString().take(8)
+        DiagnosticsLog.info(Category.SPEECH, "系统请求 $requestId 已接收", DiagnosticsLog.textHint(text))
+        val prepared = rules.withConfigurationLock {
+            val config = settings.synthesisSnapshot()
+            val descriptors = descriptors()
+            if (descriptors.none { it.usable }) {
+                DiagnosticsLog.warn(Category.SPEECH, "系统朗读被拒绝：没有可用音色")
+                return@withConfigurationLock null
+            }
+            val requested = descriptors.firstOrNull { it.systemName == request.voiceName && it.usable }
+            val narrator = requested
+                ?: descriptors.firstOrNull { it.systemName == config.narratorVoice && it.usable }
+                ?: descriptors.firstOrNull { it.systemName == config.systemVoice && it.usable }
+                ?: descriptors.firstOrNull { it.usable && it.localeTag.startsWith("zh") }
+                ?: descriptors.firstOrNull { it.usable }
+            val dialogue = descriptors.firstOrNull { it.systemName == config.dialogueVoice && it.usable } ?: narrator
+            val plan = SynthesisPlanBuilder.build(text,
+                config.builtInRoles.withVoices(narrator?.systemName, dialogue?.systemName),
+                loadRulesOrEmpty("roles") { rules.loadRoles() }, loadRulesOrEmpty("replacements") { rules.loadReplacements() },
+                config.punctuationFilter, descriptors, config.maxSegmentChars)
+            plan to config
         }
-        val requested = descriptors.firstOrNull { it.systemName == request.voiceName && it.usable }
-        val narrator = requested
-            ?: descriptors.firstOrNull { it.systemName == settings.narratorVoice && it.usable }
-            ?: descriptors.firstOrNull { it.systemName == settings.systemVoice && it.usable }
-            ?: descriptors.firstOrNull { it.usable && it.localeTag.startsWith("zh") }
-            ?: descriptors.firstOrNull { it.usable }
-        val dialogue = descriptors.firstOrNull {
-            it.systemName == settings.dialogueVoice && it.usable
-        } ?: narrator
-
-        val plan = SynthesisPlanBuilder.build(
-            text = text,
-            narratorVoiceId = narrator?.systemName,
-            dialogueVoiceId = dialogue?.systemName,
-            roles = loadRulesOrEmpty("roles") { rules.loadRoles() },
-            replacements = loadRulesOrEmpty("replacements") { rules.loadReplacements() },
-            filterPurePunctuation = settings.punctuationFilter,
-            voices = descriptors,
-        )
+        val (plan, config) = prepared ?: run { safeError(callback); return }
+        if (generation != stopGeneration.get()) return
         if (plan.segments.isEmpty()) {
             val started = runCatching {
                 callback.start(24_000, AudioFormat.ENCODING_PCM_16BIT, 1)
@@ -188,6 +242,7 @@ class MultiTtsService : TextToSpeechService() {
                 if (result != TextToSpeech.SUCCESS) {
                     failed.set(true)
                     aborted.set(true)
+                    latch.countDown()
                 }
             }
 
@@ -200,35 +255,45 @@ class MultiTtsService : TextToSpeechService() {
             }
 
             override fun onError(code: Int, message: String?) {
-                Log.w(TAG, "synthesis error [$code] $message")
+                DiagnosticsLog.error(Category.SPEECH, "系统朗读失败 [$code]", message?.take(200))
+                Log.w(TAG, "synthesis error [$code] request=$requestId")
                 aborted.set(true)
                 if (!callback.hasFinished()) safeError(callback)
                 latch.countDown()
             }
         }
 
-        val handle = synthesizer.synthesize(
-            segments = plan.segments,
-            rate = (request.speechRate / 100f).coerceIn(0.25f, 4f),
-            pitch = (request.pitch / 100f).coerceIn(0.25f, 4f),
-            volume = resolveVolume(request.params),
-            listener = listener,
-        )
-        active = ActiveSynthesis(handle, latch)
+        val session = ActiveSynthesis(latch, aborted)
+        active = session
+        if (generation != stopGeneration.get()) session.cancel()
+        var lease: AutoCloseable? = null
         try {
-            latch.await(SYNTHESIS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            if (aborted.get()) return
+            synthesizer.configure(RetryPolicy(config.maxRetryCount + 1), config.silenceBetweenSegmentsMs, config.options.timeoutSec)
+            synthesizer.configureCache(config.cacheEnabled, config.cacheMaxMb)
+            lease = PlaybackSession.open(this, plan.segments.any { it.voice.isOnline }) { onStop() }
+            val handle = synthesizer.synthesize(plan.segments,
+                (request.speechRate / 100f).coerceIn(0.25f, 4f), (request.pitch / 100f).coerceIn(0.25f, 4f),
+                resolveVolume(request.params), listener, options = config.options, requestId = requestId)
+            session.attach(handle)
+            if (!latch.await(SYNTHESIS_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                failed.set(true)
+                session.cancel()
+                DiagnosticsLog.error(Category.SPEECH, "系统请求 $requestId 超时")
+            }
         } catch (interrupted: InterruptedException) {
-            Log.w(TAG, "synthesis interrupted", interrupted)
+            failed.set(true)
+            session.cancel()
             Thread.currentThread().interrupt()
-            handle.cancel()
         } finally {
-            if (active?.latch === latch) active = null
+            if (failed.get()) { session.cancel(); safeError(callback) }
+            if (active === session) active = null
+            lease?.close()
         }
     }
-
     override fun onStop() {
-        active?.handle?.cancel()
-        active?.latch?.countDown()
+        stopGeneration.incrementAndGet()
+        active?.cancel()
     }
 
     // ---- 内部辅助 ---------------------------------------------------------
@@ -240,14 +305,20 @@ class MultiTtsService : TextToSpeechService() {
         }
     }
 
-    private fun refreshVoices(): List<Voice> = synchronized(voiceLock) {
-        if (cachedVoices.isNotEmpty()) return@synchronized cachedVoices
-        cachedDescriptors = registry.voices(settings.hasLicense())
+    private fun refreshVoices(): List<Voice> = rules.withConfigurationLock { synchronized(voiceLock) {
+        val licensed = settings.hasLicense()
+        if (cachedVoices.isNotEmpty() && cachedLocalEnginePackage == settings.localTtsEnginePackage && cachedLicenseConfigured == licensed) {
+            return@synchronized cachedVoices
+        }
+        cachedDescriptors = registry.voices(licensed, settings.localTtsEnginePackage)
+        cachedLicenseConfigured = licensed
+        cachedLocalEnginePackage = settings.localTtsEnginePackage
         cachedVoices = cachedDescriptors.filter { it.usable }.mapNotNull { descriptor ->
+            val locale = TtsLanguageProtocol.locale(descriptor.localeTag) ?: return@mapNotNull null
             runCatching {
                 Voice(
                     descriptor.systemName,
-                    Locale.forLanguageTag(descriptor.localeTag),
+                    locale,
                     Voice.QUALITY_HIGH,
                     Voice.LATENCY_NORMAL,
                     descriptor.isOnline,
@@ -256,14 +327,17 @@ class MultiTtsService : TextToSpeechService() {
             }.getOrNull()
         }
         cachedVoices
-    }
+    } }
 
-    private fun descriptors(): List<VoiceDescriptor> = synchronized(voiceLock) {
-        if (cachedDescriptors.isEmpty()) {
-            cachedDescriptors = registry.voices(settings.hasLicense())
+    private fun descriptors(): List<VoiceDescriptor> = rules.withConfigurationLock { synchronized(voiceLock) {
+        val licensed = settings.hasLicense()
+        if (cachedDescriptors.isEmpty() || cachedLocalEnginePackage != settings.localTtsEnginePackage || cachedLicenseConfigured != licensed) {
+            cachedDescriptors = registry.voices(licensed, settings.localTtsEnginePackage)
+            cachedLicenseConfigured = licensed
+            cachedLocalEnginePackage = settings.localTtsEnginePackage
         }
         cachedDescriptors
-    }
+    } }
 
     private fun matchLanguage(lang: String?, country: String?, variant: String?): Int {
         val voices = refreshVoices()
@@ -278,19 +352,7 @@ class MultiTtsService : TextToSpeechService() {
     }
 
     private fun matches(locale: Locale, lang: String?, country: String?, variant: String?): Boolean {
-        if (lang.isNullOrEmpty()) return false
-        val languageHit = locale.isO3Language.equals(lang, ignoreCase = true) ||
-            locale.language.equals(lang, ignoreCase = true)
-        if (!languageHit) return false
-        if (!country.isNullOrEmpty()) {
-            val countryHit = locale.isO3Country.equals(country, ignoreCase = true) ||
-                locale.country.equals(country, ignoreCase = true)
-            if (!countryHit) return false
-        }
-        if (!variant.isNullOrEmpty() && !locale.variant.equals(variant, ignoreCase = true)) {
-            return false
-        }
-        return true
+        return TtsLanguageProtocol.matches(locale, lang, country, variant)
     }
 
     private fun resolveVolume(params: Bundle?): Float =
@@ -301,6 +363,7 @@ class MultiTtsService : TextToSpeechService() {
         try {
             load()
         } catch (error: RulesStoreException) {
+            DiagnosticsLog.warn(Category.PIPELINE, "$label 规则不可用，本次按无规则合成", error.message?.take(200))
             Log.w(TAG, "$label unavailable, synthesizing without rules: ${error.message}")
             RuleSet()
         }
@@ -312,9 +375,20 @@ class MultiTtsService : TextToSpeechService() {
     }
 
     private class ActiveSynthesis(
-        val handle: SynthesisHandle,
         val latch: CountDownLatch,
-    )
+        private val aborted: AtomicBoolean,
+    ) {
+        private val handle = AtomicReference<SynthesisHandle?>()
+        fun attach(value: SynthesisHandle) {
+            handle.set(value)
+            if (aborted.get()) handle.getAndSet(null)?.cancel()
+        }
+        fun cancel() {
+            aborted.set(true)
+            handle.getAndSet(null)?.cancel()
+            latch.countDown()
+        }
+    }
 
     private companion object {
         const val TAG = "MultiTtsService"

@@ -9,6 +9,8 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import app.noveltts.data.settings.SettingsStore
+import app.noveltts.engine.Category
+import app.noveltts.engine.DiagnosticsLog
 import app.noveltts.data.voicepack.VoiceDescriptor
 import app.noveltts.engine.api.SynthesisError
 import app.noveltts.engine.api.SynthesisHandle
@@ -68,6 +70,7 @@ class EdgeTtsEngine(
                 val mp3 = synthesizeToMp3(descriptor, request, cancelled, socket)
                 if (cancelled.get() || closed.get()) return@execute
                 val temp = File(cacheDir, "edge-${UUID.randomUUID()}.mp3")
+                val protection = app.noveltts.data.cache.ActiveAudioFiles.protect(temp)
                 try {
                     temp.writeBytes(mp3)
                     val pcm = Mp3PcmDecoder.decodeToPcm16(temp, request.volume)
@@ -83,12 +86,15 @@ class EdgeTtsEngine(
                     if (!cancelled.get()) listener.onComplete()
                 } finally {
                     temp.delete()
+                    protection.close()
                 }
             } catch (error: EdgeHttpException) {
+                DiagnosticsLog.warn(Category.ENGINE, "Edge 合成失败（HTTP ${error.code}）", error.userMessage().take(200))
                 if (!cancelled.get()) {
                     listener.onError(SynthesisError.NETWORK_FAILED, error.userMessage())
                 }
             } catch (error: Exception) {
+                DiagnosticsLog.error(Category.ENGINE, "Edge 合成异常", error.message?.take(200))
                 if (!cancelled.get()) {
                     Log.w(TAG, "edge synthesis failed", error)
                     listener.onError(SynthesisError.NETWORK_FAILED, error.message ?: "在线语音合成失败")
@@ -120,6 +126,7 @@ class EdgeTtsEngine(
                 lastError = error
                 if (error.code != 403 || attempt == 1) throw error
                 if (!EdgeGec.adjustClockFromServerDate(error.serverDate)) throw error
+                DiagnosticsLog.warn(Category.ENGINE, "Edge 握手 403，已按服务端时间校准时钟后重试")
                 Log.i(TAG, "edge handshake 403, retrying after clock adjustment")
             }
         }
@@ -194,7 +201,7 @@ class EdgeTtsEngine(
 
         val ws = client.newWebSocket(
             Request.Builder()
-                .url(buildUrl(requestId))
+                .url(buildUrl(requestId, request.options?.edgeEndpoint))
                 .header("Pragma", "no-cache")
                 .header("Cache-Control", "no-cache")
                 .header("Origin", ORIGIN)
@@ -206,7 +213,8 @@ class EdgeTtsEngine(
         )
         socketRef.set(ws)
         try {
-            if (!done.await(RECEIVE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            val timeoutSec = (request.options?.timeoutSec ?: settings.requestTimeoutSec).toLong().coerceIn(10L, 180L)
+            if (!done.await(timeoutSec, TimeUnit.SECONDS)) {
                 ws.cancel()
                 throw IOException("在线语音服务响应超时")
             }
@@ -220,8 +228,8 @@ class EdgeTtsEngine(
         return bytes
     }
 
-    private fun buildUrl(connectionId: String): String {
-        val configured = settings.edgeEndpoint.trim().ifBlank { SettingsStore.DEFAULT_EDGE_ENDPOINT }
+    private fun buildUrl(connectionId: String, endpoint: String? = null): String {
+        val configured = (endpoint ?: settings.edgeEndpoint).trim().ifBlank { SettingsStore.DEFAULT_EDGE_ENDPOINT }
         val separator = if ('?' in configured) '&' else '?'
         val auth = if (
             configured.contains("Ocp-Apim-Subscription-Key", ignoreCase = true) ||

@@ -22,7 +22,7 @@ class VoiceRegistry(
 
     fun packs(): List<VoicePack> = store.installed()
 
-    fun voices(licenseConfigured: Boolean): List<VoiceDescriptor> = buildList {
+    fun voices(licenseConfigured: Boolean, localEnginePackage: String = ""): List<VoiceDescriptor> = buildList {
         packs().forEach { pack ->
             if (!pack.isOriginal) return@forEach
             pack.voices.forEach { voice ->
@@ -35,10 +35,20 @@ class VoiceRegistry(
                 }
                 val licenseRequired = engineCode == "microsoft"
                 val modelReady = !licenseRequired || modelDir?.isDirectory == true
-                val usable = modelReady && (!licenseRequired || licenseConfigured)
+                // android-<包名> 的桥接引擎只有设置里配了同一个包名时才真的能合成，
+                // 否则会在合成时报 BAD_REQUEST；这里提前把原因显示给用户。
+                val bridgePackage = if (engineCode.startsWith(LOCAL_ENGINE_PREFIX)) {
+                    engineCode.removePrefix(LOCAL_ENGINE_PREFIX)
+                } else {
+                    null
+                }
+                val bridgeReady = bridgePackage == null ||
+                    (localEnginePackage.isNotBlank() && bridgePackage == localEnginePackage)
+                val usable = modelReady && (!licenseRequired || licenseConfigured) && bridgeReady
                 val reason = when {
                     !modelReady -> "离线模型目录缺失"
                     licenseRequired && !licenseConfigured -> "需要 Microsoft Embedded Speech 许可证"
+                    !bridgeReady -> "需要在设置里把本地引擎配置为 " + bridgePackage
                     else -> null
                 }
                 add(
@@ -49,7 +59,7 @@ class VoiceRegistry(
                         engineCode = engineCode,
                         voiceCode = voice.code,
                         param = voice.param,
-                        displayName = "${voice.name} · ${engine?.name ?: engineCode}",
+                        displayName = "${voice.name} · ${engine.name}",
                         localeTag = voice.locale,
                         gender = voice.gender,
                         isOnline = voice.isOnline,
@@ -62,18 +72,26 @@ class VoiceRegistry(
                         usable = usable,
                         modelDirectory = modelDir,
                         unusableReason = reason,
+                        contentRevision = pack.contentRevision,
                     ),
                 )
             }
         }
         }.sortedWith(compareBy<VoiceDescriptor> { it.isOnline }.thenBy { it.displayName })
 
-    fun find(voiceId: String?, licenseConfigured: Boolean): VoiceDescriptor? {
+    fun find(
+        voiceId: String?,
+        licenseConfigured: Boolean,
+        localEnginePackage: String = "",
+    ): VoiceDescriptor? {
         if (voiceId.isNullOrBlank()) return null
-        return voices(licenseConfigured).firstOrNull { it.systemName == voiceId }
+        return voices(licenseConfigured, localEnginePackage).firstOrNull { it.systemName == voiceId }
     }
 
     companion object {
+        /** 桥接给本地系统 TTS 引擎的引擎代码前缀，与 EngineManager 保持一致。 */
+        private const val LOCAL_ENGINE_PREFIX = "android-"
+
         fun systemName(packId: String, engineCode: String, voiceCode: String): String =
             "multitts:$packId:$engineCode:$voiceCode"
     }

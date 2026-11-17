@@ -4,6 +4,7 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import app.noveltts.engine.DiagnosticsLog
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -19,20 +20,30 @@ class SecretStore(context: Context) {
         .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     fun put(key: String, plainText: String?) {
+        DiagnosticsLog.registerSensitiveValue(plainText)
         if (plainText.isNullOrBlank()) {
-            preferences.edit().remove(key).apply()
+            check(preferences.edit().remove(key).commit()) { "凭据写入失败" }
             return
         }
-        runCatching {
+        run {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.ENCRYPT_MODE, secretKey())
             val encrypted = cipher.doFinal(plainText.toByteArray(Charsets.UTF_8))
             val packed = cipher.iv + encrypted
             preferences.edit()
                 .putString(key, Base64.encodeToString(packed, Base64.NO_WRAP))
-                .apply()
+                .commit().also { check(it) { "凭据写入失败" } }
         }
     }
+
+    fun encryptedSnapshot(): Map<String, String> = preferences.all.mapNotNull { (key, value) ->
+        (value as? String)?.let { key to it } }.toMap()
+    fun restoreEncryptedSnapshot(snapshot: Map<String, String>) {
+        val editor = preferences.edit().clear()
+        snapshot.forEach { (key, value) -> editor.putString(key, value) }
+        check(editor.commit()) { "凭据回滚失败" }
+    }
+    fun flush() { check(preferences.edit().commit()) { "凭据同步失败" } }
 
     fun get(key: String): String? {
         val packed = preferences.getString(key, null) ?: return null
@@ -44,7 +55,7 @@ class SecretStore(context: Context) {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(128, iv))
             String(cipher.doFinal(cipherText), Charsets.UTF_8)
-        }.getOrNull()?.takeIf { it.isNotBlank() }
+        }.getOrNull()?.takeIf { it.isNotBlank() }?.also(DiagnosticsLog::registerSensitiveValue)
     }
 
     private fun secretKey(): SecretKey {

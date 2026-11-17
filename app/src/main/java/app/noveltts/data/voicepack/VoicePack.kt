@@ -126,6 +126,7 @@ data class VoicePack(
     val sourceUrl: String? = null,
     val format: VoicePackFormat = VoicePackFormat.LEGACY_JSON,
     val engines: List<PackEngine> = emptyList(),
+    val contentRevision: String = "",
 ) {
     val isOriginal: Boolean get() = format == VoicePackFormat.ORIGINAL_YAML
 

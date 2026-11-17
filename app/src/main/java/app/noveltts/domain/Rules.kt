@@ -28,6 +28,55 @@ enum class RoleMatchMode {
 
     /** 正则需匹配整段文本。 */
     EXACT,
+    LITERAL_EXACT,
+}
+
+enum class RoleMatchScope { SEGMENT, PREVIOUS_NARRATION, NEXT_NARRATION }
+enum class ReplacementScope { ALL, NARRATION, DIALOGUE, ROLE }
+
+/** 一个朗读角色的音色与倍率；倍率叠加在全局参数与音色默认值之上。 */
+data class RolePlaybackSettings(
+    val voiceId: String = "",
+    val rate: Float = 1f,
+    val pitch: Float = 1f,
+    val volume: Float = 1f,
+) {
+    fun normalized(): RolePlaybackSettings = copy(
+        rate = multiplier(rate, RATE_RANGE),
+        pitch = multiplier(pitch, RATE_RANGE),
+        volume = multiplier(volume, VOLUME_RANGE),
+    )
+
+    companion object {
+        val RATE_RANGE = 0.25f..4f
+        val VOLUME_RANGE = 0f..1f
+
+        fun multiplier(value: Float, range: ClosedFloatingPointRange<Float>): Float =
+            if (value.isFinite()) value.coerceIn(range) else 1f
+    }
+}
+
+enum class BuiltInRole { NARRATOR, DIALOGUE }
+
+/** 未命中任何角色规则时的兜底角色：旁白与对话。 */
+data class BuiltInRoleSettings(
+    val narrator: RolePlaybackSettings = RolePlaybackSettings(),
+    val dialogue: RolePlaybackSettings = RolePlaybackSettings(),
+) {
+    operator fun get(role: BuiltInRole): RolePlaybackSettings = when (role) {
+        BuiltInRole.NARRATOR -> narrator
+        BuiltInRole.DIALOGUE -> dialogue
+    }
+
+    fun with(role: BuiltInRole, settings: RolePlaybackSettings): BuiltInRoleSettings = when (role) {
+        BuiltInRole.NARRATOR -> copy(narrator = settings)
+        BuiltInRole.DIALOGUE -> copy(dialogue = settings)
+    }
+
+    fun withVoices(narratorVoiceId: String?, dialogueVoiceId: String?): BuiltInRoleSettings = copy(
+        narrator = narrator.copy(voiceId = narratorVoiceId.orEmpty()),
+        dialogue = dialogue.copy(voiceId = dialogueVoiceId.orEmpty()),
+    )
 }
 
 enum class VoiceSelectionMode {
@@ -50,6 +99,11 @@ data class RoleRule(
     val matchMode: RoleMatchMode = RoleMatchMode.REGEX_CONTAINS,
     val voiceSelectionMode: VoiceSelectionMode = VoiceSelectionMode.FIXED,
     val sortIndex: Int = 0,
+    val matchScope: RoleMatchScope = RoleMatchScope.SEGMENT,
+    val contextChars: Int = 200,
+    val speechRate: Float = 1f,
+    val speechPitch: Float = 1f,
+    val speechVolume: Float = 1f,
 ) {
     val primaryVoiceId: String? get() = voiceIds.firstOrNull { it.isNotBlank() }
 }
@@ -65,6 +119,8 @@ data class ReplacementRule(
     val order: Int = 100,
     val sortIndex: Int = 0,
     val groupId: String = RuleGroup.DEFAULT_ID,
+    val scope: ReplacementScope = ReplacementScope.ALL,
+    val targetRoleId: String = "",
 )
 
 data class PipelineIssue(
@@ -78,10 +134,20 @@ data class PipelineSegment(
     val isDialogue: Boolean,
     val voiceId: String?,
     val roleName: String? = null,
+    val id: String = "",
+    val roleId: String? = null,
+    val requestedVoiceId: String? = voiceId,
+    val fallbackReason: String? = null,
+    val speechRate: Float = 1f,
+    val speechPitch: Float = 1f,
+    val speechVolume: Float = 1f,
 )
+
+data class ReplacementTrace(val ruleId: String, val ruleName: String, val before: String, val after: String)
 
 data class TextPipelineResult(
     val segments: List<PipelineSegment>,
     val transformedText: String,
     val issues: List<PipelineIssue> = emptyList(),
+    val replacements: List<ReplacementTrace> = emptyList(),
 )

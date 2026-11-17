@@ -2,6 +2,8 @@ package app.noveltts.data.voicepack
 
 import android.content.Context
 import android.util.Log
+import app.noveltts.engine.Category
+import app.noveltts.engine.DiagnosticsLog
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -66,8 +68,8 @@ class VoicePackStore(context: Context) {
             if (root.usableSpace in 1 until zipFile.length() * 3) {
                 throw IOException("可用存储空间不足")
             }
+            val actual = zipFile.sha256()
             if (expectedSha256 != null) {
-                val actual = zipFile.sha256()
                 if (!actual.equals(expectedSha256.trim(), ignoreCase = true)) {
                     throw IOException("语音包校验失败：期望 $expectedSha256，实际 $actual")
                 }
@@ -79,6 +81,7 @@ class VoicePackStore(context: Context) {
             val installedAt = System.currentTimeMillis()
             val pack = detected.copy(
                 installedAt = installedAt,
+                contentRevision = actual,
                 sourceUrl = sourceUrl ?: detected.sourceUrl,
             )
             writeMetadata(payload, pack)
@@ -93,8 +96,12 @@ class VoicePackStore(context: Context) {
                 throw IOException("安装 ${pack.id} 失败")
             }
             backup.deleteRecursively()
+            DiagnosticsLog.info(Category.PACK, "音色包导入成功：${pack.name}", "包 ${pack.id} · 格式 ${pack.format} · ${pack.voices.size} 个音色")
             Log.i(TAG, "installed ${pack.format} pack ${pack.id} (${pack.voices.size} voices)")
             return pack
+        } catch (error: Exception) {
+            DiagnosticsLog.error(Category.PACK, "音色包导入失败", error.message?.take(200))
+            throw error
         } finally {
             work.deleteRecursively()
         }
@@ -121,6 +128,8 @@ class VoicePackStore(context: Context) {
             else -> throw IOException("缺少可识别的语音包清单")
         }
         return pack.copy(
+            contentRevision = metadata?.optString("contentRevision")?.takeIf { it.isNotBlank() }
+                ?: "legacy:${pack.version}:${metadata?.optLong("installedAt", pack.installedAt) ?: pack.installedAt}",
             installedAt = metadata?.optLong("installedAt", pack.installedAt) ?: pack.installedAt,
             sourceUrl = metadata?.optString("sourceUrl")?.takeIf { it.isNotBlank() } ?: pack.sourceUrl,
         )
@@ -132,6 +141,7 @@ class VoicePackStore(context: Context) {
             put("id", pack.id)
             put("format", pack.format.name)
             put("installedAt", pack.installedAt)
+            put("contentRevision", pack.contentRevision)
             pack.sourceUrl?.let { put("sourceUrl", it) }
             put("engines", pack.engines.joinToString(",") { it.code })
         }

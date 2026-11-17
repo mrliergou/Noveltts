@@ -17,6 +17,9 @@ internal object WavAudio {
 
     private const val TAG = "WavAudio"
 
+    /** WAVE_FORMAT_EXTENSIBLE 的 formatTag，真正的编码在 SubFormat GUID 里。 */
+    private const val FORMAT_EXTENSIBLE = 0xFFFE
+
     class UnsupportedAudioException(message: String) : Exception(message)
 
     fun read(file: File, volume: Float): PcmAudio {
@@ -44,6 +47,11 @@ internal object WavAudio {
                 "fmt " -> {
                     if (body + 16 > bytes.size) break
                     formatTag = shortLe(bytes, body)
+                    if (formatTag == FORMAT_EXTENSIBLE && body + 26 <= bytes.size) {
+                        // WAVE_FORMAT_EXTENSIBLE：真正的编码在 SubFormat GUID 的前两个字节，
+                        // 系统 TTS 引擎经常用这种容器。
+                        formatTag = shortLe(bytes, body + 24)
+                    }
                     channels = shortLe(bytes, body + 2)
                     sampleRate = intLe(bytes, body + 4)
                     bitsPerSample = shortLe(bytes, body + 14)
