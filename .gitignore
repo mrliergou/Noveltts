@@ -9,6 +9,8 @@ local.properties
 .DS_Store
 .gradle-home/
 .tmp/
+.tooling/
+
 *.log
 voicepacks-local/
 语音包/
@@ -25,8 +27,10 @@ app/src/main/jniLibs/
 /docs/REIMPLEMENTATION_TARGET.md
 /docs/VOICE_PACKS.md
 /docs/UI_EFFECT_ATLAS.md
+/docs/DEEP_FEATURES.md
 /build.gradle.kts
 /settings.gradle.kts
 /gradle.properties
 /app/build.gradle.kts
 /app/src/test/
+.ace-tool/
