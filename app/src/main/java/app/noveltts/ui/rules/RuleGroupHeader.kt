@@ -164,7 +164,7 @@ internal fun RuleGroupDialog(
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Text(
-                    text = "重名会自动并入已有同名分组，组内规则顺序保持不变。",
+                    text = "同名分组仍独立保存；只有导入规则时会按名称合并分组。",
                     style = MaterialTheme.typography.labelSmall,
                     color = Muted,
                 )

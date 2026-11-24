@@ -20,6 +20,13 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -45,12 +52,28 @@ internal fun <T> ImportConflictSheet(
     kindLabel: String,
     preview: RulesImportPreview<T>,
     nameOf: (T) -> String,
-    onApply: (RuleImportStrategy) -> Unit,
+    onApply: suspend (RuleImportStrategy) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var applying by remember { mutableStateOf(false) }
+    var confirmReplace by remember { mutableStateOf(false) }
+    val currentApplying = rememberUpdatedState(applying)
+    val confirmChange: (androidx.compose.material3.SheetValue) -> Boolean = remember { { !currentApplying.value } }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true, confirmValueChange = confirmChange)
+    val scope = rememberCoroutineScope()
+    fun apply(strategy: RuleImportStrategy) {
+        if (applying) return
+        applying = true
+        scope.launch { try { onApply(strategy) } finally { applying = false } }
+    }
+    if (confirmReplace) app.noveltts.ui.common.ConfirmDialog(
+        title = "全部覆盖当前规则？", message = "当前全部${kindLabel}和分组将被替换，只保留导入文件里的内容。",
+        confirmLabel = "全部覆盖", dangerous = true,
+        onConfirm = { confirmReplace = false; apply(RuleImportStrategy.REPLACE_ALL) },
+        onDismiss = { confirmReplace = false },
+    )
     val conflicts = preview.entries.filter { it.conflict != RuleImportConflict.NONE }
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
+    ModalBottomSheet(onDismissRequest = { if (!applying) onDismiss() }, sheetState = sheetState) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -70,6 +93,7 @@ internal fun <T> ImportConflictSheet(
                 style = MaterialTheme.typography.bodySmall,
                 color = Muted,
             )
+            Text("规则受输入/展开预算及执行超时限制；预览最多 2 秒，朗读规划最多 10 秒。超限会保留规则并停止本次处理。", style = MaterialTheme.typography.labelSmall, color = Muted)
             if (preview.newGroups.isNotEmpty()) {
                 Text(
                     text = "将新建分组：" + preview.newGroups.joinToString("、") { it.name },
@@ -114,7 +138,7 @@ internal fun <T> ImportConflictSheet(
                 horizontalArrangement = Arrangement.End,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                TextButton(onClick = onDismiss) { Text("取消") }
+                TextButton(onClick = onDismiss, enabled = !applying) { Text("取消") }
             }
             if (conflicts.isEmpty()) {
                 Row(
@@ -123,7 +147,7 @@ internal fun <T> ImportConflictSheet(
                         .padding(bottom = 16.dp),
                     horizontalArrangement = Arrangement.End,
                 ) {
-                    Button(onClick = { onApply(RuleImportStrategy.SKIP) }) {
+                    Button(onClick = { apply(RuleImportStrategy.SKIP) }, enabled = !applying) {
                         AppIconGlyph(AppIcon.DOWNLOAD, size = 18.dp)
                         Spacer(Modifier.width(4.dp))
                         Text("导入")
@@ -137,16 +161,16 @@ internal fun <T> ImportConflictSheet(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    TextButton(
-                        onClick = { onApply(RuleImportStrategy.SKIP) },
+                    Button(
+                        onClick = { apply(RuleImportStrategy.SKIP) }, enabled = !applying,
                         modifier = Modifier.weight(1f),
                     ) { Text("跳过冲突") }
                     TextButton(
-                        onClick = { onApply(RuleImportStrategy.OVERWRITE) },
+                        onClick = { apply(RuleImportStrategy.OVERWRITE) }, enabled = !applying,
                         modifier = Modifier.weight(1f),
                     ) { Text("覆盖冲突") }
-                    Button(
-                        onClick = { onApply(RuleImportStrategy.REPLACE_ALL) },
+                    TextButton(
+                        onClick = { confirmReplace = true }, enabled = !applying,
                         modifier = Modifier.weight(1f),
                     ) { Text("全部覆盖") }
                 }

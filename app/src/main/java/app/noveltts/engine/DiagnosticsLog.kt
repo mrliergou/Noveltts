@@ -100,6 +100,7 @@ object DiagnosticsLog {
 
     // ---- 持久化状态（只在 storeLock 内改写；写线程独占 FileSink）----
     private val storeLock = Any()
+    private val restoredDirectories = HashSet<String>()
     private val rateLock = Any()
 
     @Volatile
@@ -164,8 +165,7 @@ object DiagnosticsLog {
      * 删文件不在调用线程做：清空请求投递给写线程，由它关闭句柄后再删除。
      */
     fun clear() {
-        synchronized(lock) { buffer.clear() }
-        _entries.value = emptyList()
+        synchronized(lock) { buffer.clear(); _entries.value = emptyList() }
         droppedLines.set(0)
         val queue = storeQueue
         if (!storeAttached || queue == null) return
@@ -244,10 +244,13 @@ object DiagnosticsLog {
      * 级别或分类名未知时都跳过，读失败静默。未挂载持久化时该调用无副作用。
      */
     fun restoreRecent(limit: Int = 200) {
-        if (limit <= 0 || !storeAttached) return
-        val queue = storeQueue ?: return
-        // 队列满说明写线程已严重落后，这次恢复直接放弃，不阻塞调用方。
-        queue.offer(RestoreCommand(limit))
+        if (limit <= 0) return
+        synchronized(storeLock) {
+            if (!storeAttached) return
+            val directory = storeDir?.absolutePath ?: return
+            if (directory in restoredDirectories) return
+            if (storeQueue?.offer(RestoreCommand(limit)) == true) restoredDirectories.add(directory)
+        }
     }
 
     /**
@@ -305,8 +308,7 @@ object DiagnosticsLog {
     /** 重置单例状态：解绑持久化、清空缓冲并恢复默认配置。仅供单测使用。 */
     internal fun resetForTest() {
         detachStore()
-        synchronized(lock) { buffer.clear() }
-        _entries.value = emptyList()
+        synchronized(lock) { buffer.clear(); _entries.value = emptyList() }
         droppedLines.set(0)
         synchronized(rateLock) {
             rateWindowStart = 0L
@@ -316,17 +318,17 @@ object DiagnosticsLog {
         infoRatePerSecondForTest = DEFAULT_INFO_RATE_PER_SECOND
         queueCapacityForTest = DEFAULT_QUEUE_CAPACITY
         sensitiveValues.clear()
+        synchronized(storeLock) { restoredDirectories.clear() }
     }
 
     // ---- 内存缓冲 ----
 
     private fun appendToMemory(entry: LogEntry) {
-        val snapshot = synchronized(lock) {
+        synchronized(lock) {
             buffer.addLast(entry)
             while (buffer.size > MAX_ENTRIES) buffer.removeFirst()
-            buffer.toList()
+            _entries.value = buffer.toList()
         }
-        _entries.value = snapshot
     }
 
     // ---- 落盘调度（调用线程侧，全部非阻塞、不抛异常）----
@@ -521,12 +523,12 @@ object DiagnosticsLog {
             if (lines.isEmpty()) return
             val restored = lines.takeLast(limit).mapNotNull { decode(it) }
             if (restored.isEmpty()) return
-            val snapshot = synchronized(lock) {
-                restored.forEach { buffer.addLast(it) }
-                while (buffer.size > MAX_ENTRIES) buffer.removeFirst()
-                buffer.toList()
+            synchronized(lock) {
+                val merged = (restored + buffer).distinct().sortedBy { it.timeMillis }.takeLast(MAX_ENTRIES)
+                buffer.clear()
+                buffer.addAll(merged)
+                _entries.value = buffer.toList()
             }
-            _entries.value = snapshot
         } catch (_: Exception) {
             // 日志恢复不是关键路径，读失败静默。
         }

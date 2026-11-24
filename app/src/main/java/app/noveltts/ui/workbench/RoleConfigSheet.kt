@@ -1,19 +1,26 @@
 package app.noveltts.ui.workbench
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -23,6 +30,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -34,6 +42,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -46,9 +55,11 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.noveltts.domain.BuiltInRole
 import app.noveltts.domain.ReplacementScope
+import app.noveltts.domain.RoleAliases
 import app.noveltts.domain.RoleMatchMode
 import app.noveltts.domain.RoleMatchScope
 import app.noveltts.domain.RolePlaybackSettings
@@ -60,11 +71,11 @@ import app.noveltts.ui.common.AppIcon
 import app.noveltts.ui.common.AppIconGlyph
 import app.noveltts.ui.common.Badge
 import app.noveltts.ui.common.ConfirmDialog
-import app.noveltts.ui.common.FilterChipRow
 import app.noveltts.ui.common.VoiceField
 import app.noveltts.ui.rules.RuleVoicePickerSheet
 import app.noveltts.ui.theme.Ink
 import app.noveltts.ui.theme.Muted
+import java.util.UUID
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -100,36 +111,37 @@ internal sealed interface RoleSheetTarget {
 
 private val StringListSaver = listSaver<List<String>, String>(save = { it }, restore = { it })
 
-/** 与 MainViewModel.addQuickRole 相同的规则：纯文本原样保存，含正则符号才转义。 */
-private fun quickPattern(word: String): String =
-    if (word.any { it in REGEX_META }) Regex.escape(word) else word
 
-private const val REGEX_META = "\\^\$.|?*+()[]{}"
 private const val STEP = 0.05f
-private val RATE_RANGE = 0.5f..2f
+private val RATE_RANGE = 0.25f..4f
 private val VOLUME_RANGE = 0f..1f
+// 面板占屏幕高度的比例：自定义角色字段多，旁白/对话只有音色与三个倍率。
+private const val CUSTOM_SHEET_HEIGHT = 0.92f
+private const val BUILT_IN_SHEET_HEIGHT = 0.7f
 
-/**
- * 把角色规则的匹配表达式还原成普通匹配词；表达式不是纯文本或 Regex.escape（\Q…\E）形式时返回 null，
- * 这类规则只能在高级规则里改，避免简化面板把正则改坏。
- */
-internal fun literalKeyword(rule: RoleRule): String? {
-    val pattern = rule.pattern
-    if (rule.matchMode == RoleMatchMode.LITERAL_EXACT) return pattern
-    if (pattern.length >= 4 && pattern.startsWith("\\Q") && pattern.endsWith("\\E")) {
-        return pattern.substring(2, pattern.length - 2).takeIf { !it.contains("\\E") }
-    }
-    return pattern.takeIf { text -> text.none { it in REGEX_META } }
+/** Show decoded aliases without exposing their regex storage format. */
+internal fun roleMatchLabel(rule: RoleRule): String {
+    val aliases = if (rule.matchMode == RoleMatchMode.LITERAL_EXACT) listOf(rule.pattern)
+        else RoleAliases.decode(rule.pattern)
+    return aliases?.joinToString("、", prefix = "匹配") { "「$it」" } ?: "正则「${rule.pattern}」"
 }
 
 // 统一吸附到 0.05 的整数倍，避免浮点累加出现 1.1500001 这类值。
 private fun snap(value: Float): Float = (value * 20f).roundToInt() / 20f
 
+private val RoleMatchScope.legacyLabel: String
+    get() = when (this) {
+        RoleMatchScope.PREVIOUS_NARRATION -> "前一句旁白"
+        RoleMatchScope.NEXT_NARRATION -> "后一句旁白"
+        RoleMatchScope.SEGMENT -> "当前片段"
+        RoleMatchScope.AUTO -> "自动"
+    }
+
 /**
- * 角色配置底部弹窗：音色 + 语速/音调/音量倍率；自定义角色另有名称、匹配词、匹配位置、启用、
+ * 角色配置底部弹窗：音色 + 语速/音调/音量倍率；自定义角色另有名称、称呼 / 别名、启用、
  * 高级规则与删除。内容可滚动，底部固定「取消/保存」；保存失败保留输入并显示原因。
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 internal fun RoleConfigSheet(
     target: RoleSheetTarget,
@@ -155,8 +167,11 @@ internal fun RoleConfigSheet(
         }
     }
     val isCustom = builtIn == null
-    val keywordInitial = remember { existing?.let(::literalKeyword) }
-    val keywordEditable = existing == null || keywordInitial != null
+    // 称呼列表只对「称呼并列」的表达式开放；真正的正则与「文本相等」规则留给高级规则编辑。
+    val aliasesInitial = remember {
+        existing?.let { if (it.matchMode == RoleMatchMode.LITERAL_EXACT) null else RoleAliases.decode(it.pattern) }
+    }
+    val aliasEditable = existing == null || aliasesInitial != null
 
     val initialVoiceIds = remember {
         builtInInitial?.let { listOf(it.voiceId) }?.filter { it.isNotBlank() }
@@ -165,25 +180,28 @@ internal fun RoleConfigSheet(
     val initialRate = builtInInitial?.rate ?: existing?.speechRate ?: 1f
     val initialPitch = builtInInitial?.pitch ?: existing?.speechPitch ?: 1f
     val initialVolume = builtInInitial?.volume ?: existing?.speechVolume ?: 1f
-    val initialScope = existing?.matchScope ?: RoleMatchScope.PREVIOUS_NARRATION
+    val initialScope = existing?.matchScope ?: RoleMatchScope.AUTO
 
     var name by rememberSaveable { mutableStateOf(existing?.name.orEmpty()) }
-    var keyword by rememberSaveable { mutableStateOf(keywordInitial.orEmpty()) }
+    var aliases by rememberSaveable(stateSaver = StringListSaver) { mutableStateOf(aliasesInitial.orEmpty()) }
+    var aliasInput by rememberSaveable { mutableStateOf("") }
     var voiceIds by rememberSaveable(stateSaver = StringListSaver) { mutableStateOf(initialVoiceIds) }
     var rate by rememberSaveable { mutableStateOf(initialRate) }
     var pitch by rememberSaveable { mutableStateOf(initialPitch) }
     var volume by rememberSaveable { mutableStateOf(initialVolume) }
     var matchScope by rememberSaveable { mutableStateOf(initialScope) }
     var enabled by rememberSaveable { mutableStateOf(existing?.enabled ?: true) }
-    // 新增流程分两步（先建角色、再写倍率等），第一步成功后记住结果，重试时不再重复新建。
-    var createdId by rememberSaveable { mutableStateOf<String?>(null) }
+    // Stable before any write: retrying after rotation updates the same complete role.
+    val draftId by rememberSaveable { mutableStateOf(existing?.id ?: UUID.randomUUID().toString()) }
     var saving by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var managingVoices by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var confirmClose by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    val dirty = createdId == null && (name != existing?.name.orEmpty() || keyword != keywordInitial.orEmpty() ||
+    // Keep unsaved inputs when dismissing or rotating the sheet.
+    val dirty = (name != existing?.name.orEmpty() ||
+        aliases != aliasesInitial.orEmpty() || aliasInput.isNotBlank() ||
         voiceIds != initialVoiceIds || rate != initialRate || pitch != initialPitch || volume != initialVolume ||
         matchScope != initialScope || enabled != (existing?.enabled ?: true))
 
@@ -197,19 +215,13 @@ internal fun RoleConfigSheet(
 
     suspend fun saveCustom(): String? {
         val trimmedName = name.trim()
-        val word = keyword.trim().ifBlank { trimmedName }
-        val created = createdId?.let { id -> viewModel.uiState.value.roles.firstOrNull { it.id == id } }
-        val base = existing ?: created ?: runCatching {
-            withContext(Dispatchers.IO) { viewModel.addQuickRole(trimmedName, keyword.trim(), voiceIds.first()) }
-        }.getOrElse { Result.failure<RoleRule>(it) }
-            .getOrElse { return it.message ?: "添加角色失败，请重试。" }
-            .also { createdId = it.id }
+        // 输入框里还没点「添加」的称呼一并算上，避免保存时悄悄丢掉。
+        val finalAliases = (aliases + aliasInput.trim()).filter { it.isNotBlank() }.distinct()
         val pattern = when {
-            existing != null && (!keywordEditable || keyword.trim() == keywordInitial) -> existing.pattern
-            word == literalKeyword(base) -> base.pattern
-            base.matchMode == RoleMatchMode.LITERAL_EXACT -> word
-            else -> quickPattern(word)
+            existing != null && (!aliasEditable || finalAliases == aliasesInitial) -> existing.pattern
+            else -> RoleAliases.encode(finalAliases.ifEmpty { listOf(trimmedName) })
         }
+        val base = existing ?: RoleRule(id = draftId, name = trimmedName, pattern = pattern, voiceIds = voiceIds)
         val rule = base.copy(
             name = trimmedName,
             pattern = pattern,
@@ -220,14 +232,9 @@ internal fun RoleConfigSheet(
             speechPitch = pitch,
             speechVolume = volume,
         )
-        if (existing == null && rule == base) return null
-        RuleValidation.roleError(rule)?.let { return it }
-        val saved = runCatching { withContext(Dispatchers.IO) { viewModel.saveRole(rule) } }.getOrDefault(false)
-        return when {
-            saved -> null
-            existing == null -> "角色已添加，但倍率或匹配位置未能保存。可再点「保存」重试。"
-            else -> "保存失败，输入已保留。请检查规则文件或可用空间。"
-        }
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { RuleValidation.roleError(rule) }?.let { return it }
+        return viewModel.saveConfiguredRole(rule, isNew = existing == null, expected = existing).exceptionOrNull()
+            ?.let { it.message ?: "保存失败，输入已保留。请检查规则文件或可用空间。" }
     }
 
     val save: () -> Unit = {
@@ -255,21 +262,30 @@ internal fun RoleConfigSheet(
     }
 
     val requestDismiss: () -> Unit = { if (!saving) { if (dirty) confirmClose = true else onDismiss() } }
-    val sheetState = rememberModalBottomSheetState(
-        skipPartiallyExpanded = true,
-        confirmValueChange = { value ->
+    // M3 把 confirmValueChange 当作 rememberSaveable 的 key：lambda 换一次实例，SheetState 就重建一次、
+    // 面板重播入场动画。所以 lambda 只建一次，dirty 通过 rememberUpdatedState 读最新值。
+    val latestDirty by rememberUpdatedState(dirty)
+    val confirmSheetChange = remember {
+        { value: SheetValue ->
             when {
                 value != SheetValue.Hidden -> true
                 saving -> false
-                dirty -> { confirmClose = true; false }
+                latestDirty -> { confirmClose = true; false }
                 else -> true
             }
-        },
+        }
+    }
+    val sheetState = rememberModalBottomSheetState(
+        skipPartiallyExpanded = true,
+        confirmValueChange = confirmSheetChange,
     )
     ModalBottomSheet(onDismissRequest = requestDismiss, sheetState = sheetState) {
+        // 高度钉死（同 RuleEditorSheet）：面板高度不再跟着内容走，否则内容高度与面板位置互相影响，
+        // 面板会在两个高度之间来回抖。内容多少只影响中间滚动区。
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .fillMaxHeight(if (isCustom) CUSTOM_SHEET_HEIGHT else BUILT_IN_SHEET_HEIGHT)
                 .imePadding(),
         ) {
             Text(
@@ -286,7 +302,7 @@ internal fun RoleConfigSheet(
             )
             Column(
                 modifier = Modifier
-                    .weight(1f, fill = false)
+                    .weight(1f)
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -299,37 +315,92 @@ internal fun RoleConfigSheet(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
-                    if (keywordEditable) {
-                        OutlinedTextField(
-                            value = keyword,
-                            onValueChange = { keyword = it },
-                            label = { Text("匹配词") },
-                            supportingText = { Text("在匹配位置出现这个词时使用该角色；留空则使用角色名称") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+                    if (aliasEditable) {
+                        val addAlias = {
+                            val alias = aliasInput.trim()
+                            if (alias.isNotEmpty() && alias !in aliases) aliases = aliases + alias
+                            aliasInput = ""
+                        }
+                        // 已有角色至少留一个称呼；新建时可以不填，保存时用角色名称。
+                        val removable = existing == null || aliases.size > 1
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(text = "称呼 / 别名", style = MaterialTheme.typography.labelSmall, color = Muted)
+                            if (aliases.isNotEmpty()) {
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    aliases.forEach { alias ->
+                                        AliasChip(
+                                            alias = alias,
+                                            onRemove = if (removable) ({ aliases = aliases - alias }) else null,
+                                        )
+                                    }
+                                }
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                OutlinedTextField(
+                                    value = aliasInput,
+                                    onValueChange = { aliasInput = it },
+                                    label = { Text("添加称呼") },
+                                    singleLine = true,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                TextButton(onClick = addAlias, enabled = aliasInput.isNotBlank()) {
+                                    AppIconGlyph(AppIcon.ADD, size = 18.dp)
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("添加")
+                                }
+                            }
+                            Text(
+                                text = if (existing == null) {
+                                    "旁白里用哪些叫法提到这个角色，如「许山」「师尊」；不填则使用角色名称"
+                                } else {
+                                    "旁白里用哪些叫法提到这个角色，如「许山」「师尊」；至少保留一个"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Muted,
+                            )
+                        }
                     } else {
                         OutlinedTextField(
                             value = existing?.pattern.orEmpty(),
                             onValueChange = {},
                             readOnly = true,
                             label = { Text("匹配表达式（只读）") },
-                            supportingText = { Text("这条规则使用了正则表达式，请在「高级规则」中修改。") },
+                            supportingText = {
+                                Text(
+                                    if (existing.matchMode == RoleMatchMode.LITERAL_EXACT) {
+                                        "这条规则使用「文本相等」匹配，请在「高级规则」中修改。"
+                                    } else {
+                                        "这条规则使用了正则表达式，请在「高级规则」中修改。"
+                                    },
+                                )
+                            },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
                     }
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(text = "匹配位置", style = MaterialTheme.typography.labelSmall, color = Muted)
-                        FilterChipRow(
-                            options = listOf(
-                                RoleMatchScope.PREVIOUS_NARRATION to "前一句旁白",
-                                RoleMatchScope.NEXT_NARRATION to "后一句旁白",
-                                RoleMatchScope.SEGMENT to "当前片段",
-                            ),
-                            selected = matchScope,
-                            onSelect = { matchScope = it },
+                    if (matchScope == RoleMatchScope.AUTO) {
+                        Text(
+                            text = "根据引号前后的旁白自动判断是不是这个角色在说话",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Muted,
                         )
+                    } else {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "旧式匹配：" + matchScope.legacyLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Muted,
+                                modifier = Modifier.weight(1f),
+                            )
+                            // 只改面板内的状态，随「保存」一起写入。
+                            if (existing != null && RoleAliases.canSwitchToAuto(existing)) {
+                                TextButton(onClick = { matchScope = RoleMatchScope.AUTO }) { Text("改用自动") }
+                            }
+                        }
                     }
                 }
 
@@ -343,6 +414,7 @@ internal fun RoleConfigSheet(
                         onStopPreview = viewModel::stopPreview,
                         previewVoiceId = state.previewVoiceId,
                         previewStatus = state.statusMessage,
+                        previewError = state.previewError,
                     )
                 } else {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -367,6 +439,10 @@ internal fun RoleConfigSheet(
                     }
                 }
 
+                val effectiveRate = app.noveltts.engine.api.SynthesisParameters.rate(app.noveltts.engine.api.SynthesisParameters.globalRate(state.speed) * rate * (previewVoice?.defaultSpeed ?: 1f))
+                val effectivePitch = app.noveltts.engine.api.SynthesisParameters.pitch(app.noveltts.engine.api.SynthesisParameters.globalPitch(state.pitch) * pitch * (previewVoice?.defaultPitch ?: 1f))
+                val effectiveVolume = app.noveltts.engine.api.SynthesisParameters.volume(app.noveltts.engine.api.SynthesisParameters.globalVolume(state.volume) * volume * (previewVoice?.defaultVolume ?: 1f))
+                Text("当前有效值：语速 ${formatMultiplier(effectiveRate)} · 音调 ${formatMultiplier(effectivePitch)} · 音量 ${formatVolumePercent(effectiveVolume)}", style = MaterialTheme.typography.labelSmall, color = Muted)
                 MultiplierRow(
                     icon = AppIcon.SPEED,
                     label = "语速",
@@ -381,8 +457,8 @@ internal fun RoleConfigSheet(
                     icon = AppIcon.TUNE,
                     label = "音调",
                     value = pitch,
-                    range = RATE_RANGE,
-                    valueText = formatMultiplier(pitch),
+                    range = 0.25f..2f,
+                    valueText = formatMultiplier(pitch) + if (pitch > 2f) "（历史值；有效上限 2）" else "",
                     stateText = "音调 ${formatMultiplier(pitch).removeSuffix("×")} 倍",
                     stepText = "0.05",
                     onChange = { pitch = it },
@@ -422,9 +498,15 @@ internal fun RoleConfigSheet(
                         Text(if (previewing) "停止试听" else "试听")
                     }
                 }
-                if (state.previewVoiceId == null && state.statusMessage.startsWith("试听失败")) {
-                    Text(text = state.statusMessage, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-                }
+                // 固定占两行：试听失败的提示出现或消失时不挤动下面的内容。
+                Text(
+                    text = state.previewError.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    minLines = 2,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
 
                 if (isCustom) {
                     Row(
@@ -516,7 +598,7 @@ internal fun RoleConfigSheet(
         ConfirmDialog(
             title = "删除角色",
             message = "确定删除「${existing.name}」？" +
-                (if (linked > 0) "指定给该角色的 $linked 条替换规则会一并删除。" else "没有指定给该角色的替换规则。") +
+                (if (linked > 0) "保留指定给该角色的 $linked 条替换规则，目标缺失期间不生效，可重新绑定。" else "没有指定给该角色的替换规则。") +
                 "此操作不可撤销。",
             dangerous = true,
             onConfirm = {
@@ -526,7 +608,7 @@ internal fun RoleConfigSheet(
                 scope.launch {
                     try {
                         val result = runCatching {
-                            withContext(Dispatchers.IO) { viewModel.removeRoleWithReplacements(existing.id) }
+                            withContext(Dispatchers.IO) { viewModel.removeRolePreservingReplacements(existing.id) }
                         }.getOrElse { Result.failure<String>(it) }
                         result.fold(
                             onSuccess = { onDismiss() },
@@ -592,6 +674,36 @@ private fun MultiplierRow(
                 style = MaterialTheme.typography.labelSmall,
                 color = Muted,
             )
+        }
+    }
+}
+
+/** 一个称呼：文字 + 48dp 的删除触控区；[onRemove] 为 null 时不可删除（最后一个称呼）。 */
+@Composable
+private fun AliasChip(alias: String, onRemove: (() -> Unit)?) {
+    Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+        Row(modifier = Modifier.heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = alias,
+                style = MaterialTheme.typography.bodyMedium,
+                color = Ink,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .weight(1f, fill = false)
+                    .padding(start = 12.dp, end = if (onRemove == null) 12.dp else 0.dp),
+            )
+            if (onRemove != null) {
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clickable(role = Role.Button, onClick = onRemove)
+                        .semantics { contentDescription = "删除称呼「$alias」" },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    AppIconGlyph(AppIcon.CLOSE, size = 16.dp, tint = Muted)
+                }
+            }
         }
     }
 }

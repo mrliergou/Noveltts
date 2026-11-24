@@ -10,6 +10,8 @@ import app.noveltts.engine.api.SynthesisError
 import app.noveltts.engine.api.SynthesisHandle
 import app.noveltts.engine.api.SynthesisListener
 import app.noveltts.engine.api.SynthesisRequest
+import app.noveltts.engine.api.remainingTimeoutMillis
+import app.noveltts.engine.api.synthesisTimeoutMillis
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -38,6 +40,9 @@ data class PlannedSegment(
  * 缓存 PCM、不调用引擎；合成成功且本次未被取消才写回缓存。缓存只是旁路，不改变既有的
  * 超时、重试与取消逻辑。
  *
+ * 预取（synthesize 的 lookahead）：只对 spool 模式的多段任务生效，当前段回放期间提前备好
+ * 下一段，消除「播完才开始合成」造成的段间等待；默认关闭，行为与原来逐段串行一致。
+ *
  * 公开 API 保持不变（构造参数带默认值），现有调用方无需修改。
  */
 class MultiSegmentSynthesizer(
@@ -48,6 +53,7 @@ class MultiSegmentSynthesizer(
     cacheDir: File? = null,
     cacheMaxMb: Int = 100,
     cacheEnabled: Boolean = true,
+    private val timeoutMillis: (Int, Long) -> Long = ::synthesisTimeoutMillis,
     private val engineCall: (VoiceDescriptor, SynthesisRequest, SynthesisListener) -> SynthesisHandle =
         { voice, request, listener -> requireNotNull(engines).speak(voice, request, listener) },
 ) {
@@ -68,6 +74,13 @@ class MultiSegmentSynthesizer(
 
     private val executor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "multitts-plan").apply { isDaemon = true }
+    }
+
+    /** 预取线程：只在 lookahead 朗读时才创建，系统 TTS 与 HTTP 转发用不到。 */
+    private val prefetchExecutor = lazy {
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "multitts-prefetch").apply { isDaemon = true }
+        }
     }
 
     /** 运行期调整重试策略、段间静音与单段超时：设置页改完对下一次朗读立即生效，不需要重建合成器。 */
@@ -94,10 +107,8 @@ class MultiSegmentSynthesizer(
         if (changed && enabled) current.evictIfNeeded()
     }
 
-    private fun silence(): ByteArray {
-        val ms = silenceMs
-        return if (ms <= 0) ByteArray(0) else ByteArray(SAMPLE_RATE_HZ * 2 * ms / 1000)
-    }
+    init { spoolDir?.let(SpoolFiles::prepare) }
+
     private val closed = AtomicBoolean(false)
     private val jobs = java.util.concurrent.ConcurrentHashMap.newKeySet<Job>()
 
@@ -111,12 +122,15 @@ class MultiSegmentSynthesizer(
         onPlayback: SegmentPlaybackListener? = null,
         options: app.noveltts.engine.api.EngineRequestOptions? = null,
         requestId: String = java.util.UUID.randomUUID().toString().take(8),
+        /** 当前段回放期间提前备好下一段（只对 spool 模式的多段任务生效）。 */
+        lookahead: Boolean = false,
     ): SynthesisHandle {
         val capturedOptions = options ?: engines?.requestOptions()
         val job = Job(segments.toList(), rate, pitch, volume, listener, onProgress, spoolDir,
             onPlayback, retryPolicy, silenceMs, spoolTimeoutMs, capturedOptions, cache?.enabled == true,
             segments.map { it.voice }.distinctBy { it.systemName }.associate { voice -> voice.systemName to
-                if (engines != null && capturedOptions != null) engines.cacheRevision(voice, capturedOptions) else voice.contentRevision }, requestId)
+                if (engines != null && capturedOptions != null) engines.cacheRevision(voice, capturedOptions) else voice.contentRevision }, requestId,
+            lookahead && spoolDir != null && segments.size > 1)
         jobs.add(job)
         val handle = object : SynthesisHandle {
             override fun cancel() {
@@ -171,6 +185,7 @@ class MultiSegmentSynthesizer(
             job.current.getAndSet(null)?.cancel()
         }
         executor.shutdownNow()
+        if (prefetchExecutor.isInitialized()) prefetchExecutor.value.shutdownNow()
         jobs.clear()
         engines?.shutdown()
     }
@@ -199,7 +214,7 @@ class MultiSegmentSynthesizer(
             return
         }
         job.current.set(inner)
-        if (job.cancelled.get()) inner.cancel()
+        if (job.cancelled.get() || job.failed.get()) inner.cancel()
     }
 
     private inner class SegmentCallback(
@@ -207,6 +222,7 @@ class MultiSegmentSynthesizer(
         private val index: Int,
     ) : SynthesisListener {
         private val finished = AtomicBoolean(false)
+        private var receivedBytes = 0L
 
         override fun onStart(sampleRateHz: Int, audioFormat: Int, channelCount: Int) {
             if (job.cancelled.get() || finished.get()) return
@@ -226,6 +242,9 @@ class MultiSegmentSynthesizer(
 
         override fun onAudio(pcm: ByteArray, offset: Int, length: Int) {
             if (job.cancelled.get() || job.failed.get()) return
+            try { app.noveltts.engine.api.AudioBudget.check(receivedBytes, length.toLong(), app.noveltts.engine.api.AudioBudget.NORMALIZED_PCM, "单段 PCM") }
+            catch (error: app.noveltts.engine.api.ResourceLimitException) { failJob(job, index, SynthesisError.RESOURCE_LIMIT, error.message); return }
+            receivedBytes += length
             job.listener.onAudio(pcm, offset, length)
         }
 
@@ -241,6 +260,12 @@ class MultiSegmentSynthesizer(
         }
 
         override fun onError(code: Int, message: String?) {
+            if (code == SynthesisError.NO_AUDIO && receivedBytes == 0L) {
+                DiagnosticsLog.warn(Category.SPEECH, "空音频片段已跳过", message)
+                if (!job.started.get()) onStart(SAMPLE_RATE_HZ, AudioFormat.ENCODING_PCM_16BIT, 1)
+                onComplete()
+                return
+            }
             if (!finished.compareAndSet(false, true)) return
             fail(code, message)
         }
@@ -252,19 +277,68 @@ class MultiSegmentSynthesizer(
 
     // ---- spool + 重试模式 ----------------------------------------------------
 
+    /** 一段已经备好的音频：缓存文件、刚合成的 spool，或一个要等轮到它时才报告的失败。 */
+    private sealed interface Prepared {
+        fun release() {}
+
+        class Cached(val lease: CacheReadLease) : Prepared {
+            override fun release() { runCatching { lease.close() } }
+        }
+
+        class Spooled(
+            val file: File,
+            val request: SynthesisRequest,
+            val voice: VoiceDescriptor,
+            val fallbackReason: String?,
+        ) : Prepared {
+            override fun release() { file.delete() }
+        }
+
+        class Failed(val code: Int, val message: String?) : Prepared
+        data object Empty : Prepared
+
+        object Stopped : Prepared
+    }
+
+    private fun stopped(job: Job): Boolean = job.cancelled.get() || job.failed.get() || closed.get()
+
+    /**
+     * 计划线程：逐段「备好 → 回放」。
+     *
+     * 回放会阻塞到这一段真正播完（调用方的 onAudio 往往是阻塞写声卡），所以默认模式下
+     * 下一段要等上一段播完才开始合成。[Job.lookahead] 打开时，当前段一到手就让预取线程
+     * 去准备下一段：最多一段在播、一段在备，不会一口气合成整章。
+     */
     private fun spoolAt(job: Job, index: Int) {
-        for (position in index until job.segments.size) {
-            if (job.cancelled.get() || job.failed.get() || closed.get()) return
-            job.progress?.onSegmentStart(position, job.segments.size, job.segments[position].segment.text)
-            val startedAt = System.nanoTime()
-            val cached = playFromCache(job, position, job.segments[position])
-            if (!cached && !spoolOne(job, position)) return
-            DiagnosticsLog.debug(Category.SPEECH, "请求 ${job.requestId} · ${job.segments[position].segment.id} 已输出",
-                "${if (cached) "缓存" else "合成"} · 耗时 ${(System.nanoTime() - startedAt) / 1_000_000} ms")
-            if (position < job.segments.lastIndex) {
-                val silence = ByteArray(SAMPLE_RATE_HZ * 2 * job.silenceMs / 1000)
-                if (silence.isNotEmpty()) job.listener.onAudio(silence, 0, silence.size)
+        var ahead: Prefetch? = null
+        try {
+            for (position in index until job.segments.size) {
+                if (stopped(job)) return
+                val startedAt = System.nanoTime()
+                val prepared = if (job.lookahead) {
+                    val current = ahead ?: prefetch(job, position)
+                    // Keep ownership until await transfers the artifact; interruption must discard it.
+                    ahead = current
+                    val ready = current.await()
+                    ahead = null
+                    val playable = ready !is Prepared.Failed && ready != Prepared.Stopped
+                    if (playable && position < job.segments.lastIndex) ahead = prefetch(job, position + 1)
+                    ready
+                } else {
+                    prepare(job, position)
+                }
+                val waitedMs = (System.nanoTime() - startedAt) / 1_000_000
+                val cached = prepared is Prepared.Cached
+                if (!play(job, position, prepared)) return
+                DiagnosticsLog.debug(Category.SPEECH, "请求 ${job.requestId} · ${job.segments[position].segment.id} 已输出",
+                    "${if (cached) "缓存" else "合成"} · 等待 $waitedMs ms · 耗时 ${(System.nanoTime() - startedAt) / 1_000_000} ms")
+                if (prepared != Prepared.Empty && position < job.segments.lastIndex) {
+                    val silence = ByteArray(SAMPLE_RATE_HZ * 2 * job.silenceMs / 1000)
+                    if (silence.isNotEmpty()) job.listener.onAudio(silence, 0, silence.size)
+                }
             }
+        } finally {
+            ahead?.discard()
         }
         if (!job.cancelled.get() && !job.failed.get()) {
             job.completed.set(true)
@@ -273,7 +347,97 @@ class MultiSegmentSynthesizer(
         }
     }
 
-    private fun spoolOne(job: Job, index: Int): Boolean {
+    /** 预取线程上的一次「备好某一段」；结果只交给计划线程一次，没人要时自己清理。 */
+    private inner class Prefetch(private val job: Job, private val index: Int) : Runnable {
+        private val done = CountDownLatch(1)
+        private var result: Prepared? = null
+        private var discarded = false
+
+        override fun run() {
+            val prepared = try {
+                prepare(job, index)
+            } catch (error: Throwable) {
+                DiagnosticsLog.error(Category.SPEECH, "预取线程异常", error.message?.take(200))
+                Prepared.Failed(SynthesisError.SYNTHESIS_FAILED, error.message ?: "合成线程异常")
+            }
+            synchronized(this) { if (discarded) prepared.release() else result = prepared }
+            done.countDown()
+        }
+
+        fun await(): Prepared {
+            done.await()
+            return synchronized(this) { result.also { result = null } } ?: Prepared.Stopped
+        }
+
+        fun discard() {
+            synchronized(this) {
+                discarded = true
+                result?.release()
+                result = null
+            }
+            done.countDown()
+        }
+    }
+
+    private fun prefetch(job: Job, index: Int): Prefetch {
+        val task = Prefetch(job, index)
+        if (closed.get() || runCatching { prefetchExecutor.value.execute(task) }.isFailure) task.discard()
+        return task
+    }
+
+    /** 备好一段：先查缓存，没有就合成（含重试与备用音色）。不碰 listener 的音频回调。 */
+    private fun prepare(job: Job, index: Int): Prepared {
+        if (stopped(job)) return Prepared.Stopped
+        val planned = job.segments[index]
+        job.progress?.onSegmentStart(index, job.segments.size, planned.segment.text)
+        return cachedFor(job, planned) ?: synthesizeWithRetry(job, index)
+    }
+
+    /** 回放一段并释放它占用的文件；返回 false 表示任务已经结束（取消或失败），不要再继续。 */
+    private fun play(job: Job, index: Int, prepared: Prepared): Boolean {
+        try {
+            when (prepared) {
+                Prepared.Stopped -> return false
+                Prepared.Empty -> {
+                    announce(job, index, job.segments[index].voice, null)
+                    if (stopped(job)) return false
+                    job.playback?.onPlaybackComplete(index)
+                }
+                is Prepared.Failed -> {
+                    // 预取到的失败拖到这里才报：上一段此时已经完整播完，不会被截断。
+                    failJob(job, index, prepared.code, prepared.message)
+                    return false
+                }
+                is Prepared.Cached -> {
+                    announce(job, index, job.segments[index].voice, job.segments[index].segment.fallbackReason)
+                    if (!streamCached(job, index, prepared.lease)) return false
+                    if (stopped(job)) return false
+                    job.playback?.onPlaybackComplete(index)
+                }
+                is Prepared.Spooled -> {
+                    announce(job, index, prepared.voice, prepared.fallbackReason)
+                    streamSpool(job, prepared.file)
+                    if (stopped(job)) return false
+                    job.playback?.onPlaybackComplete(index)
+                    // 默认模式沿用旧时机：播放结束且未取消才写缓存。预取模式在合成完就写过了。
+                    if (!job.lookahead) storeInCache(job, prepared.request, prepared.file)
+                }
+            }
+        } finally {
+            prepared.release()
+        }
+        return !stopped(job)
+    }
+
+    private fun announce(job: Job, index: Int, voice: VoiceDescriptor, fallbackReason: String?) {
+        if (job.started.compareAndSet(false, true)) {
+            job.listener.onStart(SAMPLE_RATE_HZ, AudioFormat.ENCODING_PCM_16BIT, 1)
+        }
+        job.playback?.onVoiceSelected(index, voice, fallbackReason)
+        job.playback?.onPlaybackStart(index)
+    }
+
+    private fun synthesizeWithRetry(job: Job, index: Int): Prepared {
         val planned = job.segments[index]
 
         DiagnosticsLog.info(Category.SPEECH, "请求 ${job.requestId} · ${planned.segment.id} 合成 · ${planned.voice.displayName}", DiagnosticsLog.textHint(planned.segment.text))
@@ -285,37 +449,35 @@ class MultiSegmentSynthesizer(
         for ((candidateIndex, voice) in candidates.withIndex()) {
             var attempt = 1
             while (true) {
-                if (job.cancelled.get() || job.failed.get() || closed.get()) return false
-                val request = buildRequest(job, planned, voice)
+                if (stopped(job)) return Prepared.Stopped
+                val request = buildRequest(job, planned, voice).copy(prefetch = job.lookahead && index > 0)
                 val attemptStarted = System.nanoTime()
                 val outcome = synthesizeToSpool(job, request, voice)
                 DiagnosticsLog.debug(Category.SPEECH, "请求 ${job.requestId} · ${planned.segment.id} 引擎尝试 $attempt",
                     "${voice.engineCode} · ${(System.nanoTime() - attemptStarted) / 1_000_000} ms · ${outcome.bytes} 字节 · code ${outcome.code}")
                 if (outcome.ok) {
-                    if (job.started.compareAndSet(false, true)) {
-                        job.listener.onStart(SAMPLE_RATE_HZ, AudioFormat.ENCODING_PCM_16BIT, 1)
-                    }
-                    try {
-                        job.playback?.onVoiceSelected(index, voice, if (voice.systemName == planned.voice.systemName)
-                            planned.segment.fallbackReason else "主音色合成失败，使用备用音色 ${voice.displayName}")
-                        job.playback?.onPlaybackStart(index)
-                        streamSpool(job, outcome.file)
-                        job.playback?.onPlaybackComplete(index)
-                        // 播放结束且未取消才写缓存；写失败只是少一次命中，不影响本次朗读。
-                        storeInCache(job, request, outcome.file)
-                    } finally {
-                        outcome.file.delete()
-                    }
-                    if (job.cancelled.get() || job.failed.get() || closed.get()) return false
+                    // 预取模式下合成完就写缓存：暂停、跳段后回来能直接命中，也不占用段间的时间。
+                    // 写失败只是少一次命中，不影响本次朗读。
+                    if (job.lookahead) storeInCache(job, request, outcome.file)
                     DiagnosticsLog.info(
                         Category.SPEECH,
                         "请求 ${job.requestId} · ${planned.segment.id} 就绪（候选 ${candidateIndex + 1}/${candidates.size}，第 ${attempt} 次尝试，${outcome.bytes} 字节）",
                     )
-                    return true
+                    return Prepared.Spooled(
+                        outcome.file,
+                        request,
+                        voice,
+                        if (voice.systemName == planned.voice.systemName) planned.segment.fallbackReason
+                        else "主音色合成失败，使用备用音色 ${voice.displayName}",
+                    )
                 }
 
                 outcome.file.delete()
-                if (job.cancelled.get() || closed.get()) return false
+                if (job.cancelled.get() || closed.get()) return Prepared.Stopped
+                if (outcome.code == SynthesisError.NO_AUDIO) {
+                    DiagnosticsLog.warn(Category.SPEECH, "请求 ${job.requestId} · ${planned.segment.id} 空音频片段已跳过")
+                    return Prepared.Empty
+                }
                 lastCode = outcome.code
                 lastMessage = outcome.message
                 DiagnosticsLog.warn(
@@ -323,23 +485,30 @@ class MultiSegmentSynthesizer(
                     "请求 ${job.requestId} · ${planned.segment.id} 音色失败 [${outcome.code}] · ${voice.displayName}",
                     outcome.message?.take(200),
                 )
-                if (isFatal(outcome.code)) {
-                    failJob(job, index, lastCode, lastMessage)
-                    return false
-                }
+                // 失败只返回、不在这里 failJob：预取时上一段可能还在播，由 play() 在轮到本段时再报。
+                if (isFatal(outcome.code)) return Prepared.Failed(lastCode, lastMessage)
                 if (job.retryPolicy.shouldRetry(outcome.code, attempt)) {
+                    if (!pauseBeforeRetry(job, job.retryPolicy.retryDelayMillis(attempt))) return Prepared.Stopped
                     attempt += 1
                     continue
                 }
-                if (!job.retryPolicy.allowsStandby(outcome.code)) {
-                    failJob(job, index, lastCode, lastMessage)
-                    return false
-                }
+                if (!job.retryPolicy.allowsStandby(outcome.code)) return Prepared.Failed(lastCode, lastMessage)
+                if (candidateIndex < candidates.lastIndex &&
+                    !pauseBeforeRetry(job, job.retryPolicy.retryDelayMillis(attempt))) return Prepared.Stopped
                 break // 同音色不再重试，换备用音色
             }
         }
 
-        failJob(job, index, lastCode, lastMessage)
+        return Prepared.Failed(lastCode, lastMessage)
+    }
+
+    private fun pauseBeforeRetry(job: Job, millis: Long): Boolean {
+        val deadline = System.nanoTime() + millis * 1_000_000L
+        while (!stopped(job)) {
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0) return true
+            Thread.sleep(minOf(25L, (remaining / 1_000_000L).coerceAtLeast(1L)))
+        }
         return false
     }
 
@@ -372,28 +541,30 @@ class MultiSegmentSynthesizer(
         job.attempt.set(attempt)
         val handle = try {
             engineCall(voice, request, attempt)
+        } catch (error: OutOfMemoryError) {
+            attempt.onError(SynthesisError.RESOURCE_LIMIT, "引擎音频内存不足")
+            job.attempt.compareAndSet(attempt, null)
+            return attempt.await(0)
         } catch (error: Exception) {
             DiagnosticsLog.error(Category.SPEECH, "调用引擎失败：${voice.engineCode}", error.message?.take(200))
+            attempt.onError(SynthesisError.SYNTHESIS_FAILED, error.message ?: "引擎调用失败")
             job.attempt.compareAndSet(attempt, null)
-            return SpoolOutcome(false, file, SynthesisError.SYNTHESIS_FAILED, error.message ?: "引擎调用失败", 0L)
+            return attempt.await(0)
         }
         job.current.set(handle)
-        if (job.cancelled.get()) {
+        if (job.cancelled.get() || attempt.limitReached()) {
             handle.cancel()
             attempt.abort()
         }
-        val outcome = attempt.await((20_000L + request.text.length * 150L).coerceIn(job.timeoutMs, MAX_SPOOL_TIMEOUT_MS))
+        val outcome = attempt.await(request.remainingTimeoutMillis() ?: timeoutMillis(request.text.length, job.timeoutMs))
+        // An engine may complete synchronously after using up the deadline before await begins.
+        val expired = request.remainingTimeoutMillis() == 0L &&
+            (outcome.ok || outcome.code == SynthesisError.NO_AUDIO)
+        if (expired) runCatching { handle.cancel() }
         job.current.compareAndSet(handle, null)
         job.attempt.compareAndSet(attempt, null)
-        return outcome
+        return if (expired) SpoolOutcome(false, file, SynthesisError.SYNTHESIS_FAILED, "合成超时", outcome.bytes) else outcome
     }
-
-    /**
-     * 超时按文本长度放宽：500 字中文约 100 秒音频，固定 60 秒会让长段必然失败。
-     * 下限是用户配置的请求超时，上限 300 秒兜底。
-     */
-    private fun timeoutFor(text: String): Long =
-        (20_000L + text.length * 150L).coerceIn(spoolTimeoutMs, MAX_SPOOL_TIMEOUT_MS)
 
     private fun streamSpool(job: Job, file: File) {
         FileInputStream(file).use { input ->
@@ -407,52 +578,39 @@ class MultiSegmentSynthesizer(
     }
 
     /**
-     * 缓存命中时把缓存文件当作本段的 spool 音频回放，并推进到下一段。
-     * 返回 true 表示本段已处理；false 表示没命中（或缓存文件不可读且一个字节都没写），
-     * 调用方照常走合成/重试路径。
+     * 查缓存：命中就拿住读 lease（回放结束才释放，期间不会被淘汰）。
+     * 文件被系统清理或截断时删掉这条缓存并返回 null，调用方照常走合成/重试路径。
      */
-    private fun playFromCache(job: Job, index: Int, planned: PlannedSegment): Boolean {
-        val cache = this.cache ?: return false
-        if (!job.cacheEnabled) return false
+    private fun cachedFor(job: Job, planned: PlannedSegment): Prepared.Cached? {
+        val cache = this.cache ?: return null
+        if (!job.cacheEnabled) return null
         val key = cacheKeyOf(buildRequest(job, planned, planned.voice), job)
-        val lease = cache.acquireRead(key) ?: return false
-        DiagnosticsLog.debug(Category.SPEECH, "请求 ${job.requestId} · ${planned.segment.id} 缓存命中")
-        val streamed = try { streamCached(job, index, lease) } finally { lease.close() }
-        if (!streamed) {
-            // 文件被系统清理/截断：删掉这条缓存，回到正常合成路径重新生成。
+        val lease = cache.acquireRead(key) ?: return null
+        val length = lease.file.length()
+        if (!lease.file.isFile || length <= 0L || length > app.noveltts.engine.api.AudioBudget.SPOOL || length % BYTES_PER_FRAME != 0L) {
+            runCatching { lease.close() }
             cache.invalidate(key)
-            return false
+            return null
         }
-        if (job.cancelled.get() || job.failed.get() || closed.get()) return true
-        job.playback?.onPlaybackComplete(index)
-        return true
+        DiagnosticsLog.debug(Category.SPEECH, "请求 ${job.requestId} · ${planned.segment.id} 缓存命中")
+        return Prepared.Cached(lease)
     }
 
-    /** 回放缓存文件；false 表示还没往 listener 写过任何字节，可以安全回退到合成。 */
+    /** 回放缓存文件；读取出错时按失败结束任务并返回 false。 */
     private fun streamCached(job: Job, index: Int, lease: CacheReadLease): Boolean {
-        val file = lease.file
-        val length = file.length()
-        if (!file.isFile || length <= 0L || length % BYTES_PER_FRAME != 0L) return false
-        val input = lease.input
-        input.use { stream ->
-            if (job.started.compareAndSet(false, true)) {
-                job.listener.onStart(SAMPLE_RATE_HZ, AudioFormat.ENCODING_PCM_16BIT, 1)
+        val stream = lease.input
+        val buffer = ByteArray(SPOOL_CHUNK_BYTES)
+        while (!stopped(job)) {
+            val read = try {
+                stream.read(buffer)
+            } catch (error: Exception) {
+                // 缓存被系统清理或截断：按失败结束本段，绝不让异常冲出计划线程。
+                DiagnosticsLog.error(Category.SPEECH, "读取缓存音频失败", error.message?.take(200))
+                failJob(job, index, SynthesisError.SYNTHESIS_FAILED, error.message ?: "缓存音频读取失败")
+                return false
             }
-            job.playback?.onVoiceSelected(index, job.segments[index].voice, job.segments[index].segment.fallbackReason)
-            job.playback?.onPlaybackStart(index)
-            val buffer = ByteArray(SPOOL_CHUNK_BYTES)
-            while (!job.cancelled.get() && !job.failed.get() && !closed.get()) {
-                val read = try {
-                    stream.read(buffer)
-                } catch (error: Exception) {
-                    // 缓存被系统清理或截断：按失败结束本段，绝不让异常冲出计划线程。
-                    DiagnosticsLog.error(Category.SPEECH, "读取缓存音频失败", error.message?.take(200))
-                    failJob(job, index, SynthesisError.SYNTHESIS_FAILED, error.message ?: "缓存音频读取失败")
-                    return true
-                }
-                if (read <= 0) break
-                job.listener.onAudio(buffer, 0, read)
-            }
+            if (read <= 0) break
+            job.listener.onAudio(buffer, 0, read)
         }
         return true
     }
@@ -499,6 +657,7 @@ class MultiSegmentSynthesizer(
         private var outcome: SpoolOutcome? = null
 
         /** 取消时由 cancel() 调用：立即结束等待，绝不重试。 */
+        @Synchronized
         fun abort() {
             if (!finished.compareAndSet(false, true)) {
                 done.countDown()
@@ -527,14 +686,16 @@ class MultiSegmentSynthesizer(
                     )
                 }
             } catch (interrupted: InterruptedException) {
-                Thread.currentThread().interrupt()
                 abort()
+                job.current.getAndSet(null)?.cancel()
+                Thread.currentThread().interrupt()
             }
             return outcome ?: SpoolOutcome(false, file, SynthesisError.SYNTHESIS_FAILED, "合成未完成", bytes)
         }
 
+        @Synchronized
         override fun onStart(sampleRateHz: Int, audioFormat: Int, channelCount: Int) {
-            if (finished.get() || job.cancelled.get() || closed.get()) return
+            if (finished.get() || job.cancelled.get() || closed.get() || stream != null) return
             if (sampleRateHz != SAMPLE_RATE_HZ || audioFormat != AudioFormat.ENCODING_PCM_16BIT || channelCount != 1) {
                 finish(
                     SpoolOutcome(
@@ -555,30 +716,43 @@ class MultiSegmentSynthesizer(
             stream = opened
         }
 
+        @Synchronized
         override fun onAudio(pcm: ByteArray, offset: Int, length: Int) {
             if (finished.get() || length <= 0) return
+            try {
+                app.noveltts.engine.api.AudioBudget.check(bytes, length.toLong(), app.noveltts.engine.api.AudioBudget.SPOOL, "单段音频")
+            } catch (error: app.noveltts.engine.api.ResourceLimitException) {
+                finish(SpoolOutcome(false, file, SynthesisError.RESOURCE_LIMIT, error.message, bytes))
+                job.current.getAndSet(null)?.cancel()
+                return
+            }
             val output = stream ?: return
             runCatching { output.write(pcm, offset, length) }
                 .onSuccess { bytes += length }
                 .onFailure { finish(SpoolOutcome(false, file, SynthesisError.SYNTHESIS_FAILED, it.message ?: "写入 spool 失败", bytes)) }
         }
 
+        @Synchronized
         override fun onComplete() {
             if (job.cancelled.get() || closed.get()) {
                 finish(SpoolOutcome(false, file, SynthesisError.CANCELLED, "已取消", bytes))
                 return
             }
             if (bytes <= 0L) {
-                finish(SpoolOutcome(false, file, SynthesisError.SYNTHESIS_FAILED, "引擎没有返回音频", 0L))
+                finish(SpoolOutcome(false, file, SynthesisError.NO_AUDIO, "引擎没有返回音频", 0L))
                 return
             }
             finish(SpoolOutcome(true, file, 0, null, bytes))
         }
 
+        @Synchronized
         override fun onError(code: Int, message: String?) {
             finish(SpoolOutcome(false, file, code, message, bytes))
         }
 
+        fun limitReached(): Boolean = outcome?.code == SynthesisError.RESOURCE_LIMIT
+
+        @Synchronized
         private fun finish(result: SpoolOutcome) {
             if (!finished.compareAndSet(false, true)) return
             closeQuietly()
@@ -604,18 +778,21 @@ class MultiSegmentSynthesizer(
         SynthesisRequest(
             text = planned.segment.text,
             voiceId = voice.systemName,
-            rate = (job.rate * voice.defaultSpeed * planned.segment.speechRate).coerceIn(0.25f, 4f),
-            pitch = (job.pitch * voice.defaultPitch * planned.segment.speechPitch).coerceIn(0.25f, 4f),
-            volume = (job.volume * voice.defaultVolume * planned.segment.speechVolume).coerceIn(0f, 1f),
+            rate = app.noveltts.engine.api.SynthesisParameters.rate(job.rate * voice.defaultSpeed * planned.segment.speechRate),
+            pitch = app.noveltts.engine.api.SynthesisParameters.pitch(job.pitch * voice.defaultPitch * planned.segment.speechPitch),
+            volume = app.noveltts.engine.api.SynthesisParameters.volume(job.volume * voice.defaultVolume * planned.segment.speechVolume),
             options = job.options,
             requestId = job.requestId,
             segmentId = planned.segment.id,
+            deadlineNanos = System.nanoTime() + timeoutMillis(planned.segment.text.length, job.timeoutMs) * 1_000_000L,
         )
 
     /** 统一的终止路径：取消或已失败时不再回调，保证 listener 只收到一次 onError。 */
     private fun failJob(job: Job, index: Int, code: Int, message: String?) {
         if (job.cancelled.get() || !job.failed.compareAndSet(false, true)) return
         DiagnosticsLog.error(Category.SPEECH, "请求 ${job.requestId} · ${job.segments.getOrNull(index)?.segment?.id} 合成失败 [${code}]", message?.take(200))
+        // 预取线程可能正等着下一段的引擎结果：先 abort 再 cancel，顺序同超时路径。
+        job.attempt.getAndSet(null)?.abort()
         job.current.getAndSet(null)?.cancel()
         job.listener.onError(code, message)
     }
@@ -636,6 +813,8 @@ class MultiSegmentSynthesizer(
         val cacheEnabled: Boolean,
         val revisions: Map<String, String>,
         val requestId: String,
+        /** 当前段回放期间提前准备下一段。 */
+        val lookahead: Boolean,
     ) {
         private val createdAt = System.nanoTime()
         fun elapsedMs(): Long = (System.nanoTime() - createdAt) / 1_000_000
@@ -655,7 +834,6 @@ class MultiSegmentSynthesizer(
         const val DEFAULT_SILENCE_MS = 80
         const val MAX_SILENCE_MS = 2_000
         const val DEFAULT_REQUEST_TIMEOUT_SEC = 60
-        const val MAX_SPOOL_TIMEOUT_MS = 300_000L
         const val BYTES_PER_FRAME = 2L
         const val MB = 1024L * 1024L
     }

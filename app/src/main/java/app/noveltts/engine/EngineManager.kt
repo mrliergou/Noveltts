@@ -91,7 +91,16 @@ class EngineManager(
                 listener.onError(SynthesisError.NOT_READY, "引擎未就绪：${descriptor.engineCode}")
                 NoopHandle
             } else {
-                adapter.synthesize(descriptor, request, listener)
+                val effective = request.copy(rate = app.noveltts.engine.api.SynthesisParameters.rate(request.rate),
+                    pitch = app.noveltts.engine.api.SynthesisParameters.pitch(request.pitch),
+                    volume = app.noveltts.engine.api.SynthesisParameters.volume(request.volume))
+                val observed = object : SynthesisListener {
+                    override fun onStart(sampleRateHz: Int, audioFormat: Int, channelCount: Int) = listener.onStart(sampleRateHz, audioFormat, channelCount)
+                    override fun onAudio(pcm: ByteArray, offset: Int, length: Int) = listener.onAudio(pcm, offset, length)
+                    override fun onComplete() { EngineHealth.record(descriptor.engineCode, 0); listener.onComplete() }
+                    override fun onError(code: Int, message: String?) { EngineHealth.record(descriptor.engineCode, code); listener.onError(code, message) }
+                }
+                BackendScheduler.shared.submit(this, effective, observed) { scheduled -> adapter.synthesize(descriptor, effective, scheduled) }
             }
         } catch (error: Exception) {
             // 关闭竞态下适配器可能抛 RejectedExecutionException 之类的运行时异常，
@@ -103,6 +112,7 @@ class EngineManager(
     }
 
     fun shutdown() {
+        BackendScheduler.shared.cancelOwner(this)
         val all = synchronized(lazyAdapters) {
             closed = true
             val lazy = lazyAdapters.values.toList()

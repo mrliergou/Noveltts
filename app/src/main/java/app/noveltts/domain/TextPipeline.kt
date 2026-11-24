@@ -3,8 +3,8 @@ package app.noveltts.domain
 /**
  * 小说文本 -> 有序合成片段。
  *
- * 顺序固定为：替换规则 -> 引号对话识别 -> 标点分句 -> 显式角色匹配 ->
- * 纯标点过滤。未匹配到的对话只使用默认对话音色，不做自动角色分配。
+ * 顺序固定为：替换规则 -> 按段落识别引号对话 -> 说话人归属 -> 标点分句 -> 角色规则匹配 ->
+ * 纯标点过滤。说话人只在用户建好的角色里判定，判定不了的对话使用默认对话音色。
  */
 object TextPipeline {
     /** 单段最大字符数的默认值；[build] 的 `maxSegmentChars` 可覆盖。 */
@@ -30,6 +30,7 @@ object TextPipeline {
         roleGroups: List<RuleGroup> = emptyList(),
         replacementGroups: List<RuleGroup> = emptyList(),
         maxSegmentChars: Int = DEFAULT_MAX_SEGMENT_CHARS,
+        unattributedPolicy: UnattributedPolicy = UnattributedPolicy.DEFAULT,
     ): TextPipelineResult = build(
         text = text,
         builtInRoles = BuiltInRoleSettings().withVoices(narratorVoiceId, dialogueVoiceId),
@@ -39,6 +40,7 @@ object TextPipeline {
         roleGroups = roleGroups,
         replacementGroups = replacementGroups,
         maxSegmentChars = maxSegmentChars,
+        unattributedPolicy = unattributedPolicy,
     )
 
     fun build(
@@ -50,7 +52,20 @@ object TextPipeline {
         roleGroups: List<RuleGroup> = emptyList(),
         replacementGroups: List<RuleGroup> = emptyList(),
         maxSegmentChars: Int = DEFAULT_MAX_SEGMENT_CHARS,
+        unattributedPolicy: UnattributedPolicy = UnattributedPolicy.DEFAULT,
     ): TextPipelineResult {
+        if (text.length > 1_000_000) throw PipelineLimitException("输入文本超过上限（1000000 字符）")
+        return requireNotNull(RuleRuntime.execute(RuleWork(text, builtInRoles, roles.map { it.copy(voiceIds = it.voiceIds.toList()) }, replacements.toList(),
+            filterPurePunctuation, roleGroups.toList(), replacementGroups.toList(), maxSegmentChars, unattributedPolicy)).pipeline)
+    }
+
+    internal fun buildLocal(
+        text: String, builtInRoles: BuiltInRoleSettings, roles: List<RoleRule>, replacements: List<ReplacementRule>,
+        filterPurePunctuation: Boolean, roleGroups: List<RuleGroup>, replacementGroups: List<RuleGroup>,
+        maxSegmentChars: Int, unattributedPolicy: UnattributedPolicy,
+    ): TextPipelineResult {
+        if (text.length > 1_000_000) throw PipelineLimitException("输入文本超过上限（1000000 字符）")
+        val budget = ReplacementBudget()
         val segmentLimit = maxSegmentChars.coerceIn(MIN_SEGMENT_CHARS, MAX_SEGMENT_LIMIT)
         val normalized = normalize(text)
         if (normalized.isBlank()) {
@@ -60,48 +75,62 @@ object TextPipeline {
         val issues = mutableListOf<PipelineIssue>()
         val traces = mutableListOf<ReplacementTrace>()
         val activeReplacements = activeReplacements(replacements, replacementGroups)
+        activeReplacements.filter { it.scope == ReplacementScope.ROLE && roles.none { role -> role.id == it.targetRoleId } }
+            .forEach { issues += PipelineIssue("replacement", "「${it.name}」目标角色缺失，已跳过；原引用已保留", it.id) }
         val transformed = applyReplacements(
             normalized,
             activeReplacements.filter { it.scope == ReplacementScope.ALL },
             issues,
             traces,
+            budget,
         )
-        val roleMatcher = RoleMatcher(activeRoles(roles, roleGroups), issues)
+        val (autoRoles, scopedRoles) = activeRoles(roles, roleGroups).partition { it.matchScope == RoleMatchScope.AUTO }
+        val scopedMatcher = RoleMatcher(scopedRoles, issues)
+        val autoMatcher = RoleMatcher(autoRoles, issues)
+        val attributor = SpeakerAttributor(autoMatcher.regexes, unattributedPolicy)
         val segments = mutableListOf<PipelineSegment>()
 
-        val spans = quotedSpans(transformed)
-        spans.forEachIndexed { spanIndex, span ->
-            val scoped = applyReplacements(span.text, activeReplacements.filter {
-                it.scope == if (span.isDialogue) ReplacementScope.DIALOGUE else ReplacementScope.NARRATION
-            }, issues, traces)
-            val previous = spans.take(spanIndex).lastOrNull { !it.isDialogue }?.text.orEmpty()
-            val next = spans.drop(spanIndex + 1).firstOrNull { !it.isDialogue }?.text.orEmpty()
+        val paragraphs = SpeakerAttributor.paragraphs(transformed, quotePairs)
+        val units = paragraphs.flatten()
+        val decisions = paragraphs.flatMap(attributor::paragraph)
+        val context = NarrationContext(units)
+        units.forEachIndexed { unitIndex, unit ->
+            val scoped = applyReplacements(unit.text, activeReplacements.filter {
+                it.scope == if (unit.isDialogue) ReplacementScope.DIALOGUE else ReplacementScope.NARRATION
+            }, issues, traces, budget)
+            val decision = decisions[unitIndex]
+            val autoMatch = decision?.roleIndex?.takeIf { it >= 0 }?.let(autoMatcher::pick)
+            val previous = context.previous(unitIndex)
+            val next = context.next(unitIndex)
             sentenceChunks(scoped, segmentLimit).forEachIndexed chunkLoop@ { chunkIndex, chunk ->
                 var cleaned = cleanupChunk(chunk)
                 if (cleaned.isEmpty()) return@chunkLoop
                 if (filterPurePunctuation && cleaned.none { it.isLetterOrDigit() }) return@chunkLoop
 
-                val match = roleMatcher.match(cleaned, span.isDialogue, previous, next)
-                val builtIn = if (span.isDialogue) builtInRoles.dialogue else builtInRoles.narrator
+                val scopedMatch = if (autoMatch == null) scopedMatcher.match(cleaned, unit.isDialogue, previous, next) else null
+                val match = autoMatch ?: scopedMatch
+                val attribution = if (scopedMatch != null) Attribution.LEGACY_RULE else decision?.attribution
+                val builtIn = if (unit.isDialogue) builtInRoles.dialogue else builtInRoles.narrator
                 val voiceId = match?.voiceId ?: builtIn.voiceId.takeIf { it.isNotBlank() }
                 val role = match?.rule
                 cleaned = applyReplacements(cleaned, activeReplacements.filter {
                     it.scope == ReplacementScope.ROLE && role != null && it.targetRoleId == role.id
-                }, issues, traces)
+                }, issues, traces, budget)
                 val finalChunks = sentenceChunks(cleaned, segmentLimit).map(::cleanupChunk).filter {
                     it.isNotBlank() && (!filterPurePunctuation || it.any(Char::isLetterOrDigit))
                 }
                 finalChunks.forEachIndexed { childIndex, finalText ->
                     segments += PipelineSegment(
                     text = finalText,
-                    isDialogue = span.isDialogue,
+                    isDialogue = unit.isDialogue,
                     voiceId = voiceId,
                     roleName = role?.name,
-                    id = "segment:$spanIndex:$chunkIndex" + if (finalChunks.size > 1) ":$childIndex" else "",
+                    id = "segment:$unitIndex:$chunkIndex" + if (finalChunks.size > 1) ":$childIndex" else "",
                     roleId = role?.id,
                     speechRate = role?.speechRate ?: builtIn.rate,
                     speechPitch = role?.speechPitch ?: builtIn.pitch,
                     speechVolume = role?.speechVolume ?: builtIn.volume,
+                    attribution = attribution,
                 )
                 }
             }
@@ -130,77 +159,53 @@ object TextPipeline {
         replacements: List<ReplacementRule>,
         issues: MutableList<PipelineIssue>,
         traces: MutableList<ReplacementTrace>,
+        budget: ReplacementBudget,
     ): String {
         var result = text
         replacements.forEach { rule ->
             if (rule.find.isEmpty()) return@forEach
-            val validation = RuleValidation.replacementError(rule)
+            val validation = budget.validationError(rule)
             if (validation != null) {
                 if (issues.none { it.ruleId == rule.id }) issues += PipelineIssue("replacement", "「${rule.name}」$validation", rule.id)
                 return@forEach
             }
             val before = result
-            if (!rule.isRegex) {
-                result = result.replace(rule.find, rule.replaceWith)
-                if (before != result) traces += ReplacementTrace(rule.id, rule.name, before.take(200), result.take(200))
-                return@forEach
-            }
-            val regex = runCatching { Regex(rule.find) }.getOrElse { error ->
-                issues += PipelineIssue(
-                    field = "replacement",
-                    message = "「${rule.name}」正则无效：${error.message}",
-                    ruleId = rule.id,
-                )
-                return@forEach
-            }
-            result = runCatching { regex.replace(result, rule.replaceWith) }.getOrElse { error ->
-                if (issues.none { it.ruleId == rule.id }) issues += PipelineIssue("replacement", "「${rule.name}」替换失败：${error.message}", rule.id)
+            result = try { budget.replace(before, rule) }
+            catch (error: PipelineLimitException) { throw error }
+            catch (error: Exception) {
+                if (issues.none { it.ruleId == rule.id }) issues += PipelineIssue("replacement", "「${rule.name}」替换失败", rule.id)
                 before
             }
             if (before != result) traces += ReplacementTrace(rule.id, rule.name, before.take(200), result.take(200))
         }
         return result
     }
+    /**
+     * 非 AUTO 范围的角色规则使用的前后文：相邻旁白（含跨段）并成一块，
+     * 「前一句旁白」「后一句旁白」分别取最近的一整块，与引入 AUTO 之前的行为一致。
+     */
+    private class NarrationContext(units: List<SpeechUnit>) {
+        private val blockOf = IntArray(units.size)
+        private val blocks = mutableListOf<String?>()
 
-    private fun quotedSpans(text: String): List<RawSpan> {
-        val spans = mutableListOf<RawSpan>()
-        var cursor = 0
-        var dialogueStart = -1
-        var closingQuote: Char? = null
-        var index = 0
-        while (index < text.length) {
-            val char = text[index]
-            if (dialogueStart < 0) {
-                val close = quotePairs[char]
-                if (close != null) {
-                    if (index > cursor) {
-                        spans += RawSpan(text.substring(cursor, index), isDialogue = false)
-                    }
-                    dialogueStart = index + 1
-                    closingQuote = close
+        init {
+            val builders = mutableListOf<StringBuilder?>()
+            units.forEachIndexed { index, unit ->
+                if (index > 0 && !unit.isDialogue && !units[index - 1].isDialogue) {
+                    builders.last()!!.append('\n').append(unit.text)
+                } else {
+                    builders += if (unit.isDialogue) null else StringBuilder(unit.text)
                 }
-                index++
-                continue
+                blockOf[index] = builders.lastIndex
             }
+            blocks.addAll(builders.map { it?.toString() })
+        }
 
-            if (char == closingQuote) {
-                if (index > dialogueStart) {
-                    spans += RawSpan(text.substring(dialogueStart, index), isDialogue = true)
-                }
-                cursor = index + 1
-                dialogueStart = -1
-                closingQuote = null
-            }
-            index++
-        }
-        if (dialogueStart >= 0) {
-            spans += RawSpan(text.substring(dialogueStart), isDialogue = true)
-            cursor = text.length
-        }
-        if (cursor < text.length) {
-            spans += RawSpan(text.substring(cursor), isDialogue = false)
-        }
-        return spans.filter { it.text.isNotBlank() }
+        fun previous(unitIndex: Int): String =
+            (blockOf[unitIndex] - 1 downTo 0).firstNotNullOfOrNull { blocks[it] }.orEmpty()
+
+        fun next(unitIndex: Int): String =
+            (blockOf[unitIndex] + 1 until blocks.size).firstNotNullOfOrNull { blocks[it] }.orEmpty()
     }
 
     private fun sentenceChunks(text: String, limit: Int): List<String> {
@@ -238,23 +243,24 @@ object TextPipeline {
     }
 
     private fun splitLongChunk(chunk: String, maxChars: Int): List<String> {
-        var remaining = chunk
+        var start = 0
         val result = mutableListOf<String>()
-        while (remaining.length > maxChars) {
-            val limit = maxChars
+        while (chunk.length - start > maxChars) {
+            val limit = start + maxChars
             var split = -1
-            for (index in limit - 1 downTo limit / 2) {
-                if (remaining[index] in boundaries || remaining[index] in softBoundaries) {
+            for (index in limit - 1 downTo start + maxChars / 2) {
+                if (chunk[index] in boundaries || chunk[index] in softBoundaries) {
                     split = index + 1
                     break
                 }
             }
-            if (split <= 0) split = limit
-            if (split < remaining.length && remaining[split - 1].isHighSurrogate() && remaining[split].isLowSurrogate()) split--
-            result += remaining.substring(0, split).trim()
-            remaining = remaining.substring(split).trimStart()
+            if (split <= start) split = limit
+            if (split < chunk.length && chunk[split - 1].isHighSurrogate() && chunk[split].isLowSurrogate()) split--
+            result += chunk.substring(start, split).trim()
+            start = split
+            while (start < chunk.length && chunk[start].isWhitespace()) start++
         }
-        if (remaining.isNotEmpty()) result += remaining
+        if (start < chunk.length) result += chunk.substring(start)
         return result.filter { it.isNotBlank() }
     }
 
@@ -297,8 +303,10 @@ object TextPipeline {
         private val rules: List<RoleRule>,
         issues: MutableList<PipelineIssue>,
     ) {
-        private val regexes: List<Regex?> = rules.map { compile(it, issues) }
+        val regexes: List<Regex?> = rules.map { compile(it, issues) }
         private val hits = IntArray(rules.size)
+
+        fun pick(index: Int): RoleMatch = RoleMatch(rules[index], pickVoice(index))
 
         fun match(text: String, isDialogue: Boolean, previous: String, next: String): RoleMatch? {
             val index = rules.indices.firstOrNull { i ->
@@ -306,10 +314,11 @@ object TextPipeline {
                     RoleMatchScope.SEGMENT -> text
                     RoleMatchScope.PREVIOUS_NARRATION -> previous.takeLast(rules[i].contextChars.coerceIn(1, 2000))
                     RoleMatchScope.NEXT_NARRATION -> next.take(rules[i].contextChars.coerceIn(1, 2000))
+                    RoleMatchScope.AUTO -> return@firstOrNull false
                 }
                 (isDialogue || !rules[i].onlyDialogue) && matches(i, candidate)
             } ?: return null
-            return RoleMatch(rules[index], pickVoice(index))
+            return pick(index)
         }
 
         private fun matches(index: Int, text: String): Boolean {
@@ -330,9 +339,11 @@ object TextPipeline {
         }
 
         private fun compile(rule: RoleRule, issues: MutableList<PipelineIssue>): Regex? {
-            val source = when (rule.matchMode) {
-                RoleMatchMode.REGEX_SUFFIX -> "(?:${rule.pattern})\\z"
-                RoleMatchMode.LITERAL_EXACT -> Regex.escape(rule.pattern)
+            val source = when {
+                // AUTO 只在旁白里找称呼，前缀/后缀/整段这些片段级模式对它没有意义。
+                rule.matchScope == RoleMatchScope.AUTO && rule.matchMode != RoleMatchMode.LITERAL_EXACT -> rule.pattern
+                rule.matchMode == RoleMatchMode.REGEX_SUFFIX -> "(?:${rule.pattern})\\z"
+                rule.matchMode == RoleMatchMode.LITERAL_EXACT -> Regex.escape(rule.pattern)
                 else -> rule.pattern
             }
             return runCatching { Regex(source) }.getOrElse { error ->
@@ -345,6 +356,4 @@ object TextPipeline {
             }
         }
     }
-
-    private data class RawSpan(val text: String, val isDialogue: Boolean)
 }

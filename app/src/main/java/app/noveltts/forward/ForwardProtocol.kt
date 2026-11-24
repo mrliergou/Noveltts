@@ -1,5 +1,6 @@
 package app.noveltts.forward
 
+import app.noveltts.data.JsonInput
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.URLDecoder
@@ -69,22 +70,24 @@ internal object ForwardProtocol {
     const val MIN_VOLUME = 0f
     const val MAX_VOLUME = 1f
 
-    /** 读一行（CRLF 或 LF）：返回去掉行尾的内容；流一开始就 EOF 时返回 null。 */
+    /** Read one bounded CRLF/LF line; EOF is valid only before any bytes are read. */
     fun readLine(input: InputStream, limit: Int): String? {
         val buffer = ByteArrayOutputStream(64)
         while (true) {
             val value = input.read()
             if (value < 0) {
                 if (buffer.size() == 0) return null
-                return String(buffer.toByteArray(), Charsets.UTF_8)
+                throw ForwardHttpException(400, "line_truncated", "请求行或请求头不完整")
             }
             if (value == '\n'.code) break
-            if (value != '\r'.code) {
-                if (buffer.size() >= limit) {
-                    throw ForwardHttpException(400, "request_too_long", "请求行或请求头过长")
-                }
-                buffer.write(value)
+            if (value == '\r'.code) {
+                if (input.read() != '\n'.code) throw ForwardHttpException(400, "invalid_line", "请求行换行非法")
+                break
             }
+            if (buffer.size() >= limit) {
+                throw ForwardHttpException(400, "request_too_long", "请求行或请求头过长")
+            }
+            buffer.write(value)
         }
         return String(buffer.toByteArray(), Charsets.UTF_8)
     }
@@ -92,7 +95,7 @@ internal object ForwardProtocol {
     /** 解析 "GET /tts?text=hi HTTP/1.1"；方法统一转大写。 */
     fun parseRequestLine(line: String): HttpRequestLine? {
         val parts = line.trim().split(Regex("\\s+"))
-        if (parts.size < 2) return null
+        if (parts.size != 3 || parts[2] !in setOf("HTTP/1.0", "HTTP/1.1")) return null
         val method = parts[0]
         val target = parts[1]
         if (method.isEmpty() || target.isEmpty()) return null
@@ -149,87 +152,90 @@ internal object ForwardProtocol {
         value
     }
 
-    /** 读取请求头到小写键的 map；重复头用 ", " 合并。空行结束，EOF 也结束。 */
+    /** Headers and chunk trailers share byte/count limits and require a terminating blank line. */
     fun readHeaders(input: InputStream): Map<String, String> {
         val headers = LinkedHashMap<String, String>()
         var consumed = 0
         var count = 0
         while (true) {
-            val line = readLine(input, MAX_LINE_BYTES) ?: break
+            val line = readLine(input, MAX_LINE_BYTES)
+                ?: throw ForwardHttpException(400, "headers_truncated", "请求头不完整")
             if (line.isEmpty()) break
-            consumed += line.length + 2
-            if (consumed > MAX_HEADER_BYTES) {
-                throw ForwardHttpException(400, "headers_too_large", "请求头过大")
-            }
-            if (++count > MAX_HEADER_COUNT) {
-                throw ForwardHttpException(400, "too_many_headers", "请求头过多")
-            }
+            consumed += line.toByteArray(Charsets.UTF_8).size + 2
+            if (consumed > MAX_HEADER_BYTES) throw ForwardHttpException(400, "headers_too_large", "请求头过大")
+            if (++count > MAX_HEADER_COUNT) throw ForwardHttpException(400, "too_many_headers", "请求头过多")
             val colon = line.indexOf(':')
-            if (colon <= 0) continue
-            val name = line.substring(0, colon).trim().lowercase(Locale.ROOT)
+            if (colon <= 0) throw ForwardHttpException(400, "invalid_header", "请求头格式无效")
+            val name = line.substring(0, colon)
+            if (name.any { it !in 'a'..'z' && it !in 'A'..'Z' && it !in '0'..'9' && it !in "!#$%&'*+-.^_`|~" }) {
+                throw ForwardHttpException(400, "invalid_header", "请求头名称无效")
+            }
+            val key = name.lowercase(Locale.ROOT)
+            if (key in headers && key in setOf("content-length", "transfer-encoding")) {
+                throw ForwardHttpException(400, "ambiguous_framing", "请求包含重复的长度或编码头")
+            }
             val value = line.substring(colon + 1).trim()
-            if (name.isEmpty()) continue
-            val existing = headers[name]
-            headers[name] = if (existing.isNullOrEmpty()) value else "$existing, $value"
+            val existing = headers[key]
+            headers[key] = if (existing == null) value else "$existing, $value"
         }
         return headers
     }
 
-    /** 按 Content-Length 或 chunked 读请求体；两者都没有时抛 411。 */
+    /** Accept exactly one framing mechanism; unsupported transfer codings are rejected. */
     fun readBody(input: InputStream, headers: Map<String, String>): ByteArray {
-        val transferEncoding = headers["transfer-encoding"].orEmpty().lowercase(Locale.ROOT)
-        if (transferEncoding.contains("chunked")) return readChunkedBody(input)
+        val transferEncoding = headers["transfer-encoding"]
         val rawLength = headers["content-length"]
-        val length = rawLength?.trim()?.toIntOrNull()
-            ?: throw ForwardHttpException(411, "length_required", "缺少可用的 Content-Length（或 Transfer-Encoding: chunked）")
-        if (length < 0) throw ForwardHttpException(400, "invalid_length", "Content-Length 非法")
-        if (length == 0) return ByteArray(0)
-        if (length > MAX_BODY_BYTES) {
-            throw ForwardHttpException(413, "body_too_large", "请求体超过 ${MAX_BODY_BYTES / 1024} KB")
+        if (transferEncoding != null) {
+            if (rawLength != null) throw ForwardHttpException(400, "ambiguous_framing", "不能同时提供长度与传输编码")
+            if (!transferEncoding.trim().equals("chunked", ignoreCase = true)) {
+                throw ForwardHttpException(400, "unsupported_encoding", "仅支持 chunked 传输编码")
+            }
+            return readChunkedBody(input)
         }
-        val body = ByteArray(length)
+        if (rawLength == null) throw ForwardHttpException(411, "length_required", "缺少 Content-Length 或 chunked 传输编码")
+        val text = rawLength.trim()
+        val length = text.takeIf { it.isNotEmpty() && it.all { char -> char in '0'..'9' } }?.toLongOrNull()
+            ?: throw ForwardHttpException(400, "invalid_length", "Content-Length 非法")
+        if (length > MAX_BODY_BYTES) throw ForwardHttpException(413, "body_too_large", "请求体超过 ${MAX_BODY_BYTES / 1024} KB")
+        val body = ByteArray(length.toInt())
         var read = 0
-        while (read < length) {
-            val count = input.read(body, read, length - read)
-            if (count < 0) throw ForwardHttpException(400, "body_truncated", "请求体不完整")
+        while (read < body.size) {
+            val count = input.read(body, read, body.size - read)
+            if (count <= 0) throw ForwardHttpException(400, "body_truncated", "请求体不完整")
             read += count
         }
         return body
     }
 
-    /** 最小 chunked 解析；只关心数据块，忽略扩展与 trailer。 */
+    /** Chunk data and trailers are bounded independently; EOF never substitutes for completion. */
     fun readChunkedBody(input: InputStream): ByteArray {
         val output = ByteArrayOutputStream(1024)
         while (true) {
             val line = readLine(input, MAX_LINE_BYTES)
                 ?: throw ForwardHttpException(400, "body_truncated", "chunked 请求体不完整")
             val sizeText = line.substringBefore(';').trim()
-            val size = sizeText.toIntOrNull(16)
-                ?: throw ForwardHttpException(400, "invalid_chunk", "chunk 长度非法：$sizeText")
-            if (size == 0) {
-                while (true) {
-                    val trailer = readLine(input, MAX_LINE_BYTES) ?: break
-                    if (trailer.isEmpty()) break
+            val size = sizeText.takeIf { it.isNotEmpty() && it.all { char -> char in "0123456789abcdefABCDEF" } }
+                ?.toLongOrNull(16) ?: throw ForwardHttpException(400, "invalid_chunk", "chunk 长度非法")
+            if (size == 0L) {
+                val trailers = readHeaders(input)
+                if (trailers.keys.any { it in setOf("content-length", "transfer-encoding") }) {
+                    throw ForwardHttpException(400, "invalid_trailer", "trailer 不能改变请求体长度")
                 }
                 return output.toByteArray()
             }
-            if (size < 0 || output.size().toLong() + size > MAX_BODY_BYTES) {
+            if (size > MAX_BODY_BYTES.toLong() - output.size()) {
                 throw ForwardHttpException(413, "body_too_large", "请求体超过 ${MAX_BODY_BYTES / 1024} KB")
             }
-            val chunk = ByteArray(size)
+            val chunk = ByteArray(size.toInt())
             var read = 0
-            while (read < size) {
-                val count = input.read(chunk, read, size - read)
-                if (count < 0) throw ForwardHttpException(400, "body_truncated", "chunked 请求体不完整")
+            while (read < chunk.size) {
+                val count = input.read(chunk, read, chunk.size - read)
+                if (count <= 0) throw ForwardHttpException(400, "body_truncated", "chunked 请求体不完整")
                 read += count
             }
-            output.write(chunk, 0, size)
+            output.write(chunk)
             val eol = input.read()
-            if (eol < 0) throw ForwardHttpException(400, "body_truncated", "chunked 请求体不完整")
-            if (eol == '\r'.code) {
-                val lf = input.read()
-                if (lf != '\n'.code) throw ForwardHttpException(400, "invalid_chunk", "chunk 缺少换行")
-            } else if (eol != '\n'.code) {
+            if (eol != '\n'.code && (eol != '\r'.code || input.read() != '\n'.code)) {
                 throw ForwardHttpException(400, "invalid_chunk", "chunk 缺少换行")
             }
         }
@@ -263,9 +269,11 @@ internal object ForwardProtocol {
     fun parseTtsJson(body: String): TtsParams {
         if (body.isBlank()) throw ForwardHttpException(400, "invalid_json", "请求体为空")
         val json = try {
-            JSONObject(body)
+            JsonInput.parseObject(body)
         } catch (_: JSONException) {
             throw ForwardHttpException(400, "invalid_json", "请求体不是合法 JSON")
+        } catch (_: IllegalArgumentException) {
+            throw ForwardHttpException(400, "invalid_json", "请求体不是合法 JSON 或嵌套过深")
         }
         val text = if (json.has("text") && !json.isNull("text")) json.optString("text") else ""
         val voice = optText(json, "voice")
@@ -305,7 +313,7 @@ internal object ForwardProtocol {
             throw ForwardHttpException(400, "unsupported_format", "暂不支持 format=$normalizedFormat，只支持 wav（本机没有 MP3 编码器）")
         }
         requireRange("rate", rate, MIN_RATE, MAX_RATE)
-        requireRange("pitch", pitch, MIN_RATE, MAX_RATE)
+        requireRange("pitch", pitch, 0.25f, 2f)
         requireRange("volume", volume, MIN_VOLUME, MAX_VOLUME)
         return TtsParams(
             text = cleaned,

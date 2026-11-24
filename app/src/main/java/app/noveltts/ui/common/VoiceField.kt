@@ -35,6 +35,7 @@ fun VoiceField(
     onStopPreview: (() -> Unit)? = null,
     previewVoiceId: String? = null,
     previewStatus: String = "",
+    previewError: String? = null,
     enabled: Boolean = true,
 ) {
     var showPicker by remember { mutableStateOf(false) }
@@ -88,6 +89,7 @@ fun VoiceField(
             onStopPreview = onStopPreview,
             previewVoiceId = previewVoiceId,
             previewStatus = previewStatus,
+            previewError = previewError,
         )
     }
 }

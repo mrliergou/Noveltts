@@ -41,6 +41,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import app.noveltts.data.settings.SettingsStore
+import app.noveltts.domain.UnattributedPolicy
 import app.noveltts.ui.MainUiState
 import app.noveltts.ui.MainViewModel
 import app.noveltts.ui.common.AppIcon
@@ -313,6 +314,7 @@ internal fun SliderSettingRow(
     onValueChange: (Int) -> Unit,
     subtitle: String? = null,
 ) {
+    var draft by remember(value) { mutableStateOf(value.coerceIn(range).toFloat()) }
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -320,7 +322,7 @@ internal fun SliderSettingRow(
         ) {
             Text(text = title, color = Ink, modifier = Modifier.weight(1f))
             Text(
-                text = value.toString() + unit,
+                text = draft.roundToInt().toString() + unit,
                 style = MaterialTheme.typography.labelLarge,
                 color = Accent,
             )
@@ -329,8 +331,9 @@ internal fun SliderSettingRow(
             Text(text = subtitle, style = MaterialTheme.typography.labelSmall, color = Muted)
         }
         Slider(
-            value = value.coerceIn(range).toFloat(),
-            onValueChange = { onValueChange(it.roundToInt()) },
+            value = draft,
+            onValueChange = { draft = it },
+            onValueChangeFinished = { onValueChange(draft.roundToInt()) },
             valueRange = range.first.toFloat()..range.last.toFloat(),
         )
     }
@@ -339,8 +342,18 @@ internal fun SliderSettingRow(
 /** 朗读行为：标点过滤 / 系统默认音色 / 段间静音。 */
 @Composable
 internal fun ReadingBehaviorSettings(state: MainUiState, viewModel: MainViewModel) {
+    val experimentReport = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(viewModel::importFirstSegmentEvidence) }
     BackgroundNotificationPermission(showSetting = true)
     ReadingProfilesSection(state, viewModel)
+    SectionCard {
+        ToggleSettingRow("锁屏持续朗读", state.keepAwake, viewModel::setKeepAwake,
+            subtitle = "仅活动朗读期间每 10 分钟续期唤醒锁；暂停、结束或停止立即释放。默认关闭。")
+    }
+    SectionCard {
+        ToggleSettingRow("首段 ≤96 字实验", state.firstSegmentEnabled, viewModel::setFirstSegmentExperiment,
+            subtitle = "默认关闭；仅匹配报告里的设备、音色 ID、后端/内容版本和最终参数时生效。需至少 30 组配对，中位数改善 10%，P95 不变差，取消续读通过。", enabled = state.firstSegmentReady)
+        TextButton(onClick = { experimentReport.launch(arrayOf("application/json", "text/plain")) }) { Text("导入首音配对测量报告") }
+    }
     SectionTitle("朗读行为")
     SectionCard {
         ToggleSettingRow(
@@ -355,6 +368,22 @@ internal fun ReadingBehaviorSettings(state: MainUiState, viewModel: MainViewMode
             voices = state.usableVoices,
             onSelect = viewModel::selectSystemVoice,
         )
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(text = "没写是谁说的对话", color = Ink)
+            FilterChipRow(
+                options = listOf(
+                    UnattributedPolicy.INHERIT to "沿用上一个说话人",
+                    UnattributedPolicy.DEFAULT_VOICE to "用默认对话音色",
+                ),
+                selected = state.unattributedPolicy,
+                onSelect = viewModel::setUnattributedPolicy,
+            )
+            Text(
+                text = "引号前后的旁白都没交代是谁在说时怎么读；只影响自动判断说话人的角色。",
+                style = MaterialTheme.typography.labelSmall,
+                color = Muted,
+            )
+        }
     }
     SectionTitle("分段")
     SectionCard {
@@ -364,7 +393,7 @@ internal fun ReadingBehaviorSettings(state: MainUiState, viewModel: MainViewMode
             range = SettingsStore.SILENCE_RANGE,
             unit = " ms",
             onValueChange = viewModel::setSilenceBetweenSegmentsMs,
-            subtitle = "仅应用内播放时生效，系统 TTS 调用不插静音。",
+            subtitle = "应用内、系统 TTS 与 HTTP 多段合成均生效。",
         )
     }
 }
@@ -415,24 +444,26 @@ internal fun SynthesisNetworkSettings(state: MainUiState, viewModel: MainViewMod
             subtitle = "超出后自动删除最早使用的段落音频；关闭缓存不会删除已有文件。",
         )
     }
+    SectionTitle("后端状态")
+    SectionCard {
+        listOf("edgetts" to "Edge 在线", "microsoft" to "Microsoft Embedded").forEach { (code, name) ->
+            val voices = state.voices.filter { it.engineCode == code }
+            val result = state.engineHealth[code]
+            Text("$name：${voices.count { it.usable }}/${voices.size} 个音色可用", color = Ink)
+            Text(when { result == null -> "尚无合成结果，配置可用不代表服务已连通"; result.code == 0 -> "最近一次合成成功"; else -> "最近一次合成失败 [${result.code}]，详情见诊断日志" }, style = MaterialTheme.typography.labelSmall, color = Muted)
+        }
+    }
     SectionTitle("在线音源")
     EdgeEndpointCard(
         savedEndpoint = state.edgeEndpoint,
         onSave = viewModel::setEdgeEndpoint,
     )
-    SectionCard {
-        ToggleSettingRow(
-            title = "兼容代理",
-            checked = state.compatibilityProxy,
-            onCheckedChange = viewModel::setCompatibilityProxy,
-            subtitle = "通过本机伪装的 HTTP 代理转发 Edge 请求。",
-        )
-    }
+
     SectionTitle("本地引擎")
-    LocalEngineCard(
-        savedPackage = state.localTtsEnginePackage,
-        onSave = viewModel::setLocalTtsEnginePackage,
-    )
+    SectionCard {
+        Text("本地 TTS 桥接暂未开放", color = Ink)
+        Text("普通语音包的注册链路尚未闭合，历史包名配置已保留。当前可用后端为 Edge 在线和 Microsoft Embedded。", color = Muted)
+    }
 }
 
 /** 背景音乐：跟随朗读开始/结束播放，只在本应用内朗读时生效（系统 TTS 调用不播放）。 */
@@ -597,6 +628,13 @@ internal fun SystemIntegrationSettings(
     viewModel: MainViewModel,
     onOpenSystemSpeechSettings: () -> Unit,
 ) {
+    var confirmClearText by remember { mutableStateOf(false) }
+    if (confirmClearText) app.noveltts.ui.common.ConfirmDialog(
+        title = "清除最近文本？", message = "将清空工作台文本及其本机保存内容。",
+        confirmLabel = "清除", dangerous = true,
+        onConfirm = { confirmClearText = false; viewModel.clearRecentText() },
+        onDismiss = { confirmClearText = false },
+    )
     SectionTitle("微软离线许可证")
     LicenseCard(
         configured = state.licenseConfigured,
@@ -622,7 +660,7 @@ internal fun SystemIntegrationSettings(
             Text("打开系统语音设置")
         }
         OutlinedButton(
-            onClick = viewModel::clearRecentText,
+            onClick = { confirmClearText = true },
             modifier = Modifier.fillMaxWidth(),
         ) {
             AppIconGlyph(
@@ -740,6 +778,12 @@ private fun LocalEngineCard(savedPackage: String, onSave: (String) -> Unit) {
 @Composable
 private fun LicenseCard(configured: Boolean, mask: String, onSave: (String) -> Unit) {
     var input by remember { mutableStateOf("") }
+    var confirmClear by remember { mutableStateOf(false) }
+    if (confirmClear) app.noveltts.ui.common.ConfirmDialog(
+        title = "清除离线许可证？", message = "清除后微软离线音色将不可用，需要重新填写许可证。",
+        confirmLabel = "清除", dangerous = true,
+        onConfirm = { confirmClear = false; onSave("") }, onDismiss = { confirmClear = false },
+    )
     SectionCard {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -778,7 +822,7 @@ private fun LicenseCard(configured: Boolean, mask: String, onSave: (String) -> U
                 Text("保存许可证")
             }
             if (configured) {
-                OutlinedButton(onClick = { onSave("") }) {
+                OutlinedButton(onClick = { confirmClear = true }) {
                     AppIconGlyph(
                         icon = AppIcon.CLOSE,
                         size = 18.dp,
@@ -794,6 +838,11 @@ private fun LicenseCard(configured: Boolean, mask: String, onSave: (String) -> U
 private fun copyToClipboard(context: Context, text: String, message: String) {
     if (text.isBlank()) return
     val manager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-    manager?.setPrimaryClip(ClipData.newPlainText("NovelTTS", text))
+    manager?.setPrimaryClip(ClipData.newPlainText("NovelTTS", text).apply {
+        // Exported reader configuration can contain the access token; suppress clipboard previews.
+        description.extras = android.os.PersistableBundle().apply {
+            putBoolean("android.content.extra.IS_SENSITIVE", true)
+        }
+    })
     Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
 }

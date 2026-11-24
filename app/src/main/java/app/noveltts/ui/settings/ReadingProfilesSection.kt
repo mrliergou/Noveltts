@@ -131,6 +131,6 @@ internal fun VoiceRemappingFields(missing: List<String>, hints: Map<String, Stri
     missing.forEach { id ->
         VoiceField(label = hints[id] ?: "${id.substringAfterLast(':')}（未安装或不可用）", voiceId = mapping[id].orEmpty(),
             voices = state.usableVoices, onSelect = { onSelect(id, it) }, onPreview = viewModel::previewVoice,
-            onStopPreview = viewModel::stopPreview, previewVoiceId = state.previewVoiceId, previewStatus = state.statusMessage, enabled = enabled)
+            onStopPreview = viewModel::stopPreview, previewVoiceId = state.previewVoiceId, previewStatus = state.statusMessage, previewError = state.previewError, enabled = enabled)
     }
 }

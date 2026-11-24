@@ -21,6 +21,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import app.noveltts.data.config.RulesImportApplyResult
 import app.noveltts.data.config.RulesImportPreview
 import app.noveltts.data.config.RulesKind
 import app.noveltts.domain.ReplacementRule
@@ -50,7 +51,7 @@ fun ReplacementsPage(state: MainUiState, viewModel: MainViewModel) {
     var query by rememberSaveable { mutableStateOf("") }
     var filter by rememberSaveable { mutableStateOf(RulesFilter.ALL) }
     var collapsed by remember { mutableStateOf(setOf<String>()) }
-    var editor by remember { mutableStateOf<RuleEditorTarget?>(viewModel.replacementDraft()?.let { RuleEditorTarget.Replacement(it.rule, it.rule.groupId, it.newGroupName, true, it.fields) }) }
+    var editor by remember { mutableStateOf<RuleEditorTarget?>(viewModel.replacementDraft()?.let { RuleEditorTarget.Replacement(it.rule, it.rule.groupId, it.newGroupName, true, it.fields, it.saveBaseline) }) }
     var groupDialog by remember { mutableStateOf<ReplacementGroupDialogState?>(null) }
     var pendingGroupDelete by remember { mutableStateOf<RuleGroup?>(null) }
     var pendingDelete by remember { mutableStateOf<ReplacementRule?>(null) }
@@ -180,7 +181,7 @@ fun ReplacementsPage(state: MainUiState, viewModel: MainViewModel) {
                         onDelete = { pendingDelete = rule },
                         modifier = Modifier.animateItem(),
                     ) {
-                        ReplacementRowContent(rule = rule)
+                        ReplacementRowContent(rule = rule, targetMissing = rule.scope == app.noveltts.domain.ReplacementScope.ROLE && state.roles.none { it.id == rule.targetRoleId })
                     }
                 }
             }
@@ -196,7 +197,7 @@ fun ReplacementsPage(state: MainUiState, viewModel: MainViewModel) {
             onDismiss = { viewModel.stopPreview(); editor = null },
             onSaveRole = { _, _ -> false },
             onSaveReplacement = { rule, newGroup ->
-                val saved = withContext(Dispatchers.IO) { viewModel.saveReplacement(rule, newGroup) }
+                val saved = withContext(Dispatchers.IO) { viewModel.saveReplacement(rule, newGroup, (target as? RuleEditorTarget.Replacement)?.expected) }
                 if (saved) { viewModel.clearRuleDraft(RulesKind.REPLACEMENT); viewModel.stopPreview(); editor = null }
                 saved
             },
@@ -204,7 +205,7 @@ fun ReplacementsPage(state: MainUiState, viewModel: MainViewModel) {
             onTestReplacement = { text, rule, all -> withContext(Dispatchers.Default) { viewModel.testReplacements(text, rule, all) } },
             onPreviewVoice = viewModel::previewVoice,
             onStopPreview = viewModel::stopPreview,
-            onRoleDraftChange = { _, _, _ -> },
+            onRoleDraftChange = { _, _, _, _ -> },
             onReplacementDraftChange = viewModel::rememberReplacementDraft,
             onDiscardDraft = { viewModel.clearRuleDraft(RulesKind.REPLACEMENT) },
         )
@@ -256,7 +257,12 @@ fun ReplacementsPage(state: MainUiState, viewModel: MainViewModel) {
             nameOf = { rule: ReplacementRule -> rule.name },
             onApply = { strategy ->
                 viewModel.applyReplacementImport(preview, strategy).fold(
-                    onSuccess = { pendingImport = null },
+                    onSuccess = { result ->
+                        pendingImport = when (result) {
+                            is RulesImportApplyResult.Applied -> null
+                            is RulesImportApplyResult.PreviewChanged -> result.preview
+                        }
+                    },
                     onFailure = {
                         importError = it.message ?: "导入失败"
                     },
@@ -277,13 +283,17 @@ fun ReplacementsPage(state: MainUiState, viewModel: MainViewModel) {
 }
 
 @Composable
-private fun ReplacementRowContent(rule: ReplacementRule) {
+private fun ReplacementRowContent(rule: ReplacementRule, targetMissing: Boolean) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(text = rule.name, fontWeight = FontWeight.SemiBold, color = Ink)
         if (rule.isRegex) {
             Spacer(Modifier.width(6.dp))
             Badge(text = "正则", highlight = true)
         }
+    }
+    if (targetMissing) {
+        Badge(text = "目标角色缺失 · 已跳过", highlight = true)
+        Text("原角色引用已保留，请编辑并重新绑定角色。", style = MaterialTheme.typography.labelSmall, color = Muted)
     }
     Text(
         text = "查找：" + rule.find,

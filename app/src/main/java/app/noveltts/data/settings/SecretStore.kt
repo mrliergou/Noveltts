@@ -19,6 +19,8 @@ class SecretStore(context: Context) {
     private val preferences = context.applicationContext
         .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
+    fun encryptedValue(key: String): String? = preferences.getString(key, null)
+
     fun put(key: String, plainText: String?) {
         DiagnosticsLog.registerSensitiveValue(plainText)
         if (plainText.isNullOrBlank()) {
@@ -47,6 +49,7 @@ class SecretStore(context: Context) {
 
     fun get(key: String): String? {
         val packed = preferences.getString(key, null) ?: return null
+        synchronized(decrypted) { decrypted[packed]?.let { return it } }
         return runCatching {
             val bytes = Base64.decode(packed, Base64.NO_WRAP)
             if (bytes.size <= IV_BYTES) return@runCatching null
@@ -55,7 +58,14 @@ class SecretStore(context: Context) {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(128, iv))
             String(cipher.doFinal(cipherText), Charsets.UTF_8)
-        }.getOrNull()?.takeIf { it.isNotBlank() }?.also(DiagnosticsLog::registerSensitiveValue)
+                }.onFailure { DiagnosticsLog.warn(app.noveltts.engine.Category.STORAGE, "凭据解密失败，请重新配置") }
+            .getOrNull()?.takeIf { it.isNotBlank() }?.also { value ->
+                DiagnosticsLog.registerSensitiveValue(value)
+                synchronized(decrypted) {
+                    if (decrypted.size >= 4) decrypted.clear()
+                    decrypted[packed] = value
+                }
+            }
     }
 
     private fun secretKey(): SecretKey {
@@ -76,6 +86,7 @@ class SecretStore(context: Context) {
     }
 
     private companion object {
+        private val decrypted = HashMap<String, String>()
         const val PREFS = "multitts.secrets"
         const val KEYSTORE = "AndroidKeyStore"
         const val ALIAS = "multitts.license"

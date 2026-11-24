@@ -7,7 +7,7 @@ data class RuleGroup(
     val name: String,
     val enabled: Boolean = true,
     val order: Int = 100,
-) {
+) : java.io.Serializable {
     companion object {
         const val DEFAULT_ID = "default"
         val DEFAULT = RuleGroup(id = DEFAULT_ID, name = "默认")
@@ -18,7 +18,7 @@ data class RuleGroup(
 data class RuleSet<T>(
     val groups: List<RuleGroup> = listOf(RuleGroup.DEFAULT),
     val items: List<T> = emptyList(),
-)
+) : java.io.Serializable
 
 enum class RoleMatchMode {
     /** 文本任意位置命中正则（v1 行为）。 */
@@ -31,7 +31,14 @@ enum class RoleMatchMode {
     LITERAL_EXACT,
 }
 
-enum class RoleMatchScope { SEGMENT, PREVIOUS_NARRATION, NEXT_NARRATION }
+enum class RoleMatchScope {
+    SEGMENT,
+    PREVIOUS_NARRATION,
+    NEXT_NARRATION,
+
+    /** 按整句引语判定说话人，见 [SpeakerAttributor]；只作用于对话。 */
+    AUTO,
+}
 enum class ReplacementScope { ALL, NARRATION, DIALOGUE, ROLE }
 
 /** 一个朗读角色的音色与倍率；倍率叠加在全局参数与音色默认值之上。 */
@@ -40,7 +47,7 @@ data class RolePlaybackSettings(
     val rate: Float = 1f,
     val pitch: Float = 1f,
     val volume: Float = 1f,
-) {
+) : java.io.Serializable {
     fun normalized(): RolePlaybackSettings = copy(
         rate = multiplier(rate, RATE_RANGE),
         pitch = multiplier(pitch, RATE_RANGE),
@@ -62,7 +69,7 @@ enum class BuiltInRole { NARRATOR, DIALOGUE }
 data class BuiltInRoleSettings(
     val narrator: RolePlaybackSettings = RolePlaybackSettings(),
     val dialogue: RolePlaybackSettings = RolePlaybackSettings(),
-) {
+) : java.io.Serializable {
     operator fun get(role: BuiltInRole): RolePlaybackSettings = when (role) {
         BuiltInRole.NARRATOR -> narrator
         BuiltInRole.DIALOGUE -> dialogue
@@ -104,7 +111,7 @@ data class RoleRule(
     val speechRate: Float = 1f,
     val speechPitch: Float = 1f,
     val speechVolume: Float = 1f,
-) {
+) : java.io.Serializable {
     val primaryVoiceId: String? get() = voiceIds.firstOrNull { it.isNotBlank() }
 }
 
@@ -121,13 +128,13 @@ data class ReplacementRule(
     val groupId: String = RuleGroup.DEFAULT_ID,
     val scope: ReplacementScope = ReplacementScope.ALL,
     val targetRoleId: String = "",
-)
+) : java.io.Serializable
 
 data class PipelineIssue(
     val field: String,
     val message: String,
     val ruleId: String? = null,
-)
+) : java.io.Serializable
 
 data class PipelineSegment(
     val text: String,
@@ -141,13 +148,15 @@ data class PipelineSegment(
     val speechRate: Float = 1f,
     val speechPitch: Float = 1f,
     val speechVolume: Float = 1f,
-)
+    /** 这一段为什么由该角色朗读；旁白未命中规则时为空。 */
+    val attribution: Attribution? = null,
+) : java.io.Serializable
 
-data class ReplacementTrace(val ruleId: String, val ruleName: String, val before: String, val after: String)
+data class ReplacementTrace(val ruleId: String, val ruleName: String, val before: String, val after: String) : java.io.Serializable
 
 data class TextPipelineResult(
     val segments: List<PipelineSegment>,
     val transformedText: String,
     val issues: List<PipelineIssue> = emptyList(),
     val replacements: List<ReplacementTrace> = emptyList(),
-)
+) : java.io.Serializable

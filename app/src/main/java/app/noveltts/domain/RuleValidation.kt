@@ -1,7 +1,13 @@
 package app.noveltts.domain
 
 object RuleValidation {
-    fun roleError(rule: RoleRule): String? = when {
+    fun roleError(rule: RoleRule): String? = try {
+        RuleRuntime.execute(RuleWork(roles = listOf(rule), validation = "role")).validation
+    } catch (error: Exception) { error.message ?: "规则校验失败" }
+    fun replacementError(rule: ReplacementRule): String? = try {
+        RuleRuntime.execute(RuleWork(replacements = listOf(rule), validation = "replacement")).validation
+    } catch (error: Exception) { error.message ?: "规则校验失败" }
+    internal fun localRoleError(rule: RoleRule): String? = when {
         rule.name.isBlank() -> "请输入规则名称"
         rule.pattern.isBlank() -> "请输入匹配内容"
         rule.voiceIds.none { it.isNotBlank() } -> "请至少选择一个音色"
@@ -10,7 +16,7 @@ object RuleValidation {
         else -> null
     }
 
-    fun replacementError(rule: ReplacementRule): String? {
+    internal fun localReplacementError(rule: ReplacementRule): String? {
         if (rule.find.isEmpty()) return "请输入查找内容"
         if (!rule.isRegex) return null
         return runCatching {

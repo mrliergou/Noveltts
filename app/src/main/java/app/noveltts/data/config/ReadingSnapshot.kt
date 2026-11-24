@@ -16,7 +16,8 @@ object ReadingSnapshot {
                 .put("roleName", segment.roleName).put("roleId", segment.roleId)
                 .put("requestedVoiceId", segment.requestedVoiceId).put("fallbackReason", segment.fallbackReason)
                 .put("speechRate", segment.speechRate).put("speechPitch", segment.speechPitch)
-                .put("speechVolume", segment.speechVolume))
+                .put("speechVolume", segment.speechVolume)
+                .put("attribution", segment.attribution?.let { JSONObject().put("kind", it.kind.name).put("confidence", it.confidence.name).put("evidence", it.evidence) }))
         }
     }
 
@@ -40,7 +41,10 @@ object ReadingSnapshot {
             PlannedSegment(PipelineSegment(text, isDialogue, voice.systemName, optional(item, "roleName"), id,
                 optional(item, "roleId"), optional(item, "requestedVoiceId") ?: savedVoice, fallback,
                 finite(item, "speechRate", 0.25f, 4f), finite(item, "speechPitch", 0.25f, 4f),
-                finite(item, "speechVolume", 0f, 1f)), voice)
+                finite(item, "speechVolume", 0f, 1f), item.optJSONObject("attribution")?.let { attribution ->
+                    app.noveltts.domain.Attribution(app.noveltts.domain.AttributionKind.valueOf(attribution.getString("kind")),
+                        app.noveltts.domain.Confidence.valueOf(attribution.getString("confidence")), attribution.optString("evidence").take(20))
+                }), voice)
         }
     }
 

@@ -23,7 +23,7 @@ data class VoiceProfile(
 /**
  * 归一化后的合成请求。
  *
- * [rate] / [pitch] 取值 0.5f..2.0f（1.0f 为原速），[volume] 取值 0f..1f。
+ * [rate] 取值 0.25f..4f，[pitch] 取值 0.25f..2f（1f 为原值），[volume] 取值 0f..1f。
  * 调用方负责把 UI 的 0..100 滑块和系统的百分比参数映射到这段区间。
  */
 data class SynthesisRequest(
@@ -35,6 +35,10 @@ data class SynthesisRequest(
     val options: EngineRequestOptions? = null,
     val requestId: String? = null,
     val segmentId: String? = null,
+    val prefetch: Boolean = false,
+    /** Monotonic deadline shared by queueing, network, decode and the spool waiter. */
+    val deadlineNanos: Long? = null,
+    val timing: app.noveltts.engine.RequestTiming = app.noveltts.engine.RequestTiming(requestId, segmentId),
 )
 
 data class EngineRequestOptions(val edgeEndpoint: String, val timeoutSec: Int, val localEnginePackage: String)
@@ -87,4 +91,16 @@ object SynthesisError {
     const val CANCELLED = -6
     const val LICENSE_REQUIRED = -7
     const val NETWORK_FAILED = -8
+    const val RESOURCE_LIMIT = -9
+    const val BUSY = -10
+    const val NO_AUDIO = -11
 }
+
+internal fun synthesisTimeoutMillis(textLength: Int, configuredMillis: Long): Long {
+    require(textLength >= 0)
+    return (20_000L + textLength.toLong() * 150L)
+        .coerceIn(configuredMillis.coerceIn(10_000L, 300_000L), 300_000L)
+}
+
+internal fun SynthesisRequest.remainingTimeoutMillis(nowNanos: Long = System.nanoTime()): Long? =
+    deadlineNanos?.let { java.util.concurrent.TimeUnit.NANOSECONDS.toMillis((it - nowNanos).coerceAtLeast(0L)) }

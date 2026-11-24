@@ -1,5 +1,8 @@
 package app.noveltts.data.config
 
+import app.noveltts.data.stringOrDefault
+
+import app.noveltts.data.JsonInput
 import app.noveltts.domain.ReplacementRule
 import app.noveltts.domain.RoleMatchScope
 import app.noveltts.domain.ReplacementScope
@@ -50,6 +53,9 @@ data class RulesImportPreview<T>(
     val newGroups: List<RuleGroup>,
     val existingGroups: List<RuleGroup>,
     val warnings: List<String>,
+    val baseFingerprint: String = "",
+    val sourceText: String? = null,
+    val suggestedStrategy: RuleImportStrategy? = null,
 ) {
     val newCount: Int get() = entries.count { it.conflict == RuleImportConflict.NONE }
     val sameIdCount: Int get() = entries.count { it.conflict == RuleImportConflict.SAME_ID }
@@ -77,6 +83,14 @@ object RulesImport {
 
     private const val SCHEMA = 2
     private const val APP_TAG = "NovelTTS"
+
+    fun rolesFingerprint(set: RuleSet<RoleRule>): String = fingerprint(exportRoles(set))
+    fun replacementsFingerprint(set: RuleSet<ReplacementRule>): String = fingerprint(exportReplacements(set))
+    private fun fingerprint(json: String): String {
+        val stable = JSONObject(json).apply { remove("exportedAt") }.toString()
+        return java.security.MessageDigest.getInstance("SHA-256").digest(stable.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
+    }
 
     // ---- 导出 ---------------------------------------------------------------
 
@@ -149,9 +163,11 @@ object RulesImport {
         text: String,
         currentGroups: List<RuleGroup>,
         existing: List<RoleRule>,
+        externalImport: Boolean = true,
     ): RulesImportPreview<RoleRule> = previewOf(
         kind = RulesKind.ROLE,
         text = text,
+        externalImport = externalImport,
         currentGroups = currentGroups,
         existing = existing,
         decode = ::decodeRole,
@@ -166,9 +182,11 @@ object RulesImport {
         text: String,
         currentGroups: List<RuleGroup>,
         existing: List<ReplacementRule>,
+        externalImport: Boolean = true,
     ): RulesImportPreview<ReplacementRule> = previewOf(
         kind = RulesKind.REPLACEMENT,
         text = text,
+        externalImport = externalImport,
         currentGroups = currentGroups,
         existing = existing,
         decode = ::decodeReplacement,
@@ -182,6 +200,7 @@ object RulesImport {
     private fun <T> previewOf(
         kind: RulesKind,
         text: String,
+        externalImport: Boolean,
         currentGroups: List<RuleGroup>,
         existing: List<T>,
         decode: (JSONObject, Int, Int) -> T?,
@@ -191,10 +210,10 @@ object RulesImport {
         withId: (T, String) -> T,
         withGroup: (T, String) -> T,
     ): RulesImportPreview<T> {
-        val root = parseRoot(text, kind)
+        val root = parseRoot(text, kind, externalImport)
         val schema = schemaOf(root)
         val rawItems = items(root)
-        if (rawItems.size > MAX_ITEMS) {
+        if (externalImport && rawItems.size > MAX_ITEMS) {
             throw IllegalArgumentException("文件包含 ${rawItems.size} 条规则，超过 ${MAX_ITEMS} 条上限，请拆分后再导入")
         }
         val importedGroups = normalizeRuleGroups(readGroups(root))
@@ -236,6 +255,11 @@ object RulesImport {
             newGroups = newGroups,
             existingGroups = importedGroups.filterNot { it in newGroups },
             warnings = warnings,
+            sourceText = text,
+            baseFingerprint = when (kind) {
+                RulesKind.ROLE -> rolesFingerprint(RuleSet(currentGroups, existing.map { it as RoleRule }))
+                RulesKind.REPLACEMENT -> replacementsFingerprint(RuleSet(currentGroups, existing.map { it as ReplacementRule }))
+            },
         )
     }
 
@@ -338,7 +362,7 @@ object RulesImport {
         preview.entries.forEach { entry ->
             val targetGroup = groupRemap[groupOf(entry.rule)] ?: RuleGroup.DEFAULT_ID
             val rule = withGroup(entry.rule, targetGroup)
-            when (entry.conflict) {
+            when (buildEntry(rule, preview.groups, items, idOf, nameOf, groupOf).conflict) {
                 RuleImportConflict.NONE -> items += rule
                 RuleImportConflict.SAME_ID -> if (strategy == RuleImportStrategy.OVERWRITE) {
                     val index = items.indexOfFirst { idOf(it) == idOf(rule) }
@@ -379,19 +403,17 @@ object RulesImport {
 
     // ---- 校验与解码 ---------------------------------------------------------
 
-    private fun parseRoot(text: String, kind: RulesKind): JSONObject {
+    private fun parseRoot(text: String, kind: RulesKind, externalImport: Boolean): JSONObject {
         if (text.isBlank()) throw IllegalArgumentException("文件是空的")
-        if (text.length > MAX_FILE_BYTES) throw IllegalArgumentException("导入文件超过 1 MB 上限，请拆分后再导入")
-        if (depthOf(text) > MAX_DEPTH) {
-            throw IllegalArgumentException("JSON 嵌套超过 ${MAX_DEPTH} 层，已拒绝导入")
-        }
+        if (text.toByteArray(Charsets.UTF_8).size > if (externalImport) MAX_FILE_BYTES else 32 * 1024 * 1024) throw IllegalArgumentException("导入文件超过 1 MB 上限，请拆分后再导入")
+        JsonInput.checkDepth(text, MAX_DEPTH)
         val root = try {
-            JSONObject(text)
+            JSONObject(text.removePrefix("\uFEFF"))
         } catch (error: Exception) {
-            throw IllegalArgumentException("不是有效的规则 JSON：${error.message ?: "解析失败"}")
+            throw IllegalArgumentException("不是有效的规则 JSON，请检查文件格式")
         }
         if (root.optJSONArray("items") == null) throw IllegalArgumentException("缺少 items 数组，这不是规则导出文件")
-        val fileKind = root.optString("kind")
+        val fileKind = root.stringOrDefault("kind")
         if (fileKind.isNotBlank() && fileKind != kind.jsonKind) {
             val label = RulesKind.entries.firstOrNull { it.jsonKind == fileKind }?.label ?: fileKind
             throw IllegalArgumentException("这个文件是${label}，不能导入到「${kind.label}」")
@@ -419,10 +441,10 @@ object RulesImport {
         val array = root.optJSONArray("groups") ?: return emptyList()
         return (0 until array.length()).mapNotNull { index ->
             val item = array.optJSONObject(index) ?: return@mapNotNull null
-            val id = item.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val id = item.stringOrDefault("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             RuleGroup(
                 id = id,
-                name = item.optString("name").ifBlank {
+                name = item.stringOrDefault("name").ifBlank {
                     if (id == RuleGroup.DEFAULT_ID) RuleGroup.DEFAULT.name else id
                 },
                 enabled = item.optBoolean("enabled", true),
@@ -437,24 +459,24 @@ object RulesImport {
     private fun decodeRole(item: JSONObject, index: Int, schema: Int): RoleRule? = decodeRoleFields(item, index, schema, false)
 
     private fun decodeRoleFields(item: JSONObject, index: Int, schema: Int, incomplete: Boolean): RoleRule? {
-        val pattern = item.optString("pattern")
+        val pattern = item.stringOrDefault("pattern")
         if (!incomplete && pattern.isBlank()) return null
-        val name = if (incomplete) item.optString("name") else item.optString("name").trim().ifBlank { pattern }
-        val legacyVoice = item.optString("voiceId").takeIf { it.isNotBlank() }
+        val name = if (incomplete) item.stringOrDefault("name") else item.stringOrDefault("name").trim().ifBlank { pattern }
+        val legacyVoice = item.stringOrDefault("voiceId").takeIf { it.isNotBlank() }
         val voiceIds = if (schema >= 2) {
             item.optJSONArray("voiceIds")?.toStringList() ?: listOfNotNull(legacyVoice)
         } else {
             listOfNotNull(legacyVoice)
         }
         return RoleRule(
-            id = item.optString("id").ifBlank { "import-role-$index" },
+            id = item.stringOrDefault("id").ifBlank { "import-role-$index" },
             name = name,
             pattern = pattern,
             voiceIds = voiceIds,
             priority = item.optInt("priority", 100),
             onlyDialogue = item.optBoolean("onlyDialogue", true),
             enabled = item.optBoolean("enabled", true),
-            groupId = if (schema >= 2) item.optString("groupId").ifBlank { RuleGroup.DEFAULT_ID } else RuleGroup.DEFAULT_ID,
+            groupId = if (schema >= 2) item.stringOrDefault("groupId").ifBlank { RuleGroup.DEFAULT_ID } else RuleGroup.DEFAULT_ID,
             matchMode = item.optEnum("matchMode", RoleMatchMode.REGEX_CONTAINS),
             voiceSelectionMode = item.optEnum("voiceSelectionMode", VoiceSelectionMode.FIXED),
             matchScope = item.optEnum("matchScope", RoleMatchScope.SEGMENT),
@@ -469,27 +491,27 @@ object RulesImport {
     private fun decodeReplacement(item: JSONObject, index: Int, schema: Int): ReplacementRule? = decodeReplacementFields(item, index, schema, false)
 
     private fun decodeReplacementFields(item: JSONObject, index: Int, schema: Int, incomplete: Boolean): ReplacementRule? {
-        val find = item.optString("find")
+        val find = item.stringOrDefault("find")
         if (!incomplete && find.isEmpty()) return null
         return ReplacementRule(
-            id = item.optString("id").ifBlank { "import-replacement-$index" },
-            name = if (incomplete) item.optString("name") else item.optString("name").ifBlank { find },
+            id = item.stringOrDefault("id").ifBlank { "import-replacement-$index" },
+            name = if (incomplete) item.stringOrDefault("name") else item.stringOrDefault("name").ifBlank { find },
             find = find,
-            replaceWith = item.optString("replaceWith"),
+            replaceWith = item.stringOrDefault("replaceWith"),
             isRegex = item.optBoolean("isRegex", false),
             scope = item.optEnum("scope", ReplacementScope.ALL),
-            targetRoleId = item.optString("targetRoleId"),
+            targetRoleId = item.stringOrDefault("targetRoleId"),
             enabled = item.optBoolean("enabled", true),
             order = item.optInt("order", 100),
             sortIndex = item.optInt("sortIndex", index),
-            groupId = if (schema >= 2) item.optString("groupId").ifBlank { RuleGroup.DEFAULT_ID } else RuleGroup.DEFAULT_ID,
+            groupId = if (schema >= 2) item.stringOrDefault("groupId").ifBlank { RuleGroup.DEFAULT_ID } else RuleGroup.DEFAULT_ID,
         )
     }
 
     // ---- 通用工具 -----------------------------------------------------------
 
     /** 以流的方式读取导入文件，超过 [MAX_FILE_BYTES] 立即失败，避免把整块大文件读进内存。 */
-    fun readText(input: InputStream): String {
+    fun readText(input: InputStream, maximumBytes: Int = MAX_FILE_BYTES): String {
         val buffer = ByteArray(16 * 1024)
         val output = ByteArrayOutputStream()
         var total = 0
@@ -497,38 +519,10 @@ object RulesImport {
             val read = input.read(buffer)
             if (read < 0) break
             total += read
-            if (total > MAX_FILE_BYTES) throw IllegalArgumentException("导入文件超过 1 MB 上限，请拆分后再导入")
+            if (total > maximumBytes) throw IllegalArgumentException("导入文件超过 1 MB 上限，请拆分后再导入")
             output.write(buffer, 0, read)
         }
         return String(output.toByteArray(), Charsets.UTF_8)
-    }
-
-    /** 扫描原始文本计算最大嵌套层数；先于 JSON 解析执行，避免恶意深嵌套导致栈溢出。 */
-    private fun depthOf(text: String): Int {
-        var depth = 0
-        var max = 0
-        var inString = false
-        var escaped = false
-        for (char in text) {
-            if (inString) {
-                when {
-                    escaped -> escaped = false
-                    char == '\\' -> escaped = true
-                    char == '"' -> inString = false
-                }
-                continue
-            }
-            when (char) {
-                '"' -> inString = true
-                '{', '[' -> {
-                    depth++
-                    if (depth > max) max = depth
-                }
-
-                '}', ']' -> if (depth > 0) depth--
-            }
-        }
-        return max
     }
 
     private fun claimId(seen: MutableSet<String>, id: String): String {
@@ -559,7 +553,7 @@ internal fun nextRuleGroupOrder(groups: List<RuleGroup>): Int =
     (groups.maxOfOrNull { it.order } ?: RuleGroup.DEFAULT.order) + 100
 
 private fun JSONArray.toStringList(): List<String> =
-    (0 until length()).mapNotNull { optString(it).takeIf { value -> value.isNotBlank() } }
+    (0 until length()).mapNotNull { stringOrDefault(it).takeIf { value -> value.isNotBlank() } }
 
 private inline fun <reified T : Enum<T>> JSONObject.optEnum(key: String, default: T): T =
-    enumValues<T>().firstOrNull { it.name == optString(key) } ?: default
+    enumValues<T>().firstOrNull { it.name == stringOrDefault(key) } ?: default

@@ -50,13 +50,13 @@ object EdgeGec {
     fun currentUnixTimestamp(): Double =
         System.currentTimeMillis() / 1000.0 + clockSkewSeconds
 
-    fun adjustClockFromServerDate(value: String?): Boolean {
-        if (value.isNullOrBlank()) return false
+    fun adjustClockFromServerDate(value: String?, localUnixSeconds: Double = System.currentTimeMillis() / 1000.0): Boolean {
+        if (value.isNullOrBlank() || !localUnixSeconds.isFinite()) return false
         val server = runCatching {
             ZonedDateTime.parse(value, DateTimeFormatter.RFC_1123_DATE_TIME).toEpochSecond()
         }.getOrNull() ?: return false
-        val client = currentUnixTimestamp()
-        clockSkewSeconds += server - client
+        // Assign an absolute offset; concurrent 403 responses must not add the correction twice.
+        clockSkewSeconds = server - localUnixSeconds
         return true
     }
 

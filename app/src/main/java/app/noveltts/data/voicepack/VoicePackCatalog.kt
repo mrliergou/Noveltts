@@ -1,5 +1,6 @@
 package app.noveltts.data.voicepack
 
+import app.noveltts.data.JsonInput
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
@@ -28,7 +29,10 @@ object VoicePackCatalog {
         try {
             val code = connection.responseCode
             if (code !in 200..299) throw IOException("目录请求失败：HTTP $code")
-            val body = connection.inputStream.bufferedReader().use { it.readText() }
+            PackInput.checkLength(connection.contentLengthLong, PackInput.MAX_CATALOG_BYTES)
+            val body = connection.inputStream.use {
+                PackInput.readBytes(it, PackInput.MAX_CATALOG_BYTES).toString(Charsets.UTF_8)
+            }
             return parse(body)
         } finally {
             connection.disconnect()
@@ -36,7 +40,8 @@ object VoicePackCatalog {
     }
 
     fun parse(body: String): List<CatalogEntry> {
-        val trimmed = body.trim()
+        JsonInput.checkDepth(body)
+        val trimmed = body.removePrefix("\uFEFF").trim()
         val array = when {
             trimmed.startsWith("[") -> JSONArray(trimmed)
             else -> JSONObject(trimmed).optJSONArray("packs") ?: JSONArray()
@@ -59,27 +64,25 @@ object VoicePackCatalog {
             val total = connection.contentLengthLong.takeIf { it > 0 }
                 ?: entry.sizeBytes.takeIf { it > 0 }
                 ?: -1L
-            var received = 0L
-            connection.inputStream.use { input ->
+            PackInput.checkLength(total, PackInput.MAX_ARCHIVE_BYTES)
+            val received = connection.inputStream.use { input ->
                 FileOutputStream(dest).use { output ->
-                    val buffer = ByteArray(64 * 1024)
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read <= 0) break
-                        output.write(buffer, 0, read)
-                        received += read
-                        onProgress(received, total)
-                    }
+                    PackInput.copy(input, output, PackInput.MAX_ARCHIVE_BYTES) { onProgress(it, total) }
                 }
             }
             Log.i(TAG, "downloaded ${entry.id} (${received}B)")
+        } catch (error: Exception) {
+            dest.delete()
+            throw error
         } finally {
             connection.disconnect()
         }
     }
 
     private fun open(url: String): HttpURLConnection {
-        val connection = URL(url).openConnection() as HttpURLConnection
+        val address = URL(url)
+        if (address.protocol !in setOf("http", "https")) throw IOException("仅支持 HTTP / HTTPS 下载地址")
+        val connection = address.openConnection() as HttpURLConnection
         connection.connectTimeout = CONNECT_TIMEOUT_MS
         connection.readTimeout = READ_TIMEOUT_MS
         connection.instanceFollowRedirects = true

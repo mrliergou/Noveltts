@@ -27,6 +27,15 @@ class PlaybackForegroundService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var sessionId: String? = null
+    private val renewalHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val renewal = object : Runnable {
+        override fun run() {
+            if (PlaybackSession.activeCount() > 0 && app.noveltts.data.settings.SettingsStore(this@PlaybackForegroundService).keepAwake) {
+                acquireWakeLock()
+                renewalHandler.postDelayed(this, 10 * 60 * 1000L)
+            } else releaseLocks()
+        }
+    }
     private val stopReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == PlaybackSession.ACTION_STOP_SYNTHESIS)
@@ -41,7 +50,7 @@ class PlaybackForegroundService : Service() {
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(stopReceiver,
             IntentFilter(PlaybackSession.ACTION_STOP_SYNTHESIS), Context.RECEIVER_NOT_EXPORTED)
         else @Suppress("UnspecifiedRegisterReceiverFlag") registerReceiver(stopReceiver,
-            IntentFilter(PlaybackSession.ACTION_STOP_SYNTHESIS))
+            IntentFilter(PlaybackSession.ACTION_STOP_SYNTHESIS), app.noveltts.data.voicepack.VoicePackEvents.INTERNAL_PERMISSION, null)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -54,7 +63,11 @@ class PlaybackForegroundService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
-        acquireWakeLock()
+        renewalHandler.removeCallbacks(renewal)
+        if (app.noveltts.data.settings.SettingsStore(this).keepAwake) {
+            acquireWakeLock()
+            renewalHandler.postDelayed(renewal, 10 * 60 * 1000L)
+        } else { runCatching { wakeLock?.takeIf { it.isHeld }?.release() }; wakeLock = null }
         if (PlaybackSession.requiresNetwork()) acquireWifiLock()
         else { runCatching { wifiLock?.takeIf { it.isHeld }?.release() }; wifiLock = null }
         return START_NOT_STICKY
@@ -113,7 +126,7 @@ class PlaybackForegroundService : Service() {
     }
 
     private fun acquireWakeLock() {
-        // 锁带超时兜底，避免异常路径下永久持锁；长时间朗读由后续任务续期。
+        // A bounded lease is renewed only while an opted-in session remains active.
         val power = getSystemService(Context.POWER_SERVICE) as PowerManager
         val lock = wakeLock ?: power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG).also {
             it.setReferenceCounted(false)
@@ -133,6 +146,7 @@ class PlaybackForegroundService : Service() {
     }
 
     private fun releaseLocks() {
+        renewalHandler.removeCallbacks(renewal)
         runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
         wakeLock = null
         runCatching { wifiLock?.takeIf { it.isHeld }?.release() }

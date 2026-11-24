@@ -1,5 +1,7 @@
 package app.noveltts.data.config
 
+import app.noveltts.data.stringOrDefault
+
 import android.content.Context
 import app.noveltts.domain.ReplacementRule
 import app.noveltts.domain.RoleMatchScope
@@ -57,6 +59,27 @@ class RulesRepository(private val directory: File) {
         writeRoles(normalizeRoles(ruleSet))
     }
 
+    /** Merge one complete role against the current file while holding the configuration lock. */
+    fun upsertRole(rule: RoleRule, requireUniqueName: Boolean = false,
+        newGroup: RuleGroup? = null, expected: RoleRule? = null): RuleSet<RoleRule> = synchronized(LOCK) {
+        val current = loadRoles()
+        if (expected != null && current.items.firstOrNull { it.id == rule.id } != expected)
+            throw RulesStoreException("该角色已被修改或删除，草稿已保留，请刷新后重试")
+        if (requireUniqueName) require(current.items.none {
+            it.id != rule.id && it.name.trim().equals(rule.name.trim(), ignoreCase = true)
+        }) { "已有同名角色" }
+        val groups = groupsWithNew(current.groups, newGroup)
+        val knownGroups = groups.mapTo(HashSet()) { it.id }
+        val groupId = (newGroup?.id ?: rule.groupId).takeIf { it in knownGroups } ?: RuleGroup.DEFAULT_ID
+        val existing = current.items.firstOrNull { it.id == rule.id }
+        val sortIndex = existing?.takeIf { it.groupId == groupId }?.sortIndex
+            ?: ((current.items.filter { it.groupId == groupId }.maxOfOrNull { it.sortIndex } ?: -1) + 1)
+        val saved = normalizeRoles(current.copy(groups = groups, items = current.items.filterNot { it.id == rule.id } +
+            rule.copy(groupId = groupId, sortIndex = sortIndex)))
+        writeRoles(saved)
+        saved
+    }
+
     fun loadReplacements(): RuleSet<ReplacementRule> = synchronized(LOCK) {
         val root = readRoot(REPLACEMENTS_FILE) ?: return RuleSet()
         val schema = schemaOf(root, REPLACEMENTS_FILE)
@@ -78,6 +101,29 @@ class RulesRepository(private val directory: File) {
     fun saveReplacements(ruleSet: RuleSet<ReplacementRule>) = synchronized(LOCK) {
         writeReplacements(normalizeReplacements(ruleSet))
     }
+
+    /** Save one replacement without overwriting other rules restored since the editor opened. */
+    fun upsertReplacement(rule: ReplacementRule, newGroup: RuleGroup? = null, expected: ReplacementRule? = null): RuleSet<ReplacementRule> = synchronized(LOCK) {
+        val current = loadReplacements()
+        if (expected != null && current.items.firstOrNull { it.id == rule.id } != expected)
+            throw RulesStoreException("该替换规则已被修改或删除，草稿已保留，请刷新后重试")
+        val groups = groupsWithNew(current.groups, newGroup)
+        val knownGroups = groups.mapTo(HashSet()) { it.id }
+        val groupId = (newGroup?.id ?: rule.groupId).takeIf { it in knownGroups } ?: RuleGroup.DEFAULT_ID
+        val groupItems = current.items.filter { it.groupId == groupId && it.id != rule.id }
+            .sortedBy { it.sortIndex }.toMutableList()
+        groupItems.add(rule.sortIndex.coerceIn(0, groupItems.size), rule.copy(groupId = groupId))
+        val reordered = groupItems.mapIndexed { index, item -> item.copy(sortIndex = index) }
+        val saved = normalizeReplacements(RuleSet(groups,
+            current.items.filterNot { it.id == rule.id || it.groupId == groupId } + reordered))
+        writeReplacements(saved)
+        saved
+    }
+
+    /** Existing group metadata wins if another writer already created the draft's group ID. */
+    private fun groupsWithNew(groups: List<RuleGroup>, newGroup: RuleGroup?): List<RuleGroup> =
+        if (newGroup == null || groups.any { it.id == newGroup.id }) groups
+        else groups + newGroup.copy(order = nextRuleGroupOrder(groups))
 
     fun recoveryCandidates(): List<RuleRecoveryCandidate> = synchronized(LOCK) { RuleRecovery.list(directory) }
     fun <T> withConfigurationLock(block: () -> T): T = synchronized(LOCK, block)
@@ -137,21 +183,21 @@ class RulesRepository(private val directory: File) {
     // ---- 解码 ---------------------------------------------------------------
 
     private fun decodeRole(item: JSONObject, index: Int, schema: Int): RoleRule? {
-        val pattern = item.optString("pattern")
+        val pattern = item.stringOrDefault("pattern")
         if (pattern.isBlank()) return null
-        val name = item.optString("name").trim()
-        val legacyVoice = item.optString("voiceId").takeIf { it.isNotBlank() }
+        val name = item.stringOrDefault("name").trim()
+        val legacyVoice = item.stringOrDefault("voiceId").takeIf { it.isNotBlank() }
         val voiceIds = if (schema >= 2) item.optJSONArray("voiceIds")?.toStringList() else null
         val priority = item.optInt("priority", 100)
         return RoleRule(
-            id = item.optString("id").ifBlank { name.ifBlank { "role-$index" } },
+            id = item.stringOrDefault("id").ifBlank { name.ifBlank { "role-$index" } },
             name = name.ifBlank { pattern },
             pattern = pattern,
             voiceIds = voiceIds ?: listOfNotNull(legacyVoice),
             priority = priority,
             onlyDialogue = item.optBoolean("onlyDialogue", true),
             enabled = item.optBoolean("enabled", true),
-            groupId = if (schema >= 2) item.optString("groupId") else RuleGroup.DEFAULT_ID,
+            groupId = if (schema >= 2) item.stringOrDefault("groupId") else RuleGroup.DEFAULT_ID,
             matchMode = item.optEnum("matchMode", RoleMatchMode.REGEX_CONTAINS),
             voiceSelectionMode = item.optEnum("voiceSelectionMode", VoiceSelectionMode.FIXED),
             matchScope = item.optEnum("matchScope", RoleMatchScope.SEGMENT),
@@ -164,20 +210,20 @@ class RulesRepository(private val directory: File) {
     }
 
     private fun decodeReplacement(item: JSONObject, index: Int, schema: Int): ReplacementRule? {
-        val find = item.optString("find")
+        val find = item.stringOrDefault("find")
         if (find.isEmpty()) return null
         return ReplacementRule(
-            id = item.optString("id").ifBlank { "replacement-$index" },
-            name = item.optString("name").ifBlank { find },
+            id = item.stringOrDefault("id").ifBlank { "replacement-$index" },
+            name = item.stringOrDefault("name").ifBlank { find },
             find = find,
-            replaceWith = item.optString("replaceWith"),
+            replaceWith = item.stringOrDefault("replaceWith"),
             isRegex = item.optBoolean("isRegex", false),
             scope = item.optEnum("scope", ReplacementScope.ALL),
-            targetRoleId = item.optString("targetRoleId"),
+            targetRoleId = item.stringOrDefault("targetRoleId"),
             enabled = item.optBoolean("enabled", true),
             order = item.optInt("order", 100),
             sortIndex = item.optInt("sortIndex", index),
-            groupId = if (schema >= 2) item.optString("groupId") else RuleGroup.DEFAULT_ID,
+            groupId = if (schema >= 2) item.stringOrDefault("groupId") else RuleGroup.DEFAULT_ID,
         )
     }
 
@@ -185,10 +231,10 @@ class RulesRepository(private val directory: File) {
         val array = root.optJSONArray("groups") ?: return emptyList()
         return (0 until array.length()).mapNotNull { index ->
             val item = array.optJSONObject(index) ?: return@mapNotNull null
-            val id = item.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val id = item.stringOrDefault("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             RuleGroup(
                 id = id,
-                name = item.optString("name").ifBlank {
+                name = item.stringOrDefault("name").ifBlank {
                     if (id == RuleGroup.DEFAULT_ID) RuleGroup.DEFAULT.name else id
                 },
                 enabled = item.optBoolean("enabled", true),
@@ -360,7 +406,7 @@ class RulesRepository(private val directory: File) {
         directory.mkdirs()
         val temp = File.createTempFile("$name.", ".tmp", directory)
         try {
-            temp.writeText(root.toString(2))
+            java.io.FileOutputStream(temp).use { it.write(root.toString(2).toByteArray(Charsets.UTF_8)); it.fd.sync() }
             val verified = JSONObject(temp.readText())
             check(verified.optInt("schema") == SCHEMA && verified.optJSONArray("items") != null) {
                 "临时文件校验失败"
@@ -391,7 +437,7 @@ private inline fun <T> List<T>.reindexed(transform: (T, Int) -> T): List<T> =
     mapIndexed { index, item -> transform(item, index) }
 
 private fun JSONArray.toStringList(): List<String> =
-    (0 until length()).mapNotNull { optString(it).takeIf { value -> value.isNotBlank() } }
+    (0 until length()).mapNotNull { stringOrDefault(it).takeIf { value -> value.isNotBlank() } }
 
 private inline fun <reified T : Enum<T>> JSONObject.optEnum(key: String, default: T): T =
-    enumValues<T>().firstOrNull { it.name == optString(key) } ?: default
+    enumValues<T>().firstOrNull { it.name == stringOrDefault(key) } ?: default

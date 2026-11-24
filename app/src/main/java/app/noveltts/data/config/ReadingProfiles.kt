@@ -1,5 +1,7 @@
 package app.noveltts.data.config
 
+import app.noveltts.data.stringOrDefault
+
 import app.noveltts.data.voicepack.VoiceDescriptor
 import app.noveltts.domain.BuiltInRoleSettings
 import app.noveltts.domain.RolePlaybackSettings
@@ -65,7 +67,7 @@ object ReadingProfiles {
             val id = item.getString("id").take(100)
             val name = item.getString("name").trim().take(60)
             require(id.isNotBlank() && seen.add(id) && name.isNotBlank()) { "阅读方案标识或名称无效" }
-            ReadingProfile(id, name, item.optString("narratorVoice"), item.optString("dialogueVoice"), item.optString("systemVoice"),
+            ReadingProfile(id, name, item.stringOrDefault("narratorVoice"), item.stringOrDefault("dialogueVoice"), item.stringOrDefault("systemVoice"),
                 strings(item.optJSONArray("roleGroups")), strings(item.optJSONArray("replacementGroups")),
                 item.optInt("speed", 50).coerceIn(0, 100), item.optInt("pitch", 25).coerceIn(0, 100), item.optInt("volume", 50).coerceIn(0, 100),
                 item.optBoolean("punctuationFilter", true), item.optInt("silenceMs", 80).coerceIn(0, 2000),

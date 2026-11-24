@@ -59,17 +59,23 @@ internal fun PackVoicesSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
     var query by rememberSaveable { mutableStateOf("") }
+    var localeFilter by rememberSaveable { mutableStateOf("") }
+    var genderFilter by rememberSaveable { mutableStateOf(-2) }
     var filter by rememberSaveable { mutableStateOf(VoiceFilter.ALL) }
+    var editingId by rememberSaveable { mutableStateOf<String?>(null) }
 
     val voices = remember(state.voices, pack.id) { state.voices.filter { it.packId == pack.id } }
-    val visible = remember(voices, query, filter) {
+    val visible = remember(voices, query, filter, localeFilter, genderFilter) {
         voices.filter { voice ->
             val matchesFilter = when (filter) {
                 VoiceFilter.ALL -> true
                 VoiceFilter.ONLINE -> voice.isOnline
                 VoiceFilter.OFFLINE -> voice.isOffline
+                VoiceFilter.FAVORITES -> voice.favorite
             }
-            matchesFilter && voice.matchesQuery(query)
+            matchesFilter && voice.matchesQuery(query) &&
+                (localeFilter.isEmpty() || voice.localeTag == localeFilter) &&
+                (genderFilter == -2 || if (genderFilter == -1) voice.gender !in 1..2 else voice.gender == genderFilter)
         }
     }
     // 按引擎分组：组顺序取音色原始出现顺序，组内可用优先、再按名称。
@@ -85,6 +91,9 @@ internal fun PackVoicesSheet(
         scope.launch { sheetState.hide() }.invokeOnCompletion { onDismiss() }
     }
 
+    voices.firstOrNull { it.systemName == editingId }?.let { voice ->
+        VoiceOverrideEditor(voice, state.voiceOverrides[voice.systemName], viewModel) { editingId = null }
+    }
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
         LazyColumn(
             modifier = Modifier.fillMaxWidth(),
@@ -116,10 +125,22 @@ internal fun PackVoicesSheet(
                     onSelect = { filter = it },
                 )
             }
+            item(key = "locale-filter") {
+                FilterChipRow(options = listOf("" to "全部语言") + voices.map { it.localeTag }.distinct().sorted().map { it to it }, selected = localeFilter, onSelect = { localeFilter = it })
+            }
+            item(key = "gender-filter") {
+                FilterChipRow(options = listOf(-2 to "全部性别", 1 to "男声", 2 to "女声", -1 to "未知"), selected = genderFilter, onSelect = { genderFilter = it })
+            }
             item(key = "count") {
-                if (state.previewVoiceId != null || state.statusMessage.startsWith("试听失败")) {
-                    Text(state.statusMessage, style = MaterialTheme.typography.bodySmall, color = Ink)
-                }
+                // 试听状态固定占一行：出现或消失时不让整个列表上下错位。
+                Text(
+                    text = state.previewError ?: state.statusMessage.takeIf { state.previewVoiceId != null }.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Ink,
+                    minLines = 1,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                )
                 Text(
                     text = "${visible.size} / ${voices.size} 个音色" +
                         if (unlisted > 0) "，另有 $unlisted 个所属引擎未支持" else "",
@@ -155,6 +176,9 @@ internal fun PackVoicesSheet(
                             onPreview = togglePreview.takeIf { voice.usable },
                             playing = playing,
                         )
+                        TextButton(onClick = { editingId = voice.systemName }, enabled = state.voiceOverridesError == null) {
+                            Text((if (voice.favorite) "已收藏 · " else "") + "配置别名、启停和默认倍率")
+                        }
                     }
                 }
             }

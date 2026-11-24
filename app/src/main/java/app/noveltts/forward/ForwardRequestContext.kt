@@ -1,6 +1,7 @@
 package app.noveltts.forward
 
 import app.noveltts.engine.api.SynthesisHandle
+import java.io.InputStream
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -20,6 +21,22 @@ internal class ForwardRequestContext(
     private val started = AtomicBoolean()
     var onSynthesisStart: () -> Unit = {}
     val isFinished: Boolean get() = completed.get() || failure.get() != null
+
+    /** Check elapsed time even while a peer keeps sending data below the socket idle timeout. */
+    fun guardInput(input: InputStream): InputStream = object : InputStream() {
+        override fun read(): Int {
+            ensureActive()
+            val value = input.read()
+            ensureActive()
+            return value
+        }
+        override fun read(bytes: ByteArray, offset: Int, length: Int): Int {
+            ensureActive()
+            val count = input.read(bytes, offset, length)
+            ensureActive()
+            return count
+        }
+    }
 
     fun attach(value: SynthesisHandle) {
         handle.set(value)

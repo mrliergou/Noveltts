@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -59,6 +58,13 @@ private const val MAX_CUSTOM_ROLE_ROWS = 6
 
 @Composable
 fun WorkbenchPage(state: MainUiState, viewModel: MainViewModel) {
+    var confirmSample by remember { mutableStateOf(false) }
+    if (confirmSample) app.noveltts.ui.common.ConfirmDialog(
+        title = "替换为示例文本？", message = "当前工作台文本将被示例替换。",
+        confirmLabel = "替换", dangerous = true,
+        onConfirm = { confirmSample = false; viewModel.updateText(SampleTexts.random(exclude = state.text)) },
+        onDismiss = { confirmSample = false },
+    )
     val rolesEditable = state.rolesLoadError == null
     var sheetTarget by rememberSaveable(stateSaver = RoleSheetTarget.Saver) { mutableStateOf<RoleSheetTarget?>(null) }
     val disabledGroups = remember(state.roleGroups) { state.roleGroups.filterNot { it.enabled }.mapTo(HashSet()) { it.id } }
@@ -72,6 +78,11 @@ fun WorkbenchPage(state: MainUiState, viewModel: MainViewModel) {
             compareBy<RoleRule> { groupOrder[it.groupId] ?: Int.MAX_VALUE }.thenBy { it.sortIndex },
         )
     }
+    var onlyUncertain by rememberSaveable { mutableStateOf(false) }
+    val uncertainCount = state.preview.count { it.uncertain }
+    // 不确定的片段清零后筛选自动关闭，避免列表空着又没有恢复入口，也避免下次悄悄只显示一部分。
+    if (onlyUncertain && uncertainCount == 0 && !state.previewBusy) onlyUncertain = false
+    val showOnlyUncertain = onlyUncertain && uncertainCount > 0
     val voiceLabel: (String?) -> String = { id ->
         if (id.isNullOrBlank()) "未选择" else voiceNames[id] ?: "音色不可用"
     }
@@ -111,6 +122,7 @@ fun WorkbenchPage(state: MainUiState, viewModel: MainViewModel) {
                     SliderRow(AppIcon.SPEED, "语速", "慢", "快", state.speed, viewModel::updateSpeed)
                     SliderRow(AppIcon.VOLUME, "音量", "轻", "响", state.volume, viewModel::updateVolume)
                     SliderRow(AppIcon.TUNE, "音调", "低", "高", state.pitch, viewModel::updatePitch)
+                    Text("最终倍率：全局 × 角色 × 音色默认值；语速 0.25–4，音调 0.25–2，音量 0–1。实际请求值见诊断日志。", style = MaterialTheme.typography.labelSmall, color = Muted)
                 }
             }
         }
@@ -118,7 +130,9 @@ fun WorkbenchPage(state: MainUiState, viewModel: MainViewModel) {
         item(key = "input") { Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("试听文本", fontWeight = FontWeight.SemiBold, color = Ink, modifier = Modifier.weight(1f))
-            TextButton(onClick = { viewModel.updateText(SampleTexts.random(exclude = state.text)) }) {
+            TextButton(onClick = {
+                if (state.text.isBlank()) viewModel.updateText(SampleTexts.random()) else confirmSample = true
+            }) {
                 AppIconGlyph(AppIcon.TEXT, size = 16.dp)
                 Spacer(Modifier.width(4.dp))
                 Text("填入示例")
@@ -181,7 +195,7 @@ fun WorkbenchPage(state: MainUiState, viewModel: MainViewModel) {
                 name = rule.name,
                 voiceLabel = voiceLabel(rule.primaryVoiceId) + if (voiceCount > 1) " 等 $voiceCount 个" else "",
                 summary = rolePlaybackSummary(rule.speechRate, rule.speechPitch, rule.speechVolume),
-                matchLabel = "匹配「${literalKeyword(rule) ?: rule.pattern}」" +
+                matchLabel = roleMatchLabel(rule) +
                     if (rule.groupId in disabledGroups) " · 所在分组已停用，不会生效" else "",
                 roleEnabled = rule.enabled,
                 editable = rolesEditable,
@@ -201,12 +215,22 @@ fun WorkbenchPage(state: MainUiState, viewModel: MainViewModel) {
 
         item(key = "preview-title") {
         SectionTitle(if (state.previewBusy) "正在更新分段预览…" else "分段预览（${state.preview.size}）")
-        if (state.isSpeaking && state.totalSegments > 0) SegmentProgress(state)
+        if (uncertainCount > 0) {
+            TextButton(onClick = { onlyUncertain = !onlyUncertain }) {
+                AppIconGlyph(if (onlyUncertain) AppIcon.CLOSE else AppIcon.INFO, size = 16.dp, tint = Accent)
+                Spacer(Modifier.width(4.dp))
+                Text(if (onlyUncertain) "已筛出 $uncertainCount 段不确定 · 显示全部" else "$uncertainCount 段不确定 · 只看这些")
+            }
+        }
+        // 暂停时也保留进度行：朗读中点试听会先暂停，进度行进出布局会让下面的预览列表整体错位。
+        if ((state.isSpeaking || state.isPaused) && state.totalSegments > 0) SegmentProgress(state)
         }
         if (state.preview.isEmpty()) {
             item(key = "empty") { EmptyState("输入文本后，这里会显示旁白与对话的分段结果。") }
         } else {
-            itemsIndexed(state.preview, key = { _, segment -> segment.id }) { index, segment ->
+            // 筛选只影响显示哪些行；序号、试听与播放高亮一律用完整预览里的原始下标。
+            val shown = state.preview.withIndex().filter { !showOnlyUncertain || it.value.uncertain }
+            items(shown, key = { it.value.id }) { (index, segment) ->
                 PreviewRow(
                     segment = segment,
                     index = index,
@@ -247,7 +271,7 @@ fun WorkbenchPage(state: MainUiState, viewModel: MainViewModel) {
             roles = state.roles,
             onDismiss = { viewModel.stopPreview(); advancedRule = null },
             onSaveRole = { edited, newGroup ->
-                val saved = withContext(Dispatchers.IO) { viewModel.saveRole(edited, newGroup) }
+                val saved = withContext(Dispatchers.IO) { viewModel.saveRole(edited, newGroup, rule) }
                 if (saved) { viewModel.clearRuleDraft(RulesKind.ROLE); viewModel.stopPreview(); advancedRule = null }
                 saved
             },
@@ -257,7 +281,7 @@ fun WorkbenchPage(state: MainUiState, viewModel: MainViewModel) {
             onPreviewVoice = { voice -> viewModel.previewVoice(voice) },
             onStopPreview = viewModel::stopPreview,
             onRoleDraftChange = viewModel::rememberRoleDraft,
-            onReplacementDraftChange = { _, _, _ -> },
+            onReplacementDraftChange = { _, _, _, _ -> },
             onDiscardDraft = { viewModel.clearRuleDraft(RulesKind.ROLE) },
         )
     }
@@ -281,6 +305,8 @@ private fun SegmentProgress(state: MainUiState) {
         text = segmentProgressLabel(state),
         style = MaterialTheme.typography.labelSmall,
         color = Muted,
+        maxLines = 1,
+        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
     )
 }
 

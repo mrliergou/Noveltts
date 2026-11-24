@@ -24,12 +24,13 @@ class CacheReadLease internal constructor(
 }
 
 /** PCM16 cache. All instances and manual cleanup share protection for active files. */
-class AudioCache(val dir: File, @Volatile var maxBytes: Long, @Volatile var enabled: Boolean = true) {
+class AudioCache(
+    val dir: File, @Volatile var maxBytes: Long, @Volatile var enabled: Boolean = true,
+    private val nowMillis: () -> Long = { System.nanoTime() / 1_000_000L },
+) {
     private val lock = ActiveAudioFiles.lock
     private val pending = mutableMapOf<File, AutoCloseable>()
     private val rootKey = dir.canonicalPath
-    private var lastTrimMs = 0L
-    private var addedSinceTrim = 0L
 
     fun lookup(key: String): File? = synchronized(lock) {
         val file = fileFor(key)
@@ -67,16 +68,22 @@ class AudioCache(val dir: File, @Volatile var maxBytes: Long, @Volatile var enab
         try {
             if (!enabled || tmp.length() <= 0L || tmp.length() % 2L != 0L) return@synchronized false
             val target = fileFor(key)
-            addedSinceTrim += tmp.length()
+            val growth = (tmp.length() - target.length()).coerceAtLeast(0L)
             // Preserve an existing reader's file; two complete writers may safely share the first result.
             if (ActiveAudioFiles.isProtected(target)) return@synchronized false
-            runCatching {
+            val committed = runCatching {
                 try { Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE,
                     StandardCopyOption.REPLACE_EXISTING) }
                 catch (_: java.nio.file.AtomicMoveNotSupportedException) {
                     Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
                 }
             }.isSuccess
+            if (committed) {
+                val state = trimStates.getOrPut(rootKey) { TrimState() }
+                // Keep a conservative count across every cache instance; deletion only overestimates it.
+                state.bytes = state.bytes?.let { it + growth }
+            }
+            committed
         } finally { protection.close(); if (tmp.exists()) tmp.delete() }
     }
 
@@ -90,17 +97,22 @@ class AudioCache(val dir: File, @Volatile var maxBytes: Long, @Volatile var enab
     fun totalBytes(): Long = synchronized(lock) { cacheFiles().sumOf { it.length() } }
 
     fun evictIfNeeded(force: Boolean = true) = synchronized(lock) {
-        val now = System.nanoTime() / 1_000_000
-        if (!force && now - lastTrimMs < 1000 && addedSinceTrim < (maxBytes / 8).coerceAtLeast(1L)) return@synchronized
-        lastTrimMs = now
-        addedSinceTrim = 0L
-        val files = cacheFiles()
-        var bytes = files.sumOf { it.length() }
-        for (file in files.sortedWith(compareBy({ it.lastModified() }, { it.name }))) {
-            if (bytes <= maxBytes.coerceAtLeast(0L)) break
-            val size = file.length()
-            if (ActiveAudioFiles.deleteIfIdle(file)) bytes -= size
+        val now = nowMillis()
+        val limit = maxBytes.coerceAtLeast(0L)
+        val state = trimStates.getOrPut(rootKey) { TrimState() }
+        val previousScan = state.scannedAt
+        if (!force && previousScan != null && now - previousScan < RESCAN_INTERVAL_MILLIS &&
+            state.bytes?.let { it <= limit } == true) return@synchronized
+        val files = cacheFiles().map { EvictionEntry(it, it.length(), it.lastModified()) }
+        var bytes = files.sumOf { it.bytes }
+        if (bytes > limit) {
+            for (entry in files.sortedWith(compareBy({ it.modified }, { it.file.name }))) {
+                if (bytes <= limit) break
+                if (ActiveAudioFiles.deleteIfIdle(entry.file)) bytes -= entry.bytes
+            }
         }
+        state.scannedAt = now
+        state.bytes = bytes
     }
 
     private fun fileFor(key: String): File {
@@ -121,6 +133,10 @@ class AudioCache(val dir: File, @Volatile var maxBytes: Long, @Volatile var enab
 
     companion object {
         const val DIR_NAME = "audiocache"
+        private const val RESCAN_INTERVAL_MILLIS = 30_000L
+        private data class TrimState(var bytes: Long? = null, var scannedAt: Long? = null)
+        private data class EvictionEntry(val file: File, val bytes: Long, val modified: Long)
+        private val trimStates = mutableMapOf<String, TrimState>()
         private val metrics = mutableMapOf<String, CacheMetrics>()
         fun metrics(dir: File): CacheMetrics = synchronized(ActiveAudioFiles.lock) {
             metrics[dir.canonicalPath] ?: CacheMetrics()

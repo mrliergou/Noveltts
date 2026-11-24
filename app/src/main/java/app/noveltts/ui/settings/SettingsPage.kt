@@ -43,10 +43,13 @@ fun SettingsPage(
     onOpenSystemSpeechSettings: () -> Unit,
     openIntegration: Boolean = false,
     openDetail: String? = null,
+    onOpenConsumed: () -> Unit = {},
     backEnabled: Boolean = true,
 ) {
     var opened by rememberSaveable { mutableStateOf<String?>(if (openIntegration) SettingsDetailPage.INTEGRATION.name else null) }
-    LaunchedEffect(openDetail) { if (SettingsDetailPage.entries.any { it.name == openDetail }) opened = openDetail }
+    LaunchedEffect(openDetail) {
+        if (SettingsDetailPage.entries.any { it.name == openDetail }) { opened = openDetail; onOpenConsumed() }
+    }
     BackHandler(enabled = backEnabled && opened != null) { opened = null }
     val page = SettingsDetailPage.entries.firstOrNull { it.name == opened }
     if (page == null) {

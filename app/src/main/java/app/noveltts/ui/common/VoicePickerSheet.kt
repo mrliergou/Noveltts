@@ -44,6 +44,7 @@ internal enum class VoiceFilter(val label: String) {
     ALL("全部"),
     ONLINE("在线"),
     OFFLINE("离线"),
+    FAVORITES("收藏"),
 }
 
 /** 记住上次的筛选条件：弹窗关闭后重开仍是同一筛选，避免每次都回到「全部」。 */
@@ -70,21 +71,27 @@ fun VoicePickerSheet(
     onStopPreview: (() -> Unit)? = null,
     previewVoiceId: String? = null,
     previewStatus: String = "",
+    previewError: String? = null,
 ) {
     DisposableEffect(Unit) { onDispose { onStopPreview?.invoke() } }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
     var query by rememberSaveable { mutableStateOf("") }
+    var localeFilter by rememberSaveable { mutableStateOf("") }
+    var genderFilter by rememberSaveable { mutableStateOf(-2) }
     var filter by rememberSaveable { mutableStateOf(VoicePickerMemory.filter) }
 
-    val visible = remember(voices, query, filter) {
+    val visible = remember(voices, query, filter, localeFilter, genderFilter) {
         voices.filter { voice ->
             val matchesFilter = when (filter) {
                 VoiceFilter.ALL -> true
                 VoiceFilter.ONLINE -> voice.isOnline
                 VoiceFilter.OFFLINE -> voice.isOffline
+                VoiceFilter.FAVORITES -> voice.favorite
             }
-            matchesFilter && voice.matchesQuery(query)
+            matchesFilter && voice.matchesQuery(query) &&
+                (localeFilter.isEmpty() || voice.localeTag == localeFilter) &&
+                (genderFilter == -2 || if (genderFilter == -1) voice.gender !in 1..2 else voice.gender == genderFilter)
         }
     }
     // 按语音包分组：组顺序取音色原始出现顺序，组内「当前」置顶、可用优先、再按名称。
@@ -95,6 +102,7 @@ fun VoicePickerSheet(
                 .sortedWith(
                     compareByDescending<VoiceDescriptor> { it.systemName == selectedId }
                         .thenByDescending { it.usable }
+                        .thenByDescending { it.favorite }
                         .thenBy { it.displayName },
                 )
         }
@@ -138,12 +146,21 @@ fun VoicePickerSheet(
                     },
                 )
             }
+            item(key = "locale-filter") {
+                FilterChipRow(options = listOf("" to "全部语言") + voices.map { it.localeTag }.distinct().sorted().map { it to it }, selected = localeFilter, onSelect = { localeFilter = it })
+            }
+            item(key = "gender-filter") {
+                FilterChipRow(options = listOf(-2 to "全部性别", 1 to "男声", 2 to "女声", -1 to "未知"), selected = genderFilter, onSelect = { genderFilter = it })
+            }
             item(key = "count") {
-                if (previewVoiceId != null) Text(previewStatus, style = MaterialTheme.typography.bodySmall, color = Ink)
+                // 试听状态并进计数行：单独一行的话，试听开始/结束时整个列表会上下错一行。
                 Text(
-                    text = "${visible.size} / ${voices.size} 个音色",
+                    text = "${visible.size} / ${voices.size} 个音色" +
+                        if (previewVoiceId != null || previewError != null) " · ${previewError ?: previewStatus}" else "",
                     style = MaterialTheme.typography.labelSmall,
                     color = Muted,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 )
             }
             if (visible.isEmpty()) {
@@ -261,6 +278,6 @@ internal fun VoiceOptionCard(
 internal fun VoiceDescriptor.matchesQuery(query: String): Boolean {
     val needle = query.trim()
     if (needle.isEmpty()) return true
-    return listOf(displayName, packName, engineCode, voiceCode, systemName)
+    return listOf(displayName, packName, engineCode, voiceCode, systemName, localeTag, when (gender) { 2 -> "女 female"; 1 -> "男 male"; else -> "未知" })
         .any { it.contains(needle, ignoreCase = true) }
 }

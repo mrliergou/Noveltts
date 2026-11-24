@@ -1,5 +1,7 @@
 package app.noveltts.data.voicepack
 
+import app.noveltts.data.stringOrDefault
+
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -31,13 +33,13 @@ data class PackEngine(
 
     companion object {
         fun fromJson(json: JSONObject): PackEngine? {
-            val code = json.optString("code").trim()
+            val code = json.stringOrDefault("code").trim()
             if (code.isEmpty()) return null
             return PackEngine(
                 code = code,
-                name = json.optString("name", code).ifBlank { code },
-                type = json.optString("type", "inner"),
-                note = json.optString("note"),
+                name = json.stringOrDefault("name", code).ifBlank { code },
+                type = json.stringOrDefault("type", "inner"),
+                note = json.stringOrDefault("note"),
                 supported = json.optBoolean("supported", code == "edgetts" || code == "microsoft"),
             )
         }
@@ -93,24 +95,24 @@ data class PackVoice(
 
     companion object {
         fun fromJson(json: JSONObject): PackVoice = PackVoice(
-            id = json.optString("id").ifBlank { json.optString("name") },
-            name = json.optString("name", json.optString("id")),
-            locale = json.optString("locale", "zh-CN"),
-            engine = json.optString("engine").takeIf { it.isNotBlank() },
-            voiceName = json.optString("voiceName").takeIf { it.isNotBlank() },
+            id = json.stringOrDefault("id").ifBlank { json.stringOrDefault("name") },
+            name = json.stringOrDefault("name", json.stringOrDefault("id")),
+            locale = json.stringOrDefault("locale", "zh-CN"),
+            engine = json.stringOrDefault("engine").takeIf { it.isNotBlank() },
+            voiceName = json.stringOrDefault("voiceName").takeIf { it.isNotBlank() },
             requiresNetwork = json.optBoolean("requiresNetwork", false),
-            engineCode = json.optString("engineCode").takeIf { it.isNotBlank() },
-            code = json.optString("code").ifBlank { json.optString("id") },
-            param = json.optString("param", json.optString("voiceName")),
+            engineCode = json.stringOrDefault("engineCode").takeIf { it.isNotBlank() },
+            code = json.stringOrDefault("code").ifBlank { json.stringOrDefault("id") },
+            param = json.stringOrDefault("param", json.stringOrDefault("voiceName")),
             gender = json.optInt("gender", -1),
             isOnline = json.optBoolean("isOnline", json.optBoolean("requiresNetwork", false)),
             sampleRate = json.optInt("sampleRate", 24_000),
             speed = json.optDouble("speed", 1.0).toFloat(),
             pitch = json.optDouble("pitch", 1.0).toFloat(),
             volume = json.optDouble("volume", 1.0).toFloat(),
-            description = json.optString("description"),
-            note = json.optString("note"),
-            avatar = json.optString("avatar"),
+            description = json.stringOrDefault("description"),
+            note = json.stringOrDefault("note"),
+            avatar = json.stringOrDefault("avatar"),
         )
     }
 }
@@ -152,7 +154,7 @@ data class VoicePack(
 
         /** 解析 pack.json；id 非法或缺失时抛 [IllegalArgumentException]。 */
         fun fromJson(json: JSONObject): VoicePack {
-            val id = json.optString("id").trim()
+            val id = json.stringOrDefault("id").trim()
             require(isValidId(id)) { "pack.json 中的 id 非法：\"$id\"（仅允许字母、数字、. _ -）" }
             val voicesJson = json.optJSONArray("voices") ?: JSONArray()
             val voices = buildList {
@@ -163,14 +165,14 @@ data class VoicePack(
             }
             return VoicePack(
                 id = id,
-                name = json.optString("name", id).ifBlank { id },
-                version = json.optString("version", "1.0.0").ifBlank { "1.0.0" },
-                author = json.optString("author"),
-                description = json.optString("description"),
+                name = json.stringOrDefault("name", id).ifBlank { id },
+                version = json.stringOrDefault("version", "1.0.0").ifBlank { "1.0.0" },
+                author = json.stringOrDefault("author"),
+                description = json.stringOrDefault("description"),
                 voices = voices,
                 installedAt = json.optLong("installedAt", 0L),
-                sourceUrl = json.optString("sourceUrl").takeIf { it.isNotBlank() },
-                format = VoicePackFormat.fromStorage(json.optString("format")),
+                sourceUrl = json.stringOrDefault("sourceUrl").takeIf { it.isNotBlank() },
+                format = VoicePackFormat.fromStorage(json.stringOrDefault("format")),
                 engines = buildList {
                     val enginesJson = json.optJSONArray("engines") ?: JSONArray()
                     for (index in 0 until enginesJson.length()) {
@@ -198,17 +200,17 @@ data class CatalogEntry(
 ) {
     companion object {
         fun fromJson(json: JSONObject): CatalogEntry? {
-            val id = json.optString("id").trim()
-            val url = json.optString("url").trim()
+            val id = json.stringOrDefault("id").trim()
+            val url = json.stringOrDefault("url").trim()
             if (!VoicePack.isValidId(id) || url.isEmpty()) return null
             return CatalogEntry(
                 id = id,
-                name = json.optString("name", id).ifBlank { id },
-                version = json.optString("version", "1.0.0").ifBlank { "1.0.0" },
-                author = json.optString("author"),
-                description = json.optString("description"),
+                name = json.stringOrDefault("name", id).ifBlank { id },
+                version = json.stringOrDefault("version", "1.0.0").ifBlank { "1.0.0" },
+                author = json.stringOrDefault("author"),
+                description = json.stringOrDefault("description"),
                 url = url,
-                sha256 = json.optString("sha256").takeIf { it.isNotBlank() },
+                sha256 = json.stringOrDefault("sha256").takeIf { it.isNotBlank() },
                 sizeBytes = json.optLong("sizeBytes", 0L),
                 voiceCount = json.optInt("voiceCount", 0),
             )

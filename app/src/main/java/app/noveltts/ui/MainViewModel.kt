@@ -12,6 +12,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -19,6 +20,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import app.noveltts.audio.BgmPlayer
 import app.noveltts.data.backup.BackupCredentials
 import app.noveltts.data.backup.BackupManager
@@ -36,6 +39,8 @@ import app.noveltts.data.config.RuleEditorDraft
 import app.noveltts.data.config.RulesImportPreview
 import app.noveltts.data.config.RuleImportStrategy
 import app.noveltts.data.config.RulesKind
+import app.noveltts.data.config.RuleMutations
+import app.noveltts.data.config.RulesImportApplyResult
 import app.noveltts.data.config.RulesRepository
 import app.noveltts.data.config.RulesStoreException
 import app.noveltts.data.config.normalizeRuleGroups
@@ -63,6 +68,9 @@ import app.noveltts.domain.RuleGroup
 import app.noveltts.domain.RuleSet
 import app.noveltts.domain.SynthesisPlanBuilder
 import app.noveltts.domain.TextPipeline
+import app.noveltts.domain.AttributionKind
+import app.noveltts.domain.RoleAliases
+import app.noveltts.domain.UnattributedPolicy
 import app.noveltts.domain.RuleValidation
 import app.noveltts.engine.EngineManager
 import app.noveltts.engine.MultiSegmentSynthesizer
@@ -91,6 +99,8 @@ enum class AppSection(val label: String) {
 }
 
 internal const val PACK_BUSY_IMPORT = "import"
+data class PackUpdatePreview(val name: String, val previousVersion: String, val nextVersion: String,
+    val linkedRoles: Int, val linkedDefaults: Int)
 
 data class PreviewSegment(
     val text: String,
@@ -100,6 +110,8 @@ data class PreviewSegment(
     val roleName: String?,
     val id: String = "",
     val explanation: String = "",
+    /** 已配角色但依据不够确定，需要用户核对。 */
+    val uncertain: Boolean = false,
 )
 
 data class MainUiState(
@@ -113,6 +125,14 @@ data class MainUiState(
     val systemVoiceId: String = "",
     val voices: List<VoiceDescriptor> = emptyList(),
     val packs: List<VoicePack> = emptyList(),
+    val packProblems: List<String> = emptyList(),
+    val pendingPackUpdate: PackUpdatePreview? = null,
+    val firstSegmentEnabled: Boolean = false,
+    val firstSegmentReady: Boolean = false,
+    val engineHealth: Map<String, app.noveltts.engine.EngineHealthResult> = emptyMap(),
+    val voiceOverrides: Map<String, app.noveltts.data.voicepack.VoiceOverride> = emptyMap(),
+    val voiceOverridesError: String? = null,
+    val recoveryWarning: String? = null,
     val roles: List<RoleRule> = emptyList(),
     val replacements: List<ReplacementRule> = emptyList(),
     val readingProfiles: List<ReadingProfile> = emptyList(),
@@ -127,7 +147,11 @@ data class MainUiState(
     val preview: List<PreviewSegment> = emptyList(),
     val pipelineIssues: List<PipelineIssue> = emptyList(),
     val previewBusy: Boolean = false,
+    val previewError: String? = null,
+    val keepAwake: Boolean = false,
     val punctuationFilter: Boolean = true,
+    /** 没写是谁说的对话怎么读。 */
+    val unattributedPolicy: UnattributedPolicy = UnattributedPolicy.DEFAULT,
     val licenseConfigured: Boolean = false,
     val licenseMask: String = "",
     val edgeEndpoint: String = SettingsStore.DEFAULT_EDGE_ENDPOINT,
@@ -166,7 +190,6 @@ data class MainUiState(
     val previewVoiceId: String? = null,
     val isPaused: Boolean = false,
     val completedSegments: Int = 0,
-    val synthesisSegmentIndex: Int = -1,
     val playbackVoiceName: String = "",
     val playbackIsDialogue: Boolean = false,
     val playbackFallbackReason: String? = null,
@@ -193,9 +216,14 @@ data class MainUiState(
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences("multitts", android.content.Context.MODE_PRIVATE)
+    private val readingPreferences = app.noveltts.data.settings.contentPreferences(application, "multitts.reading", listOf("readingSnapshot"))
+    private val textPreferences = app.noveltts.data.settings.contentPreferences(application, "multitts.text", listOf(KEY_LAST_TEXT))
+    private val initialLoad = kotlinx.coroutines.CompletableDeferred<Unit>()
+    private var textSaveJob: Job? = null
     private val settings = SettingsStore(application)
     private val packStore = VoicePackStore(application)
     private val registry = VoiceRegistry(application, packStore)
+    private val voiceOverrides = app.noveltts.data.voicepack.VoiceOverrides(application)
     private val rulesRepository = RulesRepository(application)
     private val engines = EngineManager(application, settings)
     private val synthesizer = MultiSegmentSynthesizer(
@@ -206,22 +234,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         cacheEnabled = settings.cacheEnabled,
     )
     private val trackLock = Any()
+    private class PackDecision { val ready = java.util.concurrent.CountDownLatch(1); @Volatile var accepted = false }
+    private val packDecision = java.util.concurrent.atomic.AtomicReference<PackDecision?>(null)
 
     private var playbackHandle: SynthesisHandle? = null
     private var audioTrack: AudioTrack? = null
     private var previewJob: Job? = null
+    private val ruleWriteMutex = Mutex()
+    private fun enqueueRuleChange(action: () -> Unit) {
+        viewModelScope.launch {
+            ruleWriteMutex.withLock { withContext(Dispatchers.IO) { action() } }
+        }
+    }
     private var previewGeneration = 0L
     private val playbackGeneration = AtomicLong()
     private var playbackLease: AutoCloseable? = null
-    @Volatile private var writtenFrames = 0L
     @Volatile private var readingIndex = 0
-    private data class ReadingSession(val state: MainUiState, val segments: List<PlannedSegment>)
+    private data class ReadingSession(val state: MainUiState, val segments: List<PlannedSegment>, val restoredIndex: Int = 0)
     @Volatile private var readingSession: ReadingSession? = null
     @Volatile private var readingHadError = rulesRepository.withConfigurationLock { preferences.getBoolean("readingError", false) }
     @Volatile private var activePlaybackSettings: MainUiState? = null
 
     /** 背景音乐播放器；懒建，没用过背景音乐就不创建线程与 MediaPlayer。 */
     private var bgmPlayer: BgmPlayer? = null
+    private val audioPolicyDelegate = lazy {
+        app.noveltts.audio.PlaybackAudioPolicy(getApplication(), ::pause, ::resume, ::stop, ::previousSegment, ::nextSegment) {
+            _uiState.value.isSpeaking && !_uiState.value.isPreview && readingSession != null
+        }
+    }
+    private val audioPolicy by audioPolicyDelegate
 
     /** Legado HTTP 转发服务；只在设置里启用时才真正监听端口。 */
 
@@ -230,6 +271,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
     init {
+        viewModelScope.launch { app.noveltts.engine.EngineHealth.state.collect { health -> _uiState.update { it.copy(engineHealth = health) } } }
         viewModelScope.launch {
             ForwardController.state.collect { runtime ->
                 _uiState.update { it.copy(forwardRunning = runtime.running, forwardApplying = runtime.applying,
@@ -247,7 +289,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateText(value: String) {
         _uiState.update { it.copy(text = value) }
-        rulesRepository.withConfigurationLock { preferences.edit().putString(KEY_LAST_TEXT, value).apply() }
+        textSaveJob?.cancel()
+        textSaveJob = viewModelScope.launch {
+            delay(300)
+            withContext(Dispatchers.IO) { textPreferences.edit().putString(KEY_LAST_TEXT, value).apply() }
+        }
         refreshPreview()
     }
 
@@ -295,47 +341,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(globalControlsExpanded = expanded) }
     }
 
-    /** 主界面快速添加角色：默认匹配对话前一句旁白里的称呼，完整选项仍在角色规则编辑器。 */
-    fun addQuickRole(name: String, keyword: String, voiceId: String): Result<RoleRule> = runCatching {
-        val state = _uiState.value
-        check(state.rolesLoadError == null) { "角色规则文件无法读取，请先恢复" }
-        val label = name.trim().take(60)
-        require(label.isNotBlank()) { "请填写角色名称" }
-        require(state.roles.none { it.name.trim().equals(label, ignoreCase = true) }) { "已有同名角色" }
-        require(state.usableVoices.any { it.systemName == voiceId }) { "请选择可用音色" }
-        val literal = keyword.trim().ifBlank { label }
-        val rule = RoleRule(
-            name = label,
-            pattern = if (REGEX_META.containsMatchIn(literal)) Regex.escape(literal) else literal,
-            voiceIds = listOf(voiceId),
-            matchScope = RoleMatchScope.PREVIOUS_NARRATION,
-            contextChars = QUICK_ROLE_CONTEXT_CHARS,
-        )
-        check(saveRole(rule)) { _uiState.value.statusMessage }
-        _uiState.value.roles.first { it.id == rule.id }
-    }
+    /** Save a complete sheet draft once; the ViewModel owns the operation across rotation. */
+    suspend fun saveConfiguredRole(rule: RoleRule, isNew: Boolean, expected: RoleRule? = null): Result<RoleRule> = viewModelScope.async {
+        runCatching {
+            check(_uiState.value.rolesLoadError == null) { "角色规则文件无法读取，请先恢复" }
+            withContext(Dispatchers.Default) { RuleValidation.roleError(rule) }?.let { error(it) }
+            if (isNew) require(rule.voiceIds.all { id -> _uiState.value.usableVoices.any { it.systemName == id } }) {
+                "请选择可用音色"
+            }
+            val saved = withContext(Dispatchers.IO) { rulesRepository.upsertRole(rule, requireUniqueName = isNew, expected = expected) }
+            _uiState.update { it.copy(roleGroups = saved.groups, roles = saved.items,
+                statusMessage = "角色规则「${rule.name}」已保存") }
+            refreshPreview()
+            saved.items.first { it.id == rule.id }
+        }
+    }.await()
 
-    /** 删除角色并连带删除只对它生效的替换规则；两个规则文件在同一事务内写入。 */
-    fun removeRoleWithReplacements(roleId: String): Result<String> = runCatching {
-        // 在配置锁内重新读盘：界面状态可能落后于刚完成的还原或其它规则写入。
-        val (role, removed) = rulesRepository.withConfigurationLock {
-            val roles = rulesRepository.loadRoles()
-            val replacements = rulesRepository.loadReplacements()
-            val role = roles.items.firstOrNull { it.id == roleId } ?: error("角色不存在")
-            val (targeted, kept) = replacements.items.partition {
+    /** Delete only the role; targeted replacements retain their original binding. */
+    fun removeRolePreservingReplacements(roleId: String): Result<String> = runCatching {
+        val (saved, role, linked) = rulesRepository.withConfigurationLock {
+            val current = rulesRepository.loadRoles()
+            val role = current.items.firstOrNull { it.id == roleId } ?: error("角色不存在")
+            val linked = rulesRepository.loadReplacements().items.count {
                 it.scope == ReplacementScope.ROLE && it.targetRoleId == roleId
             }
-            transactionalConfiguration {
-                rulesRepository.restoreAll(
-                    roles.copy(items = roles.items.filterNot { it.id == roleId }),
-                    replacements.copy(items = kept),
-                )
-            }
-            role to targeted.size
+            val saved = RuleMutations(rulesRepository).roles { it.copy(items = it.items.filterNot { rule -> rule.id == roleId }) }
+            Triple(saved, role, linked)
         }
-        refreshAll()
-        ("已删除角色「${role.name}」" + if (removed == 0) "" else "及 $removed 条定向替换规则")
-            .also { message -> _uiState.update { it.copy(statusMessage = message) } }
+        val message = "已删除角色「${role.name}」" + if (linked > 0) "，保留 $linked 条定向替换规则，重新绑定后生效" else ""
+        _uiState.update { it.copy(roleGroups = saved.groups, roles = saved.items, statusMessage = message) }
+        refreshPreview()
+        message
     }
 
     fun selectSystemVoice(voiceId: String) {
@@ -347,6 +383,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setPunctuationFilter(enabled: Boolean) {
         settings.punctuationFilter = enabled
         _uiState.update { it.copy(punctuationFilter = enabled) }
+        refreshPreview()
+    }
+
+    fun setUnattributedPolicy(policy: UnattributedPolicy) {
+        if (_uiState.value.unattributedPolicy == policy) return
+        settings.unattributedDialogue = policy.name
+        _uiState.update { it.copy(unattributedPolicy = policy) }
         refreshPreview()
     }
 
@@ -368,7 +411,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setEdgeEndpoint(value: String) {
-        settings.edgeEndpoint = value
+        runCatching { settings.edgeEndpoint = value }.onFailure { error ->
+            _uiState.update { it.copy(statusMessage = error.message.orEmpty()) }; return
+        }
         _uiState.update {
             it.copy(
                 edgeEndpoint = settings.edgeEndpoint,
@@ -406,13 +451,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun importFirstSegmentEvidence(uri: Uri) { viewModelScope.launch {
+        val result = withContext(Dispatchers.IO) { runCatching { settings.setFirstSegmentEvidence(readBackupText(uri)) } }
+        refreshAll()
+        _uiState.update { it.copy(statusMessage = result.exceptionOrNull()?.message ?: "测量报告已导入；达到门槛且匹配设备后可启用，当前仍为关闭") }
+    } }
+    fun setFirstSegmentExperiment(enabled: Boolean) {
+        runCatching { settings.enableFirstSegmentExperiment(enabled) }.onFailure { error -> _uiState.update { it.copy(statusMessage = error.message.orEmpty()) } }
+        refreshAll()
+    }
+    fun setKeepAwake(enabled: Boolean) {
+        settings.keepAwake = enabled
+        _uiState.update { it.copy(keepAwake = enabled) }
+        if (PlaybackSession.activeCount() > 0) getApplication<Application>().startForegroundService(Intent(getApplication(), app.noveltts.service.PlaybackForegroundService::class.java))
+    }
+
     fun clearRecentText() {
-        rulesRepository.withConfigurationLock { preferences.edit().remove(KEY_LAST_TEXT).apply() }
+        textSaveJob?.cancel()
+        textPreferences.edit().remove(KEY_LAST_TEXT).apply()
         _uiState.update { it.copy(text = "") }
         refreshPreview()
     }
 
     fun speak() {
+        if (!initialLoad.isCompleted) {
+            val generation = playbackGeneration.get()
+            viewModelScope.launch { initialLoad.await(); if (generation == playbackGeneration.get()) speak() }
+            return
+        }
         val state = _uiState.value
         if (state.usableVoices.isEmpty()) {
             _uiState.update { it.copy(statusMessage = "还没有可用音色，请先导入语音包或配置离线许可证。") }
@@ -479,7 +545,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    private fun buildPlan(state: MainUiState): BuiltSynthesisPlan = SynthesisPlanBuilder.build(
+    private fun buildPlan(state: MainUiState): BuiltSynthesisPlan = with(SynthesisPlanBuilder.build(
         text = state.text,
         builtInRoles = state.builtInRoles,
         roles = state.roleSet,
@@ -487,7 +553,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         filterPurePunctuation = state.punctuationFilter,
         voices = state.voices,
         maxSegmentChars = state.maxSegmentChars,
-    )
+        unattributedPolicy = state.unattributedPolicy,
+    )) {
+        val first = segments.firstOrNull()
+        val effective = first?.let {
+            val rate = app.noveltts.engine.api.SynthesisParameters.rate(sliderToRate(state.speed) * it.voice.defaultSpeed * it.segment.speechRate)
+            val pitch = app.noveltts.engine.api.SynthesisParameters.pitch(sliderToPitch(state.pitch) * it.voice.defaultPitch * it.segment.speechPitch)
+            val volume = app.noveltts.engine.api.SynthesisParameters.volume(sliderToVolume(state.volume) * it.voice.defaultVolume * it.segment.speechVolume)
+            "$rate/$pitch/$volume"
+        }
+        val options = app.noveltts.engine.api.EngineRequestOptions(state.edgeEndpoint, state.requestTimeoutSec, state.localTtsEnginePackage)
+        app.noveltts.domain.FirstSegmentExperiment.apply(this, first != null && settings.firstSegmentApplies(
+            first.voice.systemName, engines.cacheRevision(first.voice, options), effective.orEmpty(),
+        ))
+    }
 
     /** Reading and preview use immutable snapshots and generation-guarded callbacks. */
     private fun playSegments(
@@ -506,11 +585,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val finished = AtomicBoolean(false)
         val total = if (isPreview) segments.size else readingSession?.segments?.size ?: segments.size
         activePlaybackSettings = playbackState
-        writtenFrames = 0L
+        val writtenFrames = AtomicLong()
         if (!isPreview) { readingHadError = false; saveReadingIndex() }
-        _uiState.update { it.copy(isSpeaking = true, isPreview = isPreview,
+        _uiState.update { it.copy(isSpeaking = true, isPreview = isPreview, previewError = null,
             previewVoiceId = if (isPreview) segments.firstOrNull()?.voice?.systemName else null,
-            isPaused = false, playbackError = false, currentSegmentIndex = if (isPreview) -1 else startIndex,
+            // 朗读中点试听时保留「可继续」标记：播放条的控制行不再先收起、试听结束又弹出。
+            isPaused = isPreview && it.isPaused, playbackError = false, currentSegmentIndex = if (isPreview) -1 else startIndex,
             playbackVoiceName = segments.first().voice.displayName, playbackIsDialogue = segments.first().segment.isDialogue,
             playbackFallbackReason = segments.first().segment.fallbackReason,
             completedSegments = if (isPreview) 0 else startIndex, totalSegments = total,
@@ -522,14 +602,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         playbackLease = PlaybackSession.open(getApplication(), segments.any { it.voice.isOnline }) {
             if (generation == playbackGeneration.get()) stop()
         }
+        if (!audioPolicy.start()) {
+            stopPlayback(updateState = false)
+            _uiState.update { it.copy(isSpeaking = false, isPaused = !isPreview,
+                statusMessage = "暂时无法获得音频焦点，请稍后继续朗读") }
+            return
+        }
+        val requestId = java.util.UUID.randomUUID().toString().take(8)
         val handle = synthesizer.synthesize(segments, sliderToRate(playbackState.speed),
             sliderToPitch(playbackState.pitch), sliderToVolume(playbackState.volume),
-            listener = playbackListener(generation, isPreview, finished),
+            requestId = requestId,
+            listener = playbackListener(generation, isPreview, finished, requestId, writtenFrames),
             options = app.noveltts.engine.api.EngineRequestOptions(playbackState.edgeEndpoint, playbackState.requestTimeoutSec, playbackState.localTtsEnginePackage),
             onProgress = { index, _, _ ->
-                updatePlaybackState(generation) { _uiState.update { it.copy(
-                    synthesisSegmentIndex = index + startIndex,
-                    statusMessage = if (isPreview) "正在合成试听 · ${segments[index].voice.displayName}"
+                // 预取不改上一段的播放状态，避免合成提示覆盖正在播放的内容。
+                updatePlaybackState(generation) { _uiState.update {
+                    val waiting = isPreview || index + startIndex <= it.completedSegments
+                    it.copy(
+                    statusMessage = if (!waiting) it.statusMessage
+                        else if (isPreview) "正在合成试听 · ${segments[index].voice.displayName}"
                         else "正在合成第 ${index + startIndex + 1}/$total 段 · ${segments[index].voice.displayName}") } }
             },
             onPlayback = object : SegmentPlaybackListener {
@@ -545,12 +636,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             else "正在播放第 ${startIndex + index + 1}/$total 段 · ${it.playbackVoiceName}") } }
                 }
                 override fun onPlaybackComplete(index: Int) {
-                    drainTrack(generation)
+                    drainTrack(generation, writtenFrames.get())
                     updatePlaybackState(generation) {
                     if (!isPreview) { readingIndex = (startIndex + index + 1).coerceAtMost(total - 1); saveReadingIndex() }
-                    _uiState.update { it.copy(completedSegments = startIndex + index + 1) } }
+                    _uiState.update { it.copy(completedSegments = startIndex + index + 1,
+                        // 下一段还没备好时如实显示在等合成；已备好的话紧接着的 onPlaybackStart 会覆盖它。
+                        statusMessage = if (!isPreview && index < segments.lastIndex)
+                            "正在合成第 ${startIndex + index + 2}/$total 段 · ${segments[index + 1].voice.displayName}"
+                            else it.statusMessage) } }
                 }
-            })
+            },
+            // 整篇朗读时提前备好下一段，段间不再等一次完整的在线合成；试听只有一段，用不上。
+            lookahead = !isPreview)
         if (generation == playbackGeneration.get() && !finished.get()) playbackHandle = handle else handle.cancel()
     }
 
@@ -558,8 +655,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.Main.immediate) { if (generation == playbackGeneration.get()) action() }
     }
 
-    private fun playbackListener(generation: Long, isPreview: Boolean, finished: AtomicBoolean): SynthesisListener =
+    private fun playbackListener(generation: Long, isPreview: Boolean, finished: AtomicBoolean, requestId: String, writtenFrames: AtomicLong): SynthesisListener =
         object : SynthesisListener {
+            private val firstWritten = AtomicBoolean(false)
+            private val playbackStarted = System.nanoTime()
             override fun onStart(sampleRateHz: Int, audioFormat: Int, channelCount: Int) {
                 if (generation != playbackGeneration.get()) return
                 val track = runCatching { createAudioTrack(sampleRateHz, audioFormat, channelCount) }.getOrElse {
@@ -586,12 +685,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         return
                     }
                     position += count
-                    writtenFrames += count / 2
+                    writtenFrames.addAndGet(count / 2L)
+                    if (firstWritten.compareAndSet(false, true)) {
+                        app.noveltts.engine.DiagnosticsLog.debug(app.noveltts.engine.Category.SPEECH,
+                            "请求 $requestId 首次写入 AudioTrack", "elapsed=${(System.nanoTime() - playbackStarted) / 1_000_000}ms · format=24000/PCM16/mono")
+                        viewModelScope.launch {
+                            // Observe playback separately: a successful write only means PCM was queued.
+                            while (generation == playbackGeneration.get()) {
+                                if (synchronized(trackLock) { audioTrack !== track }) return@launch
+                                val played = runCatching { track.playbackHeadPosition.toLong() and 0xffffffffL }.getOrNull() ?: return@launch
+                                if (played > 0) {
+                                    app.noveltts.engine.DiagnosticsLog.debug(app.noveltts.engine.Category.SPEECH,
+                                        "请求 $requestId 播放头首次推进", "elapsed=${(System.nanoTime() - playbackStarted) / 1_000_000}ms · observedFrames=$played")
+                                    return@launch
+                                }
+                                delay(5)
+                            }
+                        }
+                    }
                 }
             }
             override fun onComplete() {
                 if (generation != playbackGeneration.get() || !finished.compareAndSet(false, true)) return
-                val drained = runCatching { drainTrack(generation) }
+                val drained = runCatching { drainTrack(generation, writtenFrames.get()) }
                 finishPlayback(generation, isPreview, drained.exceptionOrNull()?.message)
             }
             override fun onError(code: Int, message: String?) {
@@ -600,14 +716,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-    private fun drainTrack(generation: Long) {
+    private fun drainTrack(generation: Long, writtenFrames: Long) {
         val track = synchronized(trackLock) { audioTrack } ?: return
         val remaining = writtenFrames - (runCatching { track.playbackHeadPosition.toLong() and 0xffffffffL }.getOrDefault(writtenFrames))
         val deadline = android.os.SystemClock.elapsedRealtime() + remaining.coerceAtLeast(0) * 1000 / 24000 + 2500
         while (generation == playbackGeneration.get()) {
             val played = runCatching { track.playbackHeadPosition.toLong() and 0xffffffffL }.getOrDefault(writtenFrames)
             if (played >= writtenFrames) return
-            check(android.os.SystemClock.elapsedRealtime() < deadline) { "音频播放等待超时" }
+            if (android.os.SystemClock.elapsedRealtime() >= deadline) {
+                app.noveltts.engine.DiagnosticsLog.warn(app.noveltts.engine.Category.SPEECH, "音频播放头等待超时，继续下一段")
+                return
+            }
             Thread.sleep(12)
         }
     }
@@ -615,15 +734,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun finishPlayback(generation: Long, preview: Boolean, error: String?) { viewModelScope.launch(Dispatchers.Main.immediate) {
         if (generation != playbackGeneration.get()) return@launch
         releaseTrack(); playbackHandle = null
+        if (audioPolicyDelegate.isInitialized()) audioPolicy.stop()
         playbackLease?.close(); playbackLease = null
         stopBgm(); activePlaybackSettings = null
         if (!preview) {
             readingHadError = error != null
             if (error == null) clearReadingSnapshot() else saveReadingIndex()
         }
-        val resumable = readingSession != null || preferences.contains("readingSnapshot")
-        _uiState.update { it.copy(isSpeaking = false, isPreview = false, previewVoiceId = null,
-            isPaused = resumable, playingSegmentIndex = null, playbackError = resumable && readingHadError,
+        val resumable = readingSession != null || readingPreferences.contains("readingSnapshot")
+        _uiState.update { (if (preview) it.withReadingProgress() else it).copy(isSpeaking = false, isPreview = false, previewVoiceId = null,
+            isPaused = resumable, playingSegmentIndex = null, playbackError = resumable && readingHadError, previewError = if (preview) error else null,
             statusMessage = error?.let {
                 if (preview) "试听失败：$it" + if (resumable) "。原朗读进度已保留，可继续朗读。" else ""
                 else "朗读失败：$it。可以重试当前段或使用备用音色。"
@@ -639,12 +759,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(isPaused = false, isPreview = false, previewVoiceId = null, playbackError = false) }
     }
     fun stopPreview() {
+        _uiState.update { it.copy(previewError = null) }
         if (!_uiState.value.isPreview) return
         stopPlayback(updateState = true)
-        val resumable = readingSession != null || preferences.contains("readingSnapshot")
-        _uiState.update { it.copy(isPaused = resumable,
+        val resumable = readingSession != null || readingPreferences.contains("readingSnapshot")
+        _uiState.update { it.withReadingProgress().copy(isPaused = resumable,
             isPreview = false, previewVoiceId = null, playbackError = resumable && readingHadError,
             statusMessage = if (resumable) "试听已停止，可继续原来的朗读" else "试听已停止") }
+    }
+
+    /** 试听会把进度改成「共 1 段」；试听结束后把进度行恢复成被暂停的那次朗读。 */
+    private fun MainUiState.withReadingProgress(): MainUiState {
+        val session = readingSession ?: return this
+        return copy(totalSegments = session.segments.size, currentSegmentIndex = readingIndex, completedSegments = readingIndex)
     }
     fun pause() {
         if (_uiState.value.isPreview) { stopPreview(); return }
@@ -653,6 +780,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         stopPlayback(updateState = false)
         _uiState.update { it.copy(isSpeaking = false, isPaused = true,
             statusMessage = "已暂停，继续时从第 ${readingIndex + 1} 段开头恢复") }
+        audioPolicy.paused()
     }
     fun resume() {
         if (_uiState.value.isSpeaking && !_uiState.value.isPreview) return
@@ -677,16 +805,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val generation = playbackGeneration.get()
         _uiState.update { it.copy(isSpeaking = true, isPreview = false, isPaused = false, statusMessage = "正在恢复朗读计划…") }
         viewModelScope.launch {
-            val result = withContext(Dispatchers.Default) { runCatching { cached ?: restoreReadingSnapshot() } }
+            val result = withContext(Dispatchers.Default) { runCatching {
+                val session = cached ?: restoreReadingSnapshot()
+                val currentVoices = _uiState.value.voices
+                session.copy(segments = app.noveltts.data.config.ReadingSnapshot.decode(
+                    app.noveltts.data.config.ReadingSnapshot.encode(session.segments), currentVoices,
+                    session.state.narratorVoiceId, session.state.dialogueVoiceId))
+            } }
             if (generation != playbackGeneration.get()) return@launch
             val session = result.getOrNull()
             if (session == null) {
-                _uiState.update { it.copy(isSpeaking = false, isPaused = preferences.contains("readingSnapshot"),
+                _uiState.update { it.copy(isSpeaking = false, isPaused = readingPreferences.contains("readingSnapshot"),
                     statusMessage = "无法恢复朗读：${result.exceptionOrNull()?.message ?: "没有保存的进度"}") }
                 return@launch
             }
             readingSession = session
-            readingIndex = savedIndex.coerceIn(session.segments.indices)
+            readingIndex = (if (cached == null) session.restoredIndex else savedIndex).coerceIn(session.segments.indices)
             runCatching { action(session) }.onFailure { error ->
                 stopPlayback(updateState = false)
                 _uiState.update { it.copy(isSpeaking = false, isPaused = true, playbackError = true,
@@ -709,17 +843,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     segment = planned.segment.copy(voiceId = alternative.systemName, fallbackReason = "用户选择备用音色")) else planned })
             readingSession = updated
             rulesRepository.withConfigurationLock {
-                val root = JSONObject(preferences.getString("readingSnapshot", "{}").orEmpty())
+                val root = JSONObject(readingPreferences.getString("readingSnapshot", "{}").orEmpty())
                 val overrides = root.optJSONObject("overrides") ?: JSONObject()
                 overrides.put(readingIndex.toString(), alternative.systemName)
                 root.put("overrides", overrides)
-                preferences.edit().putString("readingSnapshot", root.toString()).apply()
+                readingPreferences.edit().putString("readingSnapshot", root.toString()).apply()
             }
             playSegments(updated.segments.drop(readingIndex), status = "正在使用备用音色…", playbackState = updated.state, startIndex = readingIndex)
         }
     }
     private fun saveReadingSnapshot(state: MainUiState, segments: List<PlannedSegment>) {
-        val root = JSONObject().put("text", state.text)
+        val snapshotId = UUID.randomUUID().toString()
+        val root = JSONObject().put("readingId", snapshotId).put("text", state.text)
             .put("roles", RulesImport.exportRoles(state.roleSet)).put("replacements", RulesImport.exportReplacements(state.replacementSet))
             .put("narrator", state.narratorVoiceId).put("dialogue", state.dialogueVoiceId)
             .put("roleMultipliers", JSONObject(SettingsStore.builtInMultiplierValues(state.builtInRoles)
@@ -732,7 +867,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             .put("cacheEnabled", state.cacheEnabled).put("cacheMaxMb", state.cacheMaxMb)
             .put("edgeEndpoint", state.edgeEndpoint).put("localEngine", state.localTtsEnginePackage)
             .put("segments", app.noveltts.data.config.ReadingSnapshot.encode(segments))
-        rulesRepository.withConfigurationLock { preferences.edit().putString("readingSnapshot", root.toString()).putInt("readingIndex", 0).putInt("readingTotal", segments.size).apply() }
+        readingPreferences.edit().putString("readingSnapshot", root.toString()).apply()
+        preferences.edit().putString("readingId", snapshotId).putInt("readingIndex", 0).putInt("readingTotal", segments.size).apply()
     }
     private fun saveReadingIndex() { rulesRepository.withConfigurationLock {
         preferences.edit().putInt("readingIndex", readingIndex).putBoolean("readingError", readingHadError).apply()
@@ -740,12 +876,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun clearReadingSnapshot() {
         readingSession = null
         readingHadError = false
-        rulesRepository.withConfigurationLock { preferences.edit().remove("readingSnapshot").remove("readingIndex").remove("readingTotal").remove("readingError").apply() }
+        readingPreferences.edit().remove("readingSnapshot").apply()
+        preferences.edit().remove("readingId").remove("readingIndex").remove("readingTotal").remove("readingError").apply()
     }
     private fun restoreReadingSnapshot(): ReadingSession {
-        val root = JSONObject(preferences.getString("readingSnapshot", null) ?: error("没有保存的朗读快照"))
-        val roles = RulesImport.previewRoles(root.getString("roles"), emptyList(), emptyList())
-        val replacements = RulesImport.previewReplacements(root.getString("replacements"), emptyList(), emptyList())
+        val root = JSONObject(readingPreferences.getString("readingSnapshot", null) ?: error("没有保存的朗读快照"))
+        val roles = RulesImport.previewRoles(root.getString("roles"), emptyList(), emptyList(), externalImport = false)
+        val replacements = RulesImport.previewReplacements(root.getString("replacements"), emptyList(), emptyList(), externalImport = false)
         val multipliers = root.optJSONObject("roleMultipliers")
         fun builtIn(role: BuiltInRole, voiceKey: String): RolePlaybackSettings {
             val keys = SettingsStore.builtInRoleKeys(role)
@@ -772,10 +909,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val voice = state.voices.firstOrNull { it.systemName == override && it.usable }
             if (voice == null) planned else planned.copy(voice = voice, segment = planned.segment.copy(voiceId = override, fallbackReason = "用户选择备用音色"))
         }
-        return ReadingSession(state, segments)
+        val restoredIndex = if (root.optString("readingId", "") == preferences.getString("readingId", ""))
+            preferences.getInt("readingIndex", 0) else 0
+        return ReadingSession(state, segments, restoredIndex)
     }
 
-    fun refreshAll() = rulesRepository.withConfigurationLock {
+    fun refreshAll() {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try { refreshAll() }
+                catch (error: Exception) { _uiState.update { it.copy(statusMessage = "配置读取失败：${error.message}") } }
+                finally { initialLoad.complete(Unit) }
+            }
+            return
+        }
+        rulesRepository.withConfigurationLock {
         val packs = packStore.installed()
         val voices = registry.voices(settings.hasLicense(), settings.localTtsEnginePackage)
         val narrator = voices.firstOrNull {
@@ -792,7 +940,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val replacements = loadRules { rulesRepository.loadReplacements() }
         _uiState.update {
             it.copy(
+                recoveryWarning = app.noveltts.data.backup.ConfigurationRecovery.lastError,
                 packs = packs,
+                packProblems = packStore.problems(),
+                voiceOverrides = runCatching { voiceOverrides.load() }.getOrDefault(emptyMap()),
+                voiceOverridesError = runCatching { voiceOverrides.load() }.exceptionOrNull()?.message,
+                keepAwake = settings.keepAwake,
+                firstSegmentEnabled = settings.firstSegmentEnabled,
+                firstSegmentReady = settings.firstSegmentEvidence()?.accepted == true && settings.firstSegmentDeviceMatches(),
                 readingProfiles = profiles.getOrNull() ?: it.readingProfiles,
                 profilesLoadError = profiles.exceptionOrNull()?.message,
                 activeProfileId = preferences.getString("activeProfileId", "").orEmpty(),
@@ -806,6 +961,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 builtInRoles = settings.builtInRoles().withVoices(narrator?.systemName, dialogue?.systemName),
                 systemVoiceId = systemVoice?.systemName.orEmpty(),
                 punctuationFilter = settings.punctuationFilter,
+                unattributedPolicy = UnattributedPolicy.fromStorage(settings.unattributedDialogue),
                 licenseConfigured = settings.hasLicense(),
                 licenseMask = settings.licenseMask(),
                 edgeEndpoint = settings.edgeEndpoint,
@@ -831,94 +987,93 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         refreshPreview()
         refreshForwardServer()
+        }
+        initialLoad.complete(Unit)
     }
 
     /** 保存角色规则；[newGroup] 非空时与规则一起落盘，避免"先建组再保存"两次写入。 */
-    fun saveRole(rule: RoleRule, newGroup: RuleGroup? = null): Boolean {
+    fun saveRole(rule: RoleRule, newGroup: RuleGroup? = null, expected: RoleRule? = null): Boolean {
         RuleValidation.roleError(rule)?.let { error ->
             _uiState.update { it.copy(statusMessage = error) }; return false
         }
-        val state = _uiState.value
-        val created = newGroup?.let { group ->
-            if (state.roleGroups.any { it.id == group.id }) group
-            else group.copy(order = nextRuleGroupOrder(state.roleGroups))
+        val loadError = _uiState.value.rolesLoadError
+        if (loadError != null) {
+            _uiState.update { it.copy(statusMessage = "角色规则文件无法读取，已阻止保存：$loadError") }
+            return false
         }
-        val groups = if (created == null) state.roleGroups else state.roleGroups + created
-        val known = groups.mapTo(HashSet()) { it.id }
-        val targetGroup = when {
-            created != null -> created.id
-            rule.groupId in known -> rule.groupId
-            else -> RuleGroup.DEFAULT_ID
+        val saved = try {
+            rulesRepository.upsertRole(rule, newGroup = newGroup, expected = expected)
+        } catch (error: RulesStoreException) {
+            Log.w(TAG, "saveRole failed", error)
+            _uiState.update { it.copy(statusMessage = "角色规则保存失败：${error.message}") }
+            return false
         }
-        val existing = state.roles.firstOrNull { it.id == rule.id }
-        val sortIndex = if (existing != null && existing.groupId == targetGroup) {
-            existing.sortIndex
-        } else {
-            (state.roles.filter { it.groupId == targetGroup && it.id != rule.id }
-                .maxOfOrNull { it.sortIndex } ?: -1) + 1
-        }
-        return saveRoleSet(
-            RuleSet(
-                groups = groups,
-                items = state.roles.filterNot { it.id == rule.id } +
-                    rule.copy(groupId = targetGroup, sortIndex = sortIndex),
-            ),
-            "角色规则「${rule.name}」已保存",
-        )
+        _uiState.update { it.copy(roleGroups = saved.groups, roles = saved.items,
+            statusMessage = "角色规则「${rule.name}」已保存") }
+        refreshPreview()
+        return true
     }
 
-    fun deleteRole(rule: RoleRule) {
-        saveRoleSet(
-            RuleSet(_uiState.value.roleGroups, _uiState.value.roles.filterNot { it.id == rule.id }),
-            "已删除角色规则「${rule.name}」",
-        )
+    /**
+     * 把仍用旧式匹配范围的角色改为自动判断说话人。只改匹配范围；
+     * 匹配词不是纯称呼（真正的正则）或还要匹配旁白的规则保持原样。
+     */
+    fun migrateRolesToAuto() = enqueueRuleChange {
+        mutateRoles("角色匹配方式已更新") { current ->
+            current.copy(items = current.items.map {
+                if (RoleAliases.canSwitchToAuto(it)) it.copy(matchScope = RoleMatchScope.AUTO) else it
+            })
+        }
     }
 
-    fun toggleRole(rule: RoleRule, enabled: Boolean) {
-        saveRole(rule.copy(enabled = enabled))
+    fun deleteRole(rule: RoleRule) = enqueueRuleChange {
+        removeRolePreservingReplacements(rule.id).onFailure { error ->
+            _uiState.update { it.copy(statusMessage = "删除失败：${error.message}") }
+        }
+    }
+
+    fun toggleRole(rule: RoleRule, enabled: Boolean) = enqueueRuleChange {
+        mutateRoles("角色启停状态已保存") { current ->
+            check(current.items.any { it.id == rule.id }) { "角色已删除，请刷新后重试" }
+            current.copy(items = current.items.map { if (it.id == rule.id) it.copy(enabled = enabled) else it })
+        }
     }
 
     /** 保存替换规则；[newGroup] 非空时与规则一起落盘。 */
-    fun saveReplacement(rule: ReplacementRule, newGroup: RuleGroup? = null): Boolean {
+    fun saveReplacement(rule: ReplacementRule, newGroup: RuleGroup? = null, expected: ReplacementRule? = null): Boolean {
         RuleValidation.replacementError(rule)?.let { error ->
             _uiState.update { it.copy(statusMessage = error) }; return false
         }
-        val state = _uiState.value
-        val created = newGroup?.let { group ->
-            if (state.replacementGroups.any { it.id == group.id }) group
-            else group.copy(order = nextRuleGroupOrder(state.replacementGroups))
+        val loadError = _uiState.value.replacementsLoadError
+        if (loadError != null) {
+            _uiState.update { it.copy(statusMessage = "替换规则文件无法读取，已阻止保存：$loadError") }
+            return false
         }
-        val groups = if (created == null) state.replacementGroups else state.replacementGroups + created
-        val known = groups.mapTo(HashSet()) { it.id }
-        val targetGroup = when {
-            created != null -> created.id
-            rule.groupId in known -> rule.groupId
-            else -> RuleGroup.DEFAULT_ID
+        val saved = try {
+            rulesRepository.upsertReplacement(rule, newGroup, expected = expected)
+        } catch (error: RulesStoreException) {
+            Log.w(TAG, "saveReplacement failed", error)
+            _uiState.update { it.copy(statusMessage = "替换规则保存失败：${error.message}") }
+            return false
         }
-        val groupItems = state.replacements.filter { it.groupId == targetGroup && it.id != rule.id }.sortedBy { it.sortIndex }.toMutableList()
-        groupItems.add(rule.sortIndex.coerceIn(0, groupItems.size), rule.copy(groupId = targetGroup))
-        val reordered = groupItems.mapIndexed { index, item -> item.copy(sortIndex = index) }
-        return saveReplacementSet(
-            RuleSet(
-                groups = groups,
-                items = state.replacements.filterNot { it.id == rule.id || it.groupId == targetGroup } + reordered,
-            ),
-            "替换规则「${rule.name}」已保存",
-        )
+        _uiState.update { it.copy(replacementGroups = saved.groups, replacements = saved.items,
+            statusMessage = "替换规则「${rule.name}」已保存") }
+        refreshPreview()
+        return true
     }
 
-    fun deleteReplacement(rule: ReplacementRule) {
-        saveReplacementSet(
-            RuleSet(
-                _uiState.value.replacementGroups,
-                _uiState.value.replacements.filterNot { it.id == rule.id },
-            ),
-            "已删除替换规则「${rule.name}」",
-        )
+    fun deleteReplacement(rule: ReplacementRule) = enqueueRuleChange {
+        mutateReplacements("替换规则已删除") { current ->
+            check(current.items.any { it.id == rule.id }) { "规则已删除，请刷新后重试" }
+            current.copy(items = current.items.filterNot { it.id == rule.id })
+        }
     }
 
-    fun toggleReplacement(rule: ReplacementRule, enabled: Boolean) {
-        saveReplacement(rule.copy(enabled = enabled))
+    fun toggleReplacement(rule: ReplacementRule, enabled: Boolean) = enqueueRuleChange {
+        mutateReplacements("替换规则启停状态已保存") { current ->
+            check(current.items.any { it.id == rule.id }) { "规则已删除，请刷新后重试" }
+            current.copy(items = current.items.map { if (it.id == rule.id) it.copy(enabled = enabled) else it })
+        }
     }
 
     fun testReplacements(text: String, draft: ReplacementRule? = null, includeSaved: Boolean = true): String {
@@ -926,7 +1081,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val rules = if (draft == null) state.replacements else
             (if (includeSaved) state.replacements.filterNot { it.id == draft.id } else emptyList()) +
                 draft.copy(enabled = if (includeSaved) draft.enabled else true)
-        val result = TextPipeline.build(
+        val result = app.noveltts.domain.RuleRuntime.preview { TextPipeline.build(
         text = text,
         narratorVoiceId = null,
         dialogueVoiceId = null,
@@ -935,7 +1090,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         filterPurePunctuation = false,
         roleGroups = state.roleGroups,
         replacementGroups = if (includeSaved) state.replacementGroups else emptyList(),
-    )
+    ) }
         return buildString {
             append(result.segments.joinToString("\n") { it.text })
             result.replacements.forEach { append("\n${it.ruleName}：${it.before} → ${it.after}") }
@@ -943,31 +1098,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun rememberRoleDraft(rule: RoleRule, newGroupName: String, fields: Map<String, String>) {
-        rulesRepository.withConfigurationLock { preferences.edit().putString("roleDraft", RuleDrafts.encodeRole(rule, _uiState.value.roleGroups, newGroupName, fields))
-            .putString("roleDraftGroup", newGroupName).apply() }
+    fun rememberRoleDraft(rule: RoleRule, newGroupName: String, fields: Map<String, String>, expected: RoleRule?) {
+        runCatching { rulesRepository.withConfigurationLock { preferences.edit().putString("roleDraft", RuleDrafts.encodeRole(rule, _uiState.value.roleGroups, newGroupName, fields, expected))
+            .putString("roleDraftGroup", newGroupName).apply() } }
+            .onFailure { error -> _uiState.update { it.copy(statusMessage = "草稿保存失败：${error.message}") } }
     }
-    fun rememberReplacementDraft(rule: ReplacementRule, newGroupName: String, fields: Map<String, String>) {
-        rulesRepository.withConfigurationLock { preferences.edit().putString("replacementDraft", RuleDrafts.encodeReplacement(rule, _uiState.value.replacementGroups, newGroupName, fields))
-            .putString("replacementDraftGroup", newGroupName).apply() }
+    fun rememberReplacementDraft(rule: ReplacementRule, newGroupName: String, fields: Map<String, String>, expected: ReplacementRule?) {
+        runCatching { rulesRepository.withConfigurationLock { preferences.edit().putString("replacementDraft", RuleDrafts.encodeReplacement(rule, _uiState.value.replacementGroups, newGroupName, fields, expected))
+            .putString("replacementDraftGroup", newGroupName).apply() } }
+            .onFailure { error -> _uiState.update { it.copy(statusMessage = "草稿保存失败：${error.message}") } }
     }
     fun roleDraft(): RuleEditorDraft<RoleRule>? = rulesRepository.withConfigurationLock { runCatching {
         val text = preferences.getString("roleDraft", null) ?: return@withConfigurationLock null
         RuleDrafts.readRole(text, preferences.getString("roleDraftGroup", "").orEmpty())
-    }.getOrNull() }
+    }.onFailure { _uiState.update { it.copy(statusMessage = "角色草稿无法读取，原数据已保留") } }.getOrNull() }
     fun replacementDraft(): RuleEditorDraft<ReplacementRule>? = rulesRepository.withConfigurationLock { runCatching {
         val text = preferences.getString("replacementDraft", null) ?: return@withConfigurationLock null
         RuleDrafts.readReplacement(text, preferences.getString("replacementDraftGroup", "").orEmpty())
-    }.getOrNull() }
+    }.onFailure { _uiState.update { it.copy(statusMessage = "替换草稿无法读取，原数据已保留") } }.getOrNull() }
     fun clearRuleDraft(kind: RulesKind) {
         val key = if (kind == RulesKind.ROLE) "roleDraft" else "replacementDraft"
         rulesRepository.withConfigurationLock { preferences.edit().remove(key).remove(key + "Group").apply() }
     }
 
     fun setCatalogUrl(url: String) {
-        val normalized = url.trim()
-        rulesRepository.withConfigurationLock { preferences.edit().putString(KEY_CATALOG_URL, normalized).apply() }
-        _uiState.update { it.copy(catalogUrl = normalized) }
+        _uiState.update { it.copy(catalogUrl = url) }
+        enqueueRuleChange { rulesRepository.withConfigurationLock { preferences.edit().putString(KEY_CATALOG_URL, url.trim()).apply() } }
     }
 
     fun importPack(uri: Uri) {
@@ -977,7 +1133,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
                     resolver.openInputStream(uri)?.use { stream ->
-                        packStore.install(stream, expectedSha256 = null, sourceUrl = null)
+                        packStore.install(stream, expectedSha256 = null, sourceUrl = null, approveUpdate = ::approvePackUpdate)
                     } ?: throw IllegalArgumentException("无法读取所选文件")
                 }
             }
@@ -1035,7 +1191,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     try {
                         temp.inputStream().use { stream ->
-                            packStore.install(stream, expectedSha256 = entry.sha256, sourceUrl = entry.url)
+                            packStore.install(stream, expectedSha256 = entry.sha256, sourceUrl = entry.url, approveUpdate = ::approvePackUpdate)
                         }
                     } finally {
                         temp.delete()
@@ -1054,7 +1210,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val normalized = url.trim()
         val busy = _uiState.value.packBusyId
         if (normalized.isEmpty() || busy != null) {
-            Log.w(TAG, "installPackFromUrl ignored: url='$normalized' busy='$busy'")
+            _uiState.update { it.copy(packStatus = if (busy != null) "正在处理另一个语音包，请完成后重新安装" else "语音包地址为空") }
             return
         }
         val app = getApplication<Application>()
@@ -1072,7 +1228,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     try {
                         temp.inputStream().use { stream ->
-                            packStore.install(stream, expectedSha256 = null, sourceUrl = normalized)
+                            packStore.install(stream, expectedSha256 = null, sourceUrl = normalized, approveUpdate = ::approvePackUpdate)
                         }
                     } finally {
                         temp.delete()
@@ -1085,6 +1241,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 failure = { error -> "安装失败：${error.message ?: error.javaClass.simpleName}" },
             )
         }
+    }
+
+    private fun approvePackUpdate(candidate: VoicePack, previous: VoicePack): Boolean {
+        val current = _uiState.value
+        val ids = current.voices.filter { it.packId == previous.id }.map { it.systemName }.toSet()
+        val decision = PackDecision()
+        check(packDecision.compareAndSet(null, decision)) { "已有等待确认的语音包更新" }
+        _uiState.update { it.copy(pendingPackUpdate = PackUpdatePreview(candidate.name, previous.version, candidate.version,
+            current.roles.count { role -> role.voiceIds.any { it in ids } },
+            listOf(current.narratorVoiceId, current.dialogueVoiceId, current.systemVoiceId).count { it in ids })) }
+        return try { decision.ready.await(5, java.util.concurrent.TimeUnit.MINUTES) && decision.accepted }
+        finally { packDecision.compareAndSet(decision, null); _uiState.update { it.copy(pendingPackUpdate = null) } }
+    }
+    fun confirmPackUpdate(accepted: Boolean) {
+        packDecision.get()?.let { it.accepted = accepted; it.ready.countDown() }
     }
 
     fun removePack(pack: VoicePack) {
@@ -1105,10 +1276,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ?: "未选择"
 
     override fun onCleared() {
+        packDecision.getAndSet(null)?.ready?.countDown()
         stopPlayback(updateState = false)
         bgmPlayer?.release()
         bgmPlayer = null
         synthesizer.shutdown()
+        if (audioPolicyDelegate.isInitialized()) audioPolicy.release()
         super.onCleared()
     }
 
@@ -1136,13 +1309,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun refreshPreview() {
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
+            viewModelScope.launch { refreshPreview() }
+            return
+        }
         previewJob?.cancel()
         val generation = ++previewGeneration
         val state = _uiState.value
         _uiState.update { it.copy(previewBusy = true) }
         previewJob = viewModelScope.launch {
         delay(180)
-        val built = withContext(Dispatchers.Default) { runCatching { buildPlan(state).pipeline } }
+        val built = withContext(Dispatchers.Default) { runCatching { app.noveltts.domain.RuleRuntime.preview { buildPlan(state).pipeline } } }
         if (generation != previewGeneration) return@launch
         val result = built.getOrElse { error ->
             _uiState.update { it.copy(previewBusy = false, statusMessage = "分段预览失败：${error.message}") }
@@ -1158,12 +1335,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 voiceName = names[segment.voiceId] ?: "未选择音色",
                 roleName = segment.roleName,
                 id = segment.id,
-                explanation = segment.fallbackReason ?: if (segment.roleName != null)
-                    "命中 ${segment.roleName} · 请求音色 ${segment.requestedVoiceId.orEmpty()}"
-                    else if (segment.isDialogue) "未命中角色，使用默认对话音色" else "使用旁白音色",
+                explanation = segment.fallbackReason ?: speakerExplanation(segment),
+                uncertain = segment.attribution?.uncertain == true,
             )
         }
         _uiState.update { it.copy(preview = preview, pipelineIssues = result.issues, previewBusy = false) }
+        }
+    }
+
+    /** 一句话说明这一段为什么由这个角色朗读。 */
+    private fun speakerExplanation(segment: PipelineSegment): String {
+        val attribution = segment.attribution
+        val evidence = attribution?.evidence.orEmpty()
+        return when (attribution?.kind) {
+            AttributionKind.LEAD_IN, AttributionKind.NEARBY -> "前文「$evidence」"
+            AttributionKind.TRAILING -> "后文「$evidence」"
+            AttributionKind.CONTINUED -> "没写是谁，沿用上一句的说话人"
+            AttributionKind.LEGACY_RULE -> "命中角色规则「${segment.roleName}」"
+            AttributionKind.UNKNOWN -> "没写是谁，使用默认对话音色"
+            null -> when {
+                segment.roleName != null -> "命中角色规则「${segment.roleName}」"
+                segment.isDialogue -> "未命中角色，使用默认对话音色"
+                else -> "使用旁白音色"
+            }
         }
     }
 
@@ -1233,81 +1427,69 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return true
     }
 
+    private fun mutateRoles(message: String, change: (RuleSet<RoleRule>) -> RuleSet<RoleRule>): Boolean = try {
+        val saved = RuleMutations(rulesRepository).roles(change)
+        _uiState.update { it.copy(roleGroups = saved.groups, roles = saved.items, statusMessage = message) }
+        refreshPreview()
+        true
+    } catch (error: Exception) {
+        _uiState.update { it.copy(statusMessage = "保存失败：${error.message}") }
+        false
+    }
+
+    private fun mutateReplacements(message: String, change: (RuleSet<ReplacementRule>) -> RuleSet<ReplacementRule>): Boolean = try {
+        val saved = RuleMutations(rulesRepository).replacements(change)
+        _uiState.update { it.copy(replacementGroups = saved.groups, replacements = saved.items, statusMessage = message) }
+        refreshPreview()
+        true
+    } catch (error: Exception) {
+        _uiState.update { it.copy(statusMessage = "保存失败：${error.message}") }
+        false
+    }
+
     /** 新建或重命名角色分组。 */
     fun saveRoleGroup(group: RuleGroup) {
-        val state = _uiState.value
-        val exists = state.roleGroups.any { it.id == group.id }
-        val saved = if (exists) group else group.copy(order = nextRuleGroupOrder(state.roleGroups))
-        val groups = state.roleGroups.filterNot { it.id == group.id } + saved
-        saveRoleSet(RuleSet(groups, state.roles), "分组「${saved.name}」已保存")
+        val base = _uiState.value.roleGroups.firstOrNull { it.id == group.id }
+        enqueueRuleChange { mutateRoles("角色分组已保存") { RuleMutations.saveGroup(it, group, base) } }
     }
 
     /** 删除分组，组内规则移到默认分组而不是一起删除。 */
-    fun deleteRoleGroup(group: RuleGroup) {
-        if (group.id == RuleGroup.DEFAULT_ID) {
-            _uiState.update { it.copy(statusMessage = "默认分组不能删除，可以改名或停用") }
-            return
+    fun deleteRoleGroup(group: RuleGroup) = enqueueRuleChange {
+        mutateRoles("分组已删除，规则已移到默认分组") { current ->
+            check(group.id != RuleGroup.DEFAULT_ID) { "默认分组不能删除" }
+            current.copy(groups = current.groups.filterNot { it.id == group.id }, items = current.items.map {
+                if (it.groupId == group.id) it.copy(groupId = RuleGroup.DEFAULT_ID) else it
+            })
         }
-        val state = _uiState.value
-        val groups = state.roleGroups.filterNot { it.id == group.id }
-        val rules = state.roles.map { if (it.groupId == group.id) it.copy(groupId = RuleGroup.DEFAULT_ID) else it }
-        saveRoleSet(RuleSet(groups, rules), "已删除分组「${group.name}」，组内规则移到默认分组")
     }
 
     fun saveReplacementGroup(group: RuleGroup) {
-        val state = _uiState.value
-        val exists = state.replacementGroups.any { it.id == group.id }
-        val saved = if (exists) group else group.copy(order = nextRuleGroupOrder(state.replacementGroups))
-        val groups = state.replacementGroups.filterNot { it.id == group.id } + saved
-        saveReplacementSet(RuleSet(groups, state.replacements), "分组「${saved.name}」已保存")
+        val base = _uiState.value.replacementGroups.firstOrNull { it.id == group.id }
+        enqueueRuleChange { mutateReplacements("替换分组已保存") { RuleMutations.saveGroup(it, group, base) } }
     }
 
-    fun deleteReplacementGroup(group: RuleGroup) {
-        if (group.id == RuleGroup.DEFAULT_ID) {
-            _uiState.update { it.copy(statusMessage = "默认分组不能删除，可以改名或停用") }
-            return
+    fun deleteReplacementGroup(group: RuleGroup) = enqueueRuleChange {
+        mutateReplacements("分组已删除，规则已移到默认分组") { current ->
+            check(group.id != RuleGroup.DEFAULT_ID) { "默认分组不能删除" }
+            current.copy(groups = current.groups.filterNot { it.id == group.id }, items = current.items.map {
+                if (it.groupId == group.id) it.copy(groupId = RuleGroup.DEFAULT_ID) else it
+            })
         }
-        val state = _uiState.value
-        val groups = state.replacementGroups.filterNot { it.id == group.id }
-        val items = state.replacements.map {
-            if (it.groupId == group.id) it.copy(groupId = RuleGroup.DEFAULT_ID) else it
-        }
-        saveReplacementSet(RuleSet(groups, items), "已删除分组「${group.name}」，组内规则移到默认分组")
     }
 
     /** 拖拽落点：把规则移动到 [targetGroupId] 的第 [targetIndex] 个位置（含跨组）。 */
     fun moveRole(ruleId: String, targetGroupId: String, targetIndex: Int) {
-        val state = _uiState.value
-        moveRule(
-            items = state.roles,
-            groups = state.roleGroups,
-            ruleId = ruleId,
-            targetGroupId = targetGroupId,
-            targetIndex = targetIndex,
-            idOf = RoleRule::id,
-            groupOf = RoleRule::groupId,
-            sortIndexOf = RoleRule::sortIndex,
-            withPlacement = { rule, groupId, index -> rule.copy(groupId = groupId, sortIndex = index) },
-            save = { set, message -> saveRoleSet(set, message) },
-            nameOf = RoleRule::name,
-        )
+        val ordered = _uiState.value.roles.filter { it.groupId == targetGroupId }.sortedBy { it.sortIndex }
+        val anchor = RuleMutations.anchor(ordered.map { it.id }, ruleId, targetIndex) ?: return
+        enqueueRuleChange { mutateRoles("角色顺序已保存") { RuleMutations.move(it, ruleId, targetGroupId, anchor.id, anchor.after,
+            RoleRule::id, RoleRule::groupId, RoleRule::sortIndex) { item, group, rank -> item.copy(groupId = group, sortIndex = rank) } } }
     }
 
     fun moveReplacement(ruleId: String, targetGroupId: String, targetIndex: Int) {
-        val state = _uiState.value
-        moveRule(
-            items = state.replacements,
-            groups = state.replacementGroups,
-            ruleId = ruleId,
-            targetGroupId = targetGroupId,
-            targetIndex = targetIndex,
-            idOf = ReplacementRule::id,
-            groupOf = ReplacementRule::groupId,
-            sortIndexOf = ReplacementRule::sortIndex,
-            withPlacement = { rule, groupId, index -> rule.copy(groupId = groupId, sortIndex = index) },
-            save = { set, message -> saveReplacementSet(set, message) },
-            nameOf = ReplacementRule::name,
-        )
+        val ordered = _uiState.value.replacements.filter { it.groupId == targetGroupId }.sortedBy { it.sortIndex }
+        val anchor = RuleMutations.anchor(ordered.map { it.id }, ruleId, targetIndex) ?: return
+        enqueueRuleChange { mutateReplacements("替换顺序已保存") { RuleMutations.move(it, ruleId, targetGroupId, anchor.id, anchor.after,
+            ReplacementRule::id, ReplacementRule::groupId, ReplacementRule::sortIndex) { item, group, rank -> item.copy(groupId = group, sortIndex = rank) } } }
     }
 
     fun rulesExportJson(): String = RulesImport.exportRoles(RuleSet(_uiState.value.roleGroups, _uiState.value.roles))
@@ -1326,14 +1508,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             writeJsonTo(uri, json)
             "已导出 $count 条${kind.label}"
-        }
+        }.also { result -> _uiState.update { it.copy(statusMessage = result.getOrElse { error -> "导出失败：${error.message}" }) } }
     }
 
     /** 第一步：读取并解析导入文件，产出冲突预览（不写盘）。 */
     suspend fun prepareRoleImport(uri: Uri): Result<RulesImportPreview<RoleRule>> = withContext(Dispatchers.IO) {
         runCatching {
             val text = readImportText(uri)
-            RulesImport.previewRoles(text, _uiState.value.roleGroups, _uiState.value.roles)
+            rulesRepository.withConfigurationLock {
+                val current = rulesRepository.loadRoles()
+                RulesImport.previewRoles(text, current.groups, current.items)
+            }
         }
     }
 
@@ -1341,47 +1526,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         withContext(Dispatchers.IO) {
             runCatching {
                 val text = readImportText(uri)
-                RulesImport.previewReplacements(text, _uiState.value.replacementGroups, _uiState.value.replacements)
+                rulesRepository.withConfigurationLock {
+                    val current = rulesRepository.loadReplacements()
+                    RulesImport.previewReplacements(text, current.groups, current.items)
+                }
             }
         }
 
     /** 第二步：按用户选择的策略合并并落盘。 */
-    fun applyRoleImport(preview: RulesImportPreview<RoleRule>, strategy: RuleImportStrategy): Result<String> {
-        val state = _uiState.value
-        val loadError = state.rolesLoadError
-        if (loadError != null) {
-            return Result.failure(RulesStoreException("角色规则文件无法读取，已阻止导入：$loadError"))
+    suspend fun applyRoleImport(preview: RulesImportPreview<RoleRule>, strategy: RuleImportStrategy): Result<RulesImportApplyResult<RoleRule>> = withContext(Dispatchers.IO) { runCatching {
+        val result = RuleMutations(rulesRepository).applyRoles(preview, strategy)
+        if (result is RulesImportApplyResult.Applied) {
+            val saved = result.configuration
+            _uiState.update { it.copy(roleGroups = saved.groups, roles = saved.items,
+                statusMessage = "导入完成，当前共 ${saved.items.size} 条角色规则") }
+            refreshPreview()
         }
-        val merged = RulesImport.mergeRoles(preview, RuleSet(state.roleGroups, state.roles), strategy)
-        if (!saveRoleSet(merged, "")) {
-            return Result.failure(RulesStoreException(_uiState.value.statusMessage.ifBlank { "导入失败" }))
-        }
-        val message = importMessage(preview, strategy, RulesKind.ROLE)
-        _uiState.update { it.copy(statusMessage = message) }
-        return Result.success(message)
-    }
+        result
+    } }
 
-    fun applyReplacementImport(
-        preview: RulesImportPreview<ReplacementRule>,
-        strategy: RuleImportStrategy,
-    ): Result<String> {
-        val state = _uiState.value
-        val loadError = state.replacementsLoadError
-        if (loadError != null) {
-            return Result.failure(RulesStoreException("替换规则文件无法读取，已阻止导入：$loadError"))
+    suspend fun applyReplacementImport(preview: RulesImportPreview<ReplacementRule>, strategy: RuleImportStrategy): Result<RulesImportApplyResult<ReplacementRule>> = withContext(Dispatchers.IO) { runCatching {
+        val result = RuleMutations(rulesRepository).applyReplacements(preview, strategy)
+        if (result is RulesImportApplyResult.Applied) {
+            val saved = result.configuration
+            _uiState.update { it.copy(replacementGroups = saved.groups, replacements = saved.items,
+                statusMessage = "导入完成，当前共 ${saved.items.size} 条替换规则") }
+            refreshPreview()
         }
-        val merged = RulesImport.mergeReplacements(
-            preview,
-            RuleSet(state.replacementGroups, state.replacements),
-            strategy,
-        )
-        if (!saveReplacementSet(merged, "")) {
-            return Result.failure(RulesStoreException(_uiState.value.statusMessage.ifBlank { "导入失败" }))
-        }
-        val message = importMessage(preview, strategy, RulesKind.REPLACEMENT)
-        _uiState.update { it.copy(statusMessage = message) }
-        return Result.success(message)
-    }
+        result
+    } }
 
     /** 用"已保存"的角色规则跑一次测试，列出命中的角色与音色（编辑中的内容不参与）。 */
     fun testRoleMatch(text: String, draft: RoleRule? = null, includeSaved: Boolean = true): String {
@@ -1390,17 +1563,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val rules = if (draft == null) state.roles else
             (if (includeSaved) state.roles.filterNot { it.id == draft.id } else emptyList()) +
                 draft.copy(enabled = if (includeSaved) draft.enabled else true)
-        val result = SynthesisPlanBuilder.build(
+        val result = app.noveltts.domain.RuleRuntime.preview { SynthesisPlanBuilder.build(
             text = text,
             builtInRoles = state.builtInRoles,
             roles = RuleSet(if (includeSaved) state.roleGroups else emptyList(), rules),
             replacements = state.replacementSet,
             filterPurePunctuation = false,
             voices = state.voices,
-        ).pipeline
+            unattributedPolicy = state.unattributedPolicy,
+        ).pipeline }
         if (result.segments.isEmpty()) return "没有可测试的片段。"
         val matched = result.segments.mapIndexed { index, segment ->
             "第 ${index + 1} 段「${segment.text.take(30)}」→ ${segment.roleName ?: if (segment.isDialogue) "默认对话" else "旁白"} · ${voiceName(segment.voiceId)}" +
+                " · ${speakerExplanation(segment)}" + (if (segment.attribution?.uncertain == true) "（不确定）" else "") +
                 (segment.fallbackReason?.let { "\n$it" } ?: "")
         }
         if (matched.isEmpty()) {
@@ -1467,7 +1642,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             render = { state, v -> state.copy(cacheEnabled = v) },
         )
         // 设置变化立即生效：同步合成器并驱逐一次超限文件（不重建 synthesizer）。
-        synthesizer.configureCache(settings.cacheEnabled, settings.cacheMaxMb)
+        viewModelScope.launch(Dispatchers.IO) { synthesizer.configureCache(settings.cacheEnabled, settings.cacheMaxMb) }
     }
 
     fun setCacheMaxMb(value: Int) {
@@ -1477,7 +1652,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             setter = { settings.cacheMaxMb = it },
             render = { state, v -> state.copy(cacheMaxMb = v) },
         )
-        synthesizer.configureCache(settings.cacheEnabled, settings.cacheMaxMb)
+        viewModelScope.launch(Dispatchers.IO) { synthesizer.configureCache(settings.cacheEnabled, settings.cacheMaxMb) }
     }
 
     fun setBgmEnabled(enabled: Boolean) {
@@ -1522,6 +1697,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         runCatching {
             getApplication<Application>().contentResolver
                 .takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }.onFailure {
+            _uiState.update { it.copy(statusMessage = "背景音乐已选择，但无法保留文件权限，重启后可能需要重新选择") }
         }
         val text = uri.toString()
         settings.bgmUri = text
@@ -1568,6 +1745,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun exportLegadoTo(uri: Uri): Result<String> = withContext(Dispatchers.IO) {
         runCatching { writeJsonTo(uri, legadoJson()); "已导出阅读朗读配置，包含本机访问令牌" }
     }
+    suspend fun saveVoiceOverride(id: String, draft: app.noveltts.data.voicepack.VoiceOverride,
+        expected: app.noveltts.data.voicepack.VoiceOverride?): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { voiceOverrides.save(id, draft, expected); VoicePackEvents.notifyChanged(getApplication()); refreshAll() }
+    }
+    fun recoverVoiceOverrides() {
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching { voiceOverrides.recoverBackup(); VoicePackEvents.notifyChanged(getApplication()) } }
+            refreshAll()
+            _uiState.update { it.copy(statusMessage = result.exceptionOrNull()?.message ?: "音色配置备份已恢复") }
+        }
+    }
+    fun resetVoiceOverrides() {
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching { voiceOverrides.resetCorrupt() } }
+            if (result.isSuccess) VoicePackEvents.notifyChanged(getApplication())
+            refreshAll()
+            _uiState.update { it.copy(statusMessage = result.exceptionOrNull()?.message ?: "音色配置已重置，原文件已保留") }
+        }
+    }
     fun backupFileName(): String = BackupManager.exportFileName()
 
     /** 生成备份 JSON；[includeSensitive] 为 false 时不写许可证与访问令牌。 */
@@ -1575,6 +1771,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         roleSet = _uiState.value.roleSet,
         replacementSet = _uiState.value.replacementSet,
         settings = settingsSnapshot(),
+        voiceOverrides = voiceOverrides.load(),
         profiles = _uiState.value.readingProfiles,
         voiceHints = _uiState.value.voices.associate { it.systemName to it.displayName },
         credentials = if (includeSensitive) {
@@ -1661,8 +1858,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val encodedProfiles = ReadingProfiles.encode(profiles)
         transactionalConfiguration {
+            if (!repairCorrupt) {
+                check(mapped.roles.baseFingerprint == RulesImport.rolesFingerprint(rulesRepository.loadRoles()) &&
+                    mapped.replacements.baseFingerprint == RulesImport.replacementsFingerprint(rulesRepository.loadReplacements())) {
+                    "现有规则已变化，请重新导入备份并核对预览；未写入任何配置"
+                }
+            }
             rulesRepository.restoreAll(roles, replacements)
-            if (applySettings) applyBackupSettings(mapped.backup.settings)
+            if (applySettings) {
+                applyBackupSettings(mapped.backup.settings)
+                mapped.backup.voiceOverrides?.let { incoming ->
+                    val current = if (repairCorrupt) runCatching { voiceOverrides.load() }.getOrDefault(emptyMap()) else voiceOverrides.load()
+                    voiceOverrides.restore(when (strategy) {
+                        RuleImportStrategy.REPLACE_ALL -> incoming
+                        RuleImportStrategy.SKIP -> incoming + current
+                        RuleImportStrategy.OVERWRITE -> current + incoming
+                    })
+                }
+            }
             if (applyCredentials) mapped.backup.credentials?.let { credentials ->
                 credentials.license?.let(settings::setLicense)
                 credentials.forwardToken?.let { settings.commitValues(mapOf("forwardToken" to it)) }
@@ -1684,7 +1897,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val restoreApp = getApplication<Application>()
         val shared = File(restoreApp.applicationInfo.dataDir, "shared_prefs")
         app.noveltts.data.backup.ConfigurationRecovery.transaction(restoreApp).run(
-            rulesRepository.transactionFiles() + listOf(File(shared, "multitts.xml"), File(shared, "multitts.xml.bak"),
+            rulesRepository.transactionFiles() + voiceOverrides.files() + listOf(File(shared, "multitts.xml"), File(shared, "multitts.xml.bak"),
                 File(shared, "multitts.secrets.xml"), File(shared, "multitts.secrets.xml.bak")),
             rollbackMemory = { settings.commitValues(settingsBefore, replace = true); settings.restoreCredentialSnapshot(credentialsBefore) },
             apply = apply)
@@ -1731,8 +1944,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val saved = mapped.copy(roleGroups = mapped.roleGroups.filter { id -> state.roleGroups.any { it.id == id } },
             replacementGroups = mapped.replacementGroups.filter { id -> state.replacementGroups.any { it.id == id } })
         transactionalConfiguration {
-            rulesRepository.restoreAll(state.roleSet.copy(groups = state.roleGroups.map { it.copy(enabled = it.id in saved.roleGroups) }),
-                state.replacementSet.copy(groups = state.replacementGroups.map { it.copy(enabled = it.id in saved.replacementGroups) }))
+            val currentRoles = rulesRepository.loadRoles()
+            val currentReplacements = rulesRepository.loadReplacements()
+            check(dropMissingGroups || (saved.roleGroups.all { id -> currentRoles.groups.any { it.id == id } } &&
+                saved.replacementGroups.all { id -> currentReplacements.groups.any { it.id == id } })) { "分组已变化，请重新预览阅读方案" }
+            rulesRepository.restoreAll(currentRoles.copy(groups = currentRoles.groups.map { it.copy(enabled = it.id in saved.roleGroups) }),
+                currentReplacements.copy(groups = currentReplacements.groups.map { it.copy(enabled = it.id in saved.replacementGroups) }))
             settings.commitValues(mapOf("narratorVoice" to saved.narratorVoice, "dialogueVoice" to saved.dialogueVoice, "systemVoice" to saved.systemVoice,
                 KEY_SPEED to saved.speed, KEY_PITCH to saved.pitch, KEY_VOLUME to saved.volume,
                 "punctuationFilter" to saved.punctuationFilter, "silenceBetweenSegmentsMs" to saved.silenceMs,
@@ -1809,12 +2026,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /** 导出/还原设置时的白名单快照；bgmUri 是设备本地授权，不迁移。 */
     private fun settingsSnapshot(): Map<String, Any?> = mapOf(
         "punctuationFilter" to settings.punctuationFilter,
+        "keepAwake" to settings.keepAwake,
         "narratorVoice" to settings.narratorVoice,
         "dialogueVoice" to settings.dialogueVoice,
         "systemVoice" to settings.systemVoice,
         "edgeEndpoint" to settings.edgeEndpoint,
         "compatibilityProxy" to settings.compatibilityProxy,
         "themeMode" to settings.themeMode,
+        "unattributedDialogue" to settings.unattributedDialogue,
         "maxRetryCount" to settings.maxRetryCount,
         "requestTimeoutSec" to settings.requestTimeoutSec,
         "maxSegmentChars" to settings.maxSegmentChars,
@@ -1848,6 +2067,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 key == "themeMode" ->
                     (value as String).uppercase().takeIf { it in SettingsStore.THEME_MODES }
                         ?: SettingsStore.DEFAULT_THEME_MODE
+                key == "unattributedDialogue" -> UnattributedPolicy.fromStorage(value as? String).name
                 else -> value
             }
         }
@@ -1862,7 +2082,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun writeJsonTo(uri: Uri, json: String) {
         val resolver = getApplication<Application>().contentResolver
-        val stream = resolver.openOutputStream(uri) ?: throw IllegalStateException("无法写入所选文件")
+        val stream = resolver.openOutputStream(uri, "wt") ?: throw IllegalStateException("无法写入所选文件")
         stream.use { it.write(json.toByteArray(Charsets.UTF_8)) }
     }
 
@@ -1924,20 +2144,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun loadBaseState(): MainUiState = MainUiState(
-        isPaused = preferences.contains("readingSnapshot"),
-        playbackError = preferences.contains("readingSnapshot") && preferences.getBoolean("readingError", false),
+        isPaused = readingPreferences.contains("readingSnapshot"),
+        playbackError = readingPreferences.contains("readingSnapshot") && preferences.getBoolean("readingError", false),
         currentSegmentIndex = preferences.getInt("readingIndex", -1),
         totalSegments = preferences.getInt("readingTotal", 0),
-        text = preferences.getString(KEY_LAST_TEXT, "").orEmpty().ifBlank { DEFAULT_TEST_TEXT },
+        text = textPreferences.getString(KEY_LAST_TEXT, "").orEmpty().ifBlank { DEFAULT_TEST_TEXT },
         speed = preferences.getInt(KEY_SPEED, 50),
         volume = preferences.getInt(KEY_VOLUME, 50),
         pitch = preferences.getInt(KEY_PITCH, 25),
+        keepAwake = settings.keepAwake,
         builtInRoles = settings.builtInRoles(),
         globalControlsExpanded = preferences.getBoolean(KEY_GLOBAL_CONTROLS_EXPANDED, true),
         systemVoiceId = settings.systemVoice,
         punctuationFilter = settings.punctuationFilter,
-        licenseConfigured = settings.hasLicense(),
-        licenseMask = settings.licenseMask(),
+        unattributedPolicy = UnattributedPolicy.fromStorage(settings.unattributedDialogue),
+
         edgeEndpoint = settings.edgeEndpoint,
         compatibilityProxy = settings.compatibilityProxy,
         themeMode = ThemeMode.fromStorage(settings.themeMode),
@@ -1982,6 +2203,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun stopPlayback(updateState: Boolean) {
         playbackGeneration.incrementAndGet()
+        if (audioPolicyDelegate.isInitialized()) audioPolicy.stop()
         playbackLease?.close(); playbackLease = null
         playbackHandle?.cancel()
         playbackHandle = null
@@ -2011,7 +2233,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * （例如拖动音量滑块）不会反复解码；换文件或停止后再次朗读才真正重建。
      */
     private fun refreshBgm() {
-        val state = activePlaybackSettings ?: _uiState.value
+        val state = _uiState.value
         if (!_uiState.value.isSpeaking || !state.bgmEnabled || state.bgmUri.isBlank()) {
             bgmPlayer?.stop()
             return
@@ -2040,18 +2262,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         runCatching { track.release() }
     }
 
-    private fun sliderToRate(value: Int): Float = if (value <= 50) {
-        (0.5f + value / 100f).coerceIn(0.5f, 1f)
-    } else {
-        (1f + (value - 50) / 50f).coerceIn(1f, 2f)
-    }
-
-    private fun sliderToPitch(value: Int): Float =
-        (0.5f + value / 50f).coerceIn(0.5f, 2f)
-
-    private fun sliderToVolume(value: Int): Float =
-        (value / 50f).coerceIn(0f, 1f)
-
+    private fun sliderToRate(value: Int): Float = app.noveltts.engine.api.SynthesisParameters.globalRate(value)
+    private fun sliderToPitch(value: Int): Float = app.noveltts.engine.api.SynthesisParameters.globalPitch(value)
+    private fun sliderToVolume(value: Int): Float = app.noveltts.engine.api.SynthesisParameters.globalVolume(value)
     private companion object {
         const val TAG = "MainViewModel"
         const val KEY_LAST_TEXT = "lastText"
@@ -2065,8 +2278,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         const val KEY_VOLUME = "volume"
         const val KEY_PITCH = "pitch"
         const val KEY_GLOBAL_CONTROLS_EXPANDED = "globalControlsExpanded"
-        const val QUICK_ROLE_CONTEXT_CHARS = 30
-        val REGEX_META = Regex("""[\\^$.|?*+()\[\]{}]""")
+
         const val KEY_CATALOG_URL = "catalogUrl"
         const val PACK_BUSY_CATALOG = "catalog"
     }

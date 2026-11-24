@@ -9,6 +9,11 @@ data class BuiltSynthesisPlan(
 )
 
 object SynthesisPlanBuilder {
+    data class Snapshot(val text: String, val builtInRoles: BuiltInRoleSettings,
+        val roles: RuleSet<RoleRule>, val replacements: RuleSet<ReplacementRule>, val punctuation: Boolean,
+        val voices: List<VoiceDescriptor>, val maxChars: Int, val policy: UnattributedPolicy) {
+        fun build() = SynthesisPlanBuilder.build(text, builtInRoles, roles, replacements, punctuation, voices, maxChars, policy)
+    }
     fun build(
         text: String,
         builtInRoles: BuiltInRoleSettings,
@@ -17,6 +22,7 @@ object SynthesisPlanBuilder {
         filterPurePunctuation: Boolean,
         voices: List<VoiceDescriptor>,
         maxSegmentChars: Int = TextPipeline.DEFAULT_MAX_SEGMENT_CHARS,
+        unattributedPolicy: UnattributedPolicy = UnattributedPolicy.DEFAULT,
     ): BuiltSynthesisPlan {
         val usable = voices.filter { it.usable }
         val byId = usable.associateBy { it.systemName }
@@ -34,6 +40,7 @@ object SynthesisPlanBuilder {
             roleGroups = roles.groups,
             replacementGroups = replacements.groups,
             maxSegmentChars = maxSegmentChars,
+            unattributedPolicy = unattributedPolicy,
         )
         val segments = pipeline.segments.mapNotNull { segment ->
             val fallbackVoice = if (segment.isDialogue) dialogue else narrator

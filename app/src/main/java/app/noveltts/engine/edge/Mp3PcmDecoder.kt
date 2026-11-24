@@ -14,7 +14,7 @@ internal object Mp3PcmDecoder {
     private const val TARGET_SAMPLE_RATE = 24_000
     private const val TIMEOUT_US = 10_000L
 
-    fun decodeToPcm16(file: File, gain: Float): ByteArray {
+    fun decodeToPcm16(file: File, gain: Float, deadlineNanos: Long? = null, cancelled: () -> Boolean = { false }): ByteArray {
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
         try {
@@ -42,7 +42,10 @@ internal object Mp3PcmDecoder {
             val raw = ByteArrayOutputStream()
             var inputDone = false
             var outputDone = false
+            val deadline = deadlineNanos ?: (System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(180))
             while (!outputDone) {
+                if (cancelled() || Thread.currentThread().isInterrupted) throw IOException("已取消解码")
+                if (System.nanoTime() > deadline) throw IOException("解码超时")
                 if (!inputDone) {
                     val inputIndex = codec.dequeueInputBuffer(TIMEOUT_US)
                     if (inputIndex >= 0) {
@@ -79,6 +82,7 @@ internal object Mp3PcmDecoder {
                             if (outputBuffer != null) {
                                 outputBuffer.position(bufferInfo.offset)
                                 outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                                app.noveltts.engine.api.AudioBudget.check(raw.size().toLong(), bufferInfo.size.toLong(), app.noveltts.engine.api.AudioBudget.RAW_PCM, "解码 PCM")
                                 val chunk = ByteArray(bufferInfo.size)
                                 outputBuffer.get(chunk)
                                 raw.write(chunk)
@@ -112,10 +116,13 @@ internal object Mp3PcmDecoder {
             android.media.AudioFormat.ENCODING_PCM_16BIT -> 2
             else -> throw IOException("不支持的解码输出格式：$encoding")
         }
-        val frameBytes = channels.coerceAtLeast(1) * bytesPerSample
+        require(channels in 1..32 && sourceRate in 1..384_000) { "Invalid decoded audio format" }
+        val frameBytes = channels * bytesPerSample
         val sourceFrames = data.size / frameBytes
         if (sourceFrames <= 0) throw IOException("MP3 解码结果为空")
         val buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        val outputBytes = app.noveltts.engine.api.AudioBudget.normalizedBytes(sourceFrames.toLong(), sourceRate)
+        app.noveltts.engine.api.AudioBudget.check(0, sourceFrames.toLong() * 4, app.noveltts.engine.api.AudioBudget.RAW_PCM, "混音缓冲区")
         val samples = FloatArray(sourceFrames)
         for (frame in 0 until sourceFrames) {
             var mixed = 0f
@@ -129,12 +136,8 @@ internal object Mp3PcmDecoder {
             samples[frame] = mixed / channels.coerceAtLeast(1)
         }
 
-        val outputFrames = if (sourceRate == TARGET_SAMPLE_RATE) {
-            sourceFrames
-        } else {
-            (sourceFrames.toLong() * TARGET_SAMPLE_RATE / sourceRate).toInt()
-        }
-        val output = ByteArray(outputFrames * 2)
+        val outputFrames = outputBytes / 2
+        val output = ByteArray(outputBytes)
         val outputBuffer = ByteBuffer.wrap(output).order(ByteOrder.LITTLE_ENDIAN)
         val safeGain = gain.coerceIn(0f, 1f)
         for (frame in 0 until outputFrames) {

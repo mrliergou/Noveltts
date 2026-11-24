@@ -18,8 +18,8 @@ object OriginalPackParser {
         File(directory, CONFIG_NAME).isFile && File(directory, ENGINES_NAME).isFile
 
     fun packId(directory: File): String = packId(
-        File(directory, CONFIG_NAME).readBytes(),
-        File(directory, ENGINES_NAME).readBytes(),
+        PackInput.readFile(File(directory, CONFIG_NAME)),
+        PackInput.readFile(File(directory, ENGINES_NAME)),
     )
 
     /** 包 ID 只由两个 YAML 的字节决定，同一包重复导入得到同一 ID。 */
@@ -42,7 +42,9 @@ object OriginalPackParser {
         require(configFile.isFile) { "缺少 $CONFIG_NAME" }
         require(enginesFile.isFile) { "缺少 $ENGINES_NAME" }
 
-        val parsed = PackYaml.parse(configFile.readText(), enginesFile.readText())
+        val configBytes = PackInput.readFile(configFile)
+        val enginesBytes = PackInput.readFile(enginesFile)
+        val parsed = PackYaml.parse(configBytes.toString(Charsets.UTF_8), enginesBytes.toString(Charsets.UTF_8))
 
         val engines = parsed.engines.map { engine ->
             PackEngine(
@@ -77,7 +79,7 @@ object OriginalPackParser {
         }
 
         return VoicePack(
-            id = packId(configFile.readBytes(), enginesFile.readBytes()),
+            id = packId(configBytes, enginesBytes),
             name = "${parsed.displayName} 语音包",
             version = "1.0.0",
             author = "原版语音包",

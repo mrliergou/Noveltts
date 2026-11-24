@@ -41,8 +41,11 @@ class ForwardForegroundService : Service() {
             while (true) {
                 delay(1000)
                 val current = ForwardController.state.value
-                if (current.running) ForwardController.publish(current.copy(activeRequests = server.activeRequests,
-                    queuedRequests = server.queuedRequests))
+                if (current.running) {
+                    ForwardController.publish(current.copy(running = server.isRunning,
+                        error = server.lastError, activeRequests = server.activeRequests, queuedRequests = server.queuedRequests))
+                    if (!server.isRunning) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
+                }
             }
         }
     }

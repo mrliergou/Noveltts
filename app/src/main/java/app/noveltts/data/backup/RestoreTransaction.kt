@@ -49,8 +49,21 @@ class RestoreTransaction(private val dataRoot: File, private val journal: File) 
     fun recover(): Boolean = synchronized(LOCK) {
         val file = File(journal, "manifest.json")
         if (!file.isFile) return@synchronized false
-        val manifest = JSONObject(file.readText())
-        require(manifest.getInt("schema") == 1) { "还原日志版本不支持" }
+        val manifest = try {
+            require(journal.canonicalFile.toPath().startsWith(rootPath) && journal.canonicalFile.toPath() != rootPath)
+            require(file.length() <= 1024 * 1024) { "还原日志过大" }
+            val parsed = app.noveltts.data.JsonInput.parseObject(file.readText())
+            require(parsed.getInt("schema") == 1) { "还原日志版本不支持" }
+            require(parsed.getString("phase") in setOf("prepared", "committed")) { "还原日志阶段无效" }
+            if (parsed.getString("phase") == "prepared") validateBackups(parsed)
+            parsed
+        } catch (failure: Exception) {
+            // Preserve evidence and block this operation once, without poisoning every future transaction.
+            val quarantine = File(journal.parentFile, "${journal.name}.corrupt-${java.util.UUID.randomUUID()}")
+            require(journal.canonicalFile.toPath().startsWith(rootPath) && journal.canonicalFile.toPath() != rootPath)
+            check(journal.renameTo(quarantine)) { "损坏的还原日志无法隔离" }
+            throw IllegalArgumentException("还原日志损坏，已保留隔离副本；请检查配置或重新还原备份", failure)
+        }
         if (manifest.getString("phase") == "prepared") {
             restore(manifest)
             writeManifest(manifest.put("phase", "committed"))
@@ -60,7 +73,19 @@ class RestoreTransaction(private val dataRoot: File, private val journal: File) 
         true
     }
 
+    private fun validateBackups(manifest: JSONObject) {
+        val entries = manifest.getJSONArray("entries")
+        for (index in 0 until entries.length()) {
+            val entry = entries.getJSONObject(index)
+            val target = checked(entry.getString("path"))
+            require(!target.toPath().startsWith(journal.canonicalFile.toPath())) { "还原目标不能指向日志" }
+            val backupName = entry.getString("backup")
+            require(backupName.matches(Regex("[0-9]+\\.bak"))) { "还原备份名称无效" }
+            if (entry.getBoolean("existed")) require(File(journal, backupName).isFile) { "还原日志缺少备份" }
+        }
+    }
     private fun restore(manifest: JSONObject) {
+        validateBackups(manifest)
         val entries = manifest.getJSONArray("entries")
         for (index in 0 until entries.length()) {
             val entry = entries.getJSONObject(index)
@@ -94,10 +119,13 @@ class RestoreTransaction(private val dataRoot: File, private val journal: File) 
 }
 
 object ConfigurationRecovery {
+    @Volatile var lastError: String? = null
+        private set
     fun transaction(context: android.content.Context): RestoreTransaction = RestoreTransaction(
         File(context.applicationInfo.dataDir), File(context.filesDir, "restore-journal"))
     fun recover(context: android.content.Context) = synchronized(app.noveltts.data.config.CONFIGURATION_LOCK) {
         runCatching { transaction(context).recover() }.onFailure {
+            lastError = it.message ?: "还原恢复失败"
             app.noveltts.engine.DiagnosticsLog.error(app.noveltts.engine.Category.STORAGE, "未完成的还原无法自动恢复", it.javaClass.simpleName)
         }
     }

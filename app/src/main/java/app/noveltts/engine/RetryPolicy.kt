@@ -27,20 +27,24 @@ data class RetryPolicy(
 
     /** 当前错误码下是否允许换备用音色（致命错误和用户取消都不允许）。 */
     fun allowsStandby(code: Int): Boolean = allowStandbyVoice && !isFatal(code)
+
+    /** Bounded backoff; the plan checks cancellation while waiting. */
+    fun retryDelayMillis(completedAttempts: Int): Long =
+        250L shl (completedAttempts - 1).coerceIn(0, 4)
 }
 
 /**
  * 瞬时错误：重试同一个音色或换备用音色都可能成功。
  *
- * 包括网络失败、引擎内部合成失败、初始化失败，以及 HTTP 5xx / 408 / 429 这类
- * 服务端临时错误（桥接引擎可能直接透传 HTTP 码）。
+ * 包括网络失败、引擎内部合成失败、初始化失败，以及 HTTP 5xx / 408 这类
+ * 服务端临时错误。401/403/429 终止当前请求，避免同一端点连续重试或换音色。
  */
 fun isTransient(code: Int): Boolean = when (code) {
     SynthesisError.NETWORK_FAILED,
     SynthesisError.SYNTHESIS_FAILED,
     SynthesisError.INIT_FAILED,
     -> true
-    in 500..599, 408, 429 -> true
+    in 500..599, 408 -> true
     else -> false
 }
 
@@ -53,7 +57,10 @@ fun isTransient(code: Int): Boolean = when (code) {
 fun isFatal(code: Int): Boolean = when (code) {
     SynthesisError.LICENSE_REQUIRED,
     SynthesisError.BAD_REQUEST,
+    SynthesisError.RESOURCE_LIMIT,
+    SynthesisError.BUSY,
     SynthesisError.CANCELLED,
+    401, 403, 429,
     -> true
     else -> false
 }

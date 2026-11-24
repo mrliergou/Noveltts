@@ -49,13 +49,16 @@ internal class TtsHttpHandler(
 ) {
 
     fun handle(input: InputStream, output: OutputStream, context: ForwardRequestContext = ForwardRequestContext()) {
-        val token = config().token
+        val requestInput = context.guardInput(input)
         try {
+            val snapshot = config()
+            val token = snapshot.token
             context.ensureActive()
-            val requestLine = ForwardProtocol.readLine(input, ForwardProtocol.MAX_LINE_BYTES) ?: return
+            val requestLine = ForwardProtocol.readLine(requestInput, ForwardProtocol.MAX_LINE_BYTES) ?: return
             val request = ForwardProtocol.parseRequestLine(requestLine)
                 ?: throw ForwardHttpException(400, "bad_request", "无法解析请求行")
-            val headers = ForwardProtocol.readHeaders(input)
+            val headers = ForwardProtocol.readHeaders(requestInput)
+            validateSource(headers, snapshot)
             val target = ForwardProtocol.splitTarget(request.target)
             val query = ForwardProtocol.parseQuery(target.query)
             when (target.path) {
@@ -72,13 +75,13 @@ internal class TtsHttpHandler(
 
                 "/tts" -> {
                     requireAuthorized(token, headers, query)
-                    handleTts(output, request.method, input, headers, query, context)
+                    handleTts(output, request.method, requestInput, headers, query, context)
                 }
                 "/legado" -> {
                     requireAuthorized(token, headers, query)
                     requireMethod(request.method, "GET")
                     writeResponse(output, 200, "application/json; charset=utf-8",
-                        LegadoIntegration.configJson(config()).toByteArray(Charsets.UTF_8),
+                        LegadoIntegration.configJson(snapshot).toByteArray(Charsets.UTF_8),
                         listOf("Cache-Control" to "no-store"))
                 }
 
@@ -95,6 +98,18 @@ internal class TtsHttpHandler(
     private fun handleHealth(output: OutputStream) {
         val count = backend.voices().count { it.usable }
         writeJson(output, 200, JSONObject().put("status", "ok").put("voices", count))
+    }
+
+    private fun validateSource(headers: Map<String, String>, snapshot: ForwardConfig) {
+        if (headers.containsKey("origin"))
+            throw ForwardHttpException(403, "browser_origin_denied", "不接受浏览器跨源请求")
+        val authority = headers["host"] ?: return
+        val uri = runCatching { java.net.URI("http://$authority") }.getOrNull()
+        if (uri == null || uri.host.isNullOrBlank() || uri.userInfo != null ||
+            !uri.rawPath.isNullOrEmpty() || uri.query != null || uri.fragment != null)
+            throw ForwardHttpException(400, "invalid_host", "Host 格式无效")
+        if (snapshot.host == "127.0.0.1" && uri.host.lowercase() !in setOf("127.0.0.1", "localhost", "[::1]", "::1"))
+            throw ForwardHttpException(403, "host_denied", "本机监听只接受本机 Host")
     }
 
     private fun handleVoices(output: OutputStream) {
@@ -133,19 +148,13 @@ internal class TtsHttpHandler(
         context.beginSynthesis()
         val audio = backend.synthesize(params.voice, params.text, params.rate, params.pitch, params.volume, context)
         context.ensureActive()
-        val wav = ByteArray(WavPcm.totalBytes(audio.pcm.size))
-        System.arraycopy(WavPcm.header(audio.pcm.size, audio.sampleRateHz), 0, wav, 0, WavPcm.HEADER_BYTES)
-        System.arraycopy(audio.pcm, 0, wav, WavPcm.HEADER_BYTES, audio.pcm.size)
-        writeResponse(
-            output = output,
-            status = 200,
-            contentType = "audio/wav",
-            body = wav,
-            extraHeaders = listOf(
-                "Cache-Control" to "no-store",
-                "Content-Disposition" to "inline; filename=\"tts.wav\"",
-            ),
-        )
+        val header = "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\n" +
+            "Content-Length: ${WavPcm.totalBytes(audio.pcm.size)}\r\nCache-Control: no-store\r\n" +
+            "Content-Disposition: inline; filename=\"tts.wav\"\r\nConnection: close\r\n\r\n"
+        output.write(header.toByteArray(Charsets.US_ASCII))
+        output.write(WavPcm.header(audio.pcm.size, audio.sampleRateHz))
+        output.write(audio.pcm)
+        output.flush()
     }
 
     private fun requireAuthorized(expected: String, headers: Map<String, String>, query: Map<String, String>) {

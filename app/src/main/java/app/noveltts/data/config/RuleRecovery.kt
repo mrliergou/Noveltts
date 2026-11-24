@@ -19,12 +19,12 @@ internal object RuleRecovery {
         val file = File(directory, name)
         val initial = RuleRecoveryCandidate(name, kind, file.lastModified(), file.length())
         return runCatching {
-            val text = file.inputStream().use(RulesImport::readText)
+            val text = file.inputStream().use { RulesImport.readText(it, 32 * 1024 * 1024) }
             if (kind == RulesKind.ROLE) {
-                val preview = RulesImport.previewRoles(text, emptyList(), emptyList())
+                val preview = RulesImport.previewRoles(text, emptyList(), emptyList(), externalImport = false)
                 initial.copy(roles = RuleSet(preview.groups, preview.entries.map { it.rule }))
             } else {
-                val preview = RulesImport.previewReplacements(text, emptyList(), emptyList())
+                val preview = RulesImport.previewReplacements(text, emptyList(), emptyList(), externalImport = false)
                 initial.copy(replacements = RuleSet(preview.groups, preview.entries.map { it.rule }))
             }
         }.getOrElse { initial.copy(error = it.message ?: "文件无法解析") }

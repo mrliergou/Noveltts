@@ -16,6 +16,8 @@ import app.noveltts.engine.api.SynthesisError
 import app.noveltts.engine.api.SynthesisHandle
 import app.noveltts.engine.api.SynthesisListener
 import app.noveltts.engine.api.SynthesisRequest
+import app.noveltts.engine.api.remainingTimeoutMillis
+import app.noveltts.engine.api.synthesisTimeoutMillis
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
@@ -65,16 +67,29 @@ class EdgeTtsEngine(
             listener.onError(SynthesisError.BAD_REQUEST, "待合成文本为空")
             return handle
         }
+        val timedRequest = if (request.deadlineNanos != null) request else request.copy(
+            deadlineNanos = System.nanoTime() + synthesisTimeoutMillis(request.text.length,
+                (request.options?.timeoutSec ?: settings.requestTimeoutSec) * 1000L) * 1_000_000L)
         executor.execute {
             try {
-                val mp3 = synthesizeToMp3(descriptor, request, cancelled, socket)
+                val mp3 = synthesizeToMp3(descriptor, timedRequest, cancelled, socket)
                 if (cancelled.get() || closed.get()) return@execute
+                if (mp3.isEmpty()) {
+                    listener.onError(SynthesisError.NO_AUDIO, "在线服务正常结束但没有音频")
+                    return@execute
+                }
                 val temp = File(cacheDir, "edge-${UUID.randomUUID()}.mp3")
                 val protection = app.noveltts.data.cache.ActiveAudioFiles.protect(temp)
                 try {
                     temp.writeBytes(mp3)
-                    val pcm = Mp3PcmDecoder.decodeToPcm16(temp, request.volume)
+                    request.timing.mark("decode-start")
+                    val pcm = Mp3PcmDecoder.decodeToPcm16(temp, request.volume, timedRequest.deadlineNanos) { cancelled.get() || closed.get() }
+                    request.timing.mark("decode-finished")
                     if (cancelled.get() || closed.get()) return@execute
+                    if (pcm.isEmpty()) {
+                        listener.onError(SynthesisError.NO_AUDIO, "在线音频解码后没有 PCM")
+                        return@execute
+                    }
                     listener.onStart(24_000, AudioFormat.ENCODING_PCM_16BIT, 1)
                     var offset = 0
                     while (offset < pcm.size) {
@@ -88,10 +103,16 @@ class EdgeTtsEngine(
                     temp.delete()
                     protection.close()
                 }
+            } catch (error: OutOfMemoryError) {
+                runCatching { socket.getAndSet(null)?.cancel() }
+                if (!cancelled.get()) listener.onError(SynthesisError.RESOURCE_LIMIT, "在线音频内存不足")
+            } catch (error: app.noveltts.engine.api.ResourceLimitException) {
+                socket.getAndSet(null)?.cancel()
+                if (!cancelled.get()) listener.onError(SynthesisError.RESOURCE_LIMIT, error.message)
             } catch (error: EdgeHttpException) {
                 DiagnosticsLog.warn(Category.ENGINE, "Edge 合成失败（HTTP ${error.code}）", error.userMessage().take(200))
                 if (!cancelled.get()) {
-                    listener.onError(SynthesisError.NETWORK_FAILED, error.userMessage())
+                    listener.onError(error.code, error.userMessage())
                 }
             } catch (error: Exception) {
                 DiagnosticsLog.error(Category.ENGINE, "Edge 合成异常", error.message?.take(200))
@@ -120,6 +141,7 @@ class EdgeTtsEngine(
         var lastError: EdgeHttpException? = null
         repeat(2) { attempt ->
             if (cancelled.get()) throw IOException("已取消")
+            if (request.remainingTimeoutMillis() == 0L) throw IOException("在线语音服务响应超时")
             try {
                 return collectAudio(descriptor, request, cancelled, socket)
             } catch (error: EdgeHttpException) {
@@ -150,15 +172,17 @@ class EdgeTtsEngine(
 
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                request.timing.mark("connected")
                 socketRef.set(webSocket)
+                if (cancelled.get() || closed.get()) { webSocket.cancel(); done.countDown(); return }
                 webSocket.send(config)
                 webSocket.send(requestMessage)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (text.contains("Path:turn.end")) {
-                    webSocket.close(1000, "turn end")
                     done.countDown()
+                    webSocket.close(1000, "turn end")
                 } else if (text.contains("Path:turn.start") || text.contains("Path:response")) {
                     // protocol keep-alives
                 } else if (text.contains("Path:audio.metadata")) {
@@ -171,11 +195,25 @@ class EdgeTtsEngine(
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
+                if (bytes.size.toLong() > app.noveltts.engine.api.AudioBudget.COMPRESSED + 65_537L) {
+                    failure.compareAndSet(null, app.noveltts.engine.api.ResourceLimitException("在线音频帧超过资源上限"))
+                    webSocket.cancel(); done.countDown(); return
+                }
                 val parsed = EdgeFrames.parse(bytes.toByteArray()) ?: return
                 if (!parsed.header.contains("Path:audio")) return
                 if (parsed.header.contains("Content-Type") && !parsed.header.contains("audio/mpeg")) return
                 if (parsed.payload.isEmpty()) return
-                audio.write(parsed.payload)
+                request.timing.mark("first-compressed-frame")
+                if (failure.get() != null || cancelled.get()) return
+                try {
+                    app.noveltts.engine.api.AudioBudget.check(audio.size().toLong(), parsed.payload.size.toLong(), app.noveltts.engine.api.AudioBudget.COMPRESSED, "压缩音频")
+                    audio.write(parsed.payload)
+                } catch (error: app.noveltts.engine.api.ResourceLimitException) {
+                    failure.compareAndSet(null, error)
+                    webSocket.cancel()
+                    done.countDown()
+                    return
+                }
                 audioFrames.incrementAndGet()
             }
 
@@ -191,8 +229,14 @@ class EdgeTtsEngine(
                 done.countDown()
             }
 
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                if (done.count > 0) failure.compareAndSet(null, IOException("在线服务在合成完成前关闭连接"))
+                webSocket.close(code, null)
+                done.countDown()
+            }
+
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                if (done.count > 0 && audioFrames.get() == 0) {
+                if (done.count > 0) {
                     failure.compareAndSet(null, IOException("在线服务提前关闭连接：$reason"))
                 }
                 done.countDown()
@@ -212,9 +256,10 @@ class EdgeTtsEngine(
             listener,
         )
         socketRef.set(ws)
+        if (cancelled.get() || closed.get()) { ws.cancel(); done.countDown() }
         try {
-            val timeoutSec = (request.options?.timeoutSec ?: settings.requestTimeoutSec).toLong().coerceIn(10L, 180L)
-            if (!done.await(timeoutSec, TimeUnit.SECONDS)) {
+            val timeoutMillis = request.remainingTimeoutMillis() ?: error("Missing Edge request deadline")
+            if (!done.await(timeoutMillis, TimeUnit.MILLISECONDS)) {
                 ws.cancel()
                 throw IOException("在线语音服务响应超时")
             }
@@ -223,13 +268,14 @@ class EdgeTtsEngine(
         }
         if (cancelled.get()) throw IOException("已取消")
         failure.get()?.let { throw it }
+        request.timing.mark("compressed-received")
         val bytes = audio.toByteArray()
-        if (bytes.isEmpty()) throw IOException("在线服务没有返回音频")
         return bytes
     }
 
     private fun buildUrl(connectionId: String, endpoint: String? = null): String {
         val configured = (endpoint ?: settings.edgeEndpoint).trim().ifBlank { SettingsStore.DEFAULT_EDGE_ENDPOINT }
+        require(java.net.URI(configured).let { it.scheme == "wss" && !it.host.isNullOrBlank() && it.userInfo == null }) { "Edge 端点必须使用有效的 WSS 地址" }
         val separator = if ('?' in configured) '&' else '?'
         val auth = if (
             configured.contains("Ocp-Apim-Subscription-Key", ignoreCase = true) ||

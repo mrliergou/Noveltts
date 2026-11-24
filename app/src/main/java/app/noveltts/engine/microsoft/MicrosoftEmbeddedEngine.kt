@@ -71,18 +71,37 @@ class MicrosoftEmbeddedEngine(
         executor.execute {
             var config: EmbeddedSpeechConfig? = null
             var synthesizer: SpeechSynthesizer? = null
+            var outputStream: com.microsoft.cognitiveservices.speech.audio.AudioOutputStream? = null
+            var outputConfig: AudioConfig? = null
+            val pcmBuffer = app.noveltts.engine.api.BoundedAudioBuffer()
+            val limitFailure = AtomicReference<app.noveltts.engine.api.ResourceLimitException?>(null)
             try {
                 config = EmbeddedSpeechConfig.fromPath(modelDirectory.absolutePath)
                 config.setSpeechSynthesisVoice(descriptor.param, license)
                 config.setSpeechSynthesisOutputFormat(
                     SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm,
                 )
-                synthesizer = SpeechSynthesizer(config, null as AudioConfig?)
+                outputStream = com.microsoft.cognitiveservices.speech.audio.AudioOutputStream.createPushStream(
+                    object : com.microsoft.cognitiveservices.speech.audio.PushAudioOutputStreamCallback() {
+                        override fun write(data: ByteArray): Int {
+                            if (cancelled.get() || closed.get() || limitFailure.get() != null) return 0
+                            return try { pcmBuffer.write(data) }
+                            catch (error: app.noveltts.engine.api.ResourceLimitException) {
+                                limitFailure.compareAndSet(null, error)
+                                runCatching { synthesizerRef.get()?.StopSpeakingAsync() }
+                                0
+                            }
+                        }
+                        override fun close() = Unit
+                    })
+                outputConfig = AudioConfig.fromStreamOutput(outputStream)
+                synthesizer = SpeechSynthesizer(config, outputConfig)
                 synthesizerRef.set(synthesizer)
                 if (cancelled.get()) return@execute
 
                 val result = synthesizer.SpeakSsml(buildSsml(descriptor, request))
                 try {
+                    limitFailure.get()?.let { throw it }
                     if (cancelled.get()) return@execute
                     if (result.reason != ResultReason.SynthesizingAudioCompleted) {
                         val details = runCatching {
@@ -97,9 +116,11 @@ class MicrosoftEmbeddedEngine(
                         return@execute
                     }
 
-                    val pcm = applyGain(result.audioData, request.volume)
+                    val raw = pcmBuffer.toByteArray()
+                    app.noveltts.engine.api.AudioBudget.check(0, raw.size.toLong(), app.noveltts.engine.api.AudioBudget.NORMALIZED_PCM, "离线 PCM")
+                    val pcm = applyGain(raw, request.volume)
                     if (pcm.isEmpty()) {
-                        listener.onError(SynthesisError.SYNTHESIS_FAILED, "嵌入式语音没有返回音频")
+                        listener.onError(SynthesisError.NO_AUDIO, "嵌入式语音正常结束但没有音频")
                         return@execute
                     }
                     listener.onStart(24_000, AudioFormat.ENCODING_PCM_16BIT, 1)
@@ -114,6 +135,12 @@ class MicrosoftEmbeddedEngine(
                 } finally {
                     result.close()
                 }
+            } catch (error: OutOfMemoryError) {
+                runCatching { synthesizerRef.get()?.StopSpeakingAsync() }
+                if (!cancelled.get()) listener.onError(SynthesisError.RESOURCE_LIMIT, "离线音频内存不足")
+            } catch (error: app.noveltts.engine.api.ResourceLimitException) {
+                runCatching { synthesizerRef.get()?.StopSpeakingAsync() }
+                if (!cancelled.get()) listener.onError(SynthesisError.RESOURCE_LIMIT, error.message)
             } catch (error: Throwable) {
                 DiagnosticsLog.error(Category.ENGINE, "嵌入式语音初始化或合成失败：${descriptor.systemName}", error.message?.take(200))
                 if (!cancelled.get()) {
@@ -126,6 +153,8 @@ class MicrosoftEmbeddedEngine(
             } finally {
                 synthesizerRef.compareAndSet(synthesizer, null)
                 runCatching { synthesizer?.close() }
+                runCatching { outputConfig?.close() }
+                runCatching { outputStream?.close() }
                 runCatching { config?.close() }
             }
         }

@@ -5,6 +5,7 @@ import app.noveltts.data.config.CONFIGURATION_LOCK
 import app.noveltts.domain.BuiltInRole
 import app.noveltts.domain.BuiltInRoleSettings
 import app.noveltts.domain.RolePlaybackSettings
+import app.noveltts.domain.UnattributedPolicy
 import app.noveltts.engine.DiagnosticsLog
 import app.noveltts.engine.api.EngineRequestOptions
 
@@ -14,6 +15,7 @@ data class SynthesisSettings(
     val silenceBetweenSegmentsMs: Int, val cacheEnabled: Boolean, val cacheMaxMb: Int,
     val licenseConfigured: Boolean, val options: EngineRequestOptions,
     val builtInRoles: BuiltInRoleSettings,
+    val unattributedPolicy: UnattributedPolicy,
 )
 
 class SettingsStore(context: Context) {
@@ -25,6 +27,33 @@ class SettingsStore(context: Context) {
         if (preferences.getBoolean("notificationPermissionRequested", false)) false
         else { preferences.edit().putBoolean("notificationPermissionRequested", true).apply(); true }
     }
+
+    /** Default off. A passing, device-specific evidence report is required before enabling. */
+    val firstSegmentEnabled: Boolean
+        get() = synchronized(CONFIGURATION_LOCK) {
+            preferences.getBoolean("firstSegmentEnabled", false) && firstSegmentEvidence()?.accepted == true
+        }
+    fun firstSegmentEvidence(): app.noveltts.domain.FirstSegmentEvidence? = synchronized(CONFIGURATION_LOCK) {
+        runCatching { preferences.getString("firstSegmentEvidence", null)?.let(app.noveltts.domain.FirstSegmentEvidence::parse) }.getOrNull()
+    }
+    fun setFirstSegmentEvidence(report: String) {
+        app.noveltts.domain.FirstSegmentEvidence.parse(report)
+        commitValues(mapOf("firstSegmentEvidence" to report, "firstSegmentEnabled" to false))
+    }
+    fun firstSegmentDeviceMatches(): Boolean = firstSegmentEvidence()?.device == "${android.os.Build.MANUFACTURER}/${android.os.Build.MODEL}/${android.os.Build.VERSION.SDK_INT}"
+    fun firstSegmentApplies(voiceId: String, voiceRevision: String, parameters: String): Boolean = synchronized(CONFIGURATION_LOCK) {
+        preferences.getBoolean("firstSegmentEnabled", false) && firstSegmentEvidence()?.matches(
+            "${android.os.Build.MANUFACTURER}/${android.os.Build.MODEL}/${android.os.Build.VERSION.SDK_INT}", voiceId, voiceRevision, parameters,
+        ) == true
+    }
+    fun enableFirstSegmentExperiment(enabled: Boolean) {
+        require(!enabled || firstSegmentEvidence()?.accepted == true && firstSegmentDeviceMatches()) { "尚未达到首段实验启用门槛：至少 30 组配对，首音中位数改善 10%，P95 不变差且取消续读通过" }
+        commitValues(mapOf("firstSegmentEnabled" to enabled))
+    }
+
+    var keepAwake: Boolean
+        get() = synchronized(CONFIGURATION_LOCK) { preferences.getBoolean("keepAwake", false) }
+        set(value) = commitValues(mapOf("keepAwake" to value))
 
     var punctuationFilter: Boolean
         get() = synchronized(CONFIGURATION_LOCK) {
@@ -83,7 +112,9 @@ class SettingsStore(context: Context) {
             ?: DEFAULT_EDGE_ENDPOINT
         }
         set(value) = synchronized(CONFIGURATION_LOCK) {
-            preferences.edit().putString(KEY_EDGE_ENDPOINT, value.trim()).apply()
+            val endpoint = value.trim().ifBlank { DEFAULT_EDGE_ENDPOINT }
+            require(isSecureEdgeEndpoint(endpoint)) { "Edge 端点必须使用有效的 WSS 地址" }
+            preferences.edit().putString(KEY_EDGE_ENDPOINT, endpoint).apply()
         }
 
     var compatibilityProxy: Boolean
@@ -103,6 +134,15 @@ class SettingsStore(context: Context) {
         }
         set(value) = synchronized(CONFIGURATION_LOCK) {
             preferences.edit().putString(KEY_THEME_MODE, normalizeThemeMode(value)).apply()
+        }
+
+    /** 没写是谁说的对话怎么读，取值见 [UnattributedPolicy]；未知值回落到默认。 */
+    var unattributedDialogue: String
+        get() = synchronized(CONFIGURATION_LOCK) {
+            UnattributedPolicy.fromStorage(preferences.getString(KEY_UNATTRIBUTED_DIALOGUE, null)).name
+        }
+        set(value) = synchronized(CONFIGURATION_LOCK) {
+            preferences.edit().putString(KEY_UNATTRIBUTED_DIALOGUE, UnattributedPolicy.fromStorage(value).name).apply()
         }
 
     // ---- 阶段 7：合成参数 ----------------------------------------------------
@@ -246,10 +286,18 @@ class SettingsStore(context: Context) {
     /** 外部调用访问令牌；空串表示尚未生成。 */
     var forwardToken: String
         get() = synchronized(CONFIGURATION_LOCK) {
-            preferences.getString(KEY_FORWARD_TOKEN, "").orEmpty().also(DiagnosticsLog::registerSensitiveValue)
+            if (preferences.contains(KEY_FORWARD_TOKEN)) {
+                val legacy = preferences.getString(KEY_FORWARD_TOKEN, "").orEmpty()
+                if (secrets.encryptedValue(KEY_FORWARD_TOKEN) == null && legacy.isNotBlank()) secrets.put(KEY_FORWARD_TOKEN, legacy)
+                check(preferences.edit().remove(KEY_FORWARD_TOKEN).commit()) { "旧令牌迁移失败" }
+            }
+            val encrypted = secrets.encryptedValue(KEY_FORWARD_TOKEN)
+            if (encrypted == null) "" else secrets.get(KEY_FORWARD_TOKEN)
+                ?: throw IllegalStateException("访问令牌无法解密，请重新设置")
         }
         set(value) = synchronized(CONFIGURATION_LOCK) {
-            preferences.edit().putString(KEY_FORWARD_TOKEN, value.trim()).apply()
+            secrets.put(KEY_FORWARD_TOKEN, value.trim())
+            check(preferences.edit().remove(KEY_FORWARD_TOKEN).commit()) { "旧令牌清理失败" }
         }
 
     // ---- 阶段 5：本地系统 TTS 桥接 -------------------------------------------
@@ -269,15 +317,25 @@ class SettingsStore(context: Context) {
             // 本应用自己的包名一律落库为空：否则合成会递归回自己。
             val safe = if (trimmed == appContext.packageName) "" else trimmed
             preferences.edit().putString(KEY_LOCAL_TTS_ENGINE_PACKAGE, safe).apply()
+            app.noveltts.data.voicepack.VoicePackEvents.invalidate()
         }
 
     fun setLicense(value: String?) = synchronized(CONFIGURATION_LOCK) {
         secrets.put(KEY_LICENSE, value)
+        app.noveltts.data.voicepack.VoicePackEvents.invalidate()
     }
 
     fun license(): String? = synchronized(CONFIGURATION_LOCK) { secrets.get(KEY_LICENSE) }
 
-    fun hasLicense(): Boolean = !license().isNullOrBlank()
+    fun hasLicense(): Boolean = synchronized(CONFIGURATION_LOCK) {
+        val encrypted = secrets.encryptedValue(KEY_LICENSE)
+        if (!licenseStatusLoaded || encrypted != licenseStatusKey) {
+            licenseStatusConfigured = !license().isNullOrBlank()
+            licenseStatusKey = encrypted
+            licenseStatusLoaded = true
+        }
+        licenseStatusConfigured
+    }
 
     fun licenseMask(): String {
         val license = license() ?: return ""
@@ -288,20 +346,29 @@ class SettingsStore(context: Context) {
     fun <T> withConfigurationLock(block: () -> T): T = synchronized(CONFIGURATION_LOCK, block)
     fun snapshot(): Map<String, Any?> = withConfigurationLock { preferences.all.toMap() }
     fun credentialSnapshot(): Map<String, String> = withConfigurationLock { secrets.encryptedSnapshot() }
-    fun restoreCredentialSnapshot(snapshot: Map<String, String>) = withConfigurationLock { secrets.restoreEncryptedSnapshot(snapshot) }
+    fun restoreCredentialSnapshot(snapshot: Map<String, String>) = withConfigurationLock {
+        secrets.restoreEncryptedSnapshot(snapshot)
+        app.noveltts.data.voicepack.VoicePackEvents.invalidate()
+    }
     fun flush() = withConfigurationLock { check(preferences.edit().commit()) { "设置同步失败" }; secrets.flush() }
 
     fun synthesisSnapshot(): SynthesisSettings = withConfigurationLock {
         SynthesisSettings(narratorVoice, dialogueVoice, systemVoice, punctuationFilter, maxSegmentChars,
             maxRetryCount, silenceBetweenSegmentsMs, cacheEnabled, cacheMaxMb, hasLicense(),
-            EngineRequestOptions(edgeEndpoint, requestTimeoutSec, localTtsEnginePackage), builtInRoles())
+            EngineRequestOptions(edgeEndpoint, requestTimeoutSec, localTtsEnginePackage), builtInRoles(),
+            UnattributedPolicy.fromStorage(unattributedDialogue))
     }
 
     /** A checked, single SharedPreferences commit is used for configuration and restore transactions. */
     fun commitValues(values: Map<String, Any?>, replace: Boolean = false) = withConfigurationLock {
         val editor = preferences.edit()
         if (replace) editor.clear()
-        values.forEach { (key, value) -> when (value) {
+        val previousCredentials = if (KEY_FORWARD_TOKEN in values) secrets.encryptedSnapshot() else null
+        if (KEY_FORWARD_TOKEN in values) {
+            secrets.put(KEY_FORWARD_TOKEN, values[KEY_FORWARD_TOKEN] as? String)
+            editor.remove(KEY_FORWARD_TOKEN)
+        }
+        values.filterKeys { it != KEY_FORWARD_TOKEN }.forEach { (key, value) -> when (value) {
             null -> editor.remove(key)
             is Boolean -> editor.putBoolean(key, value)
             is Int -> editor.putInt(key, value)
@@ -311,7 +378,13 @@ class SettingsStore(context: Context) {
             is Set<*> -> editor.putStringSet(key, value.filterIsInstance<String>().toSet())
             else -> throw IllegalArgumentException("Unsupported setting: $key")
         } }
-        check(editor.commit()) { "设置写入失败" }
+        if (!editor.commit()) {
+            previousCredentials?.let(secrets::restoreEncryptedSnapshot)
+            error("设置写入失败")
+        }
+        if (replace || KEY_LOCAL_TTS_ENGINE_PACKAGE in values) app.noveltts.data.voicepack.VoicePackEvents.invalidate()
+        if ("keepAwake" in values && app.noveltts.service.PlaybackSession.activeCount() > 0)
+            runCatching { appContext.startForegroundService(android.content.Intent(appContext, app.noveltts.service.PlaybackForegroundService::class.java)) }
     }
 
     fun commitForward(config: app.noveltts.forward.ForwardConfig) {
@@ -324,6 +397,13 @@ class SettingsStore(context: Context) {
         value?.trim()?.uppercase()?.takeIf { it in THEME_MODES } ?: DEFAULT_THEME_MODE
 
     companion object {
+        fun isSecureEdgeEndpoint(value: String): Boolean = runCatching {
+            val uri = java.net.URI(value)
+            uri.scheme == "wss" && !uri.host.isNullOrBlank() && uri.userInfo == null && uri.fragment == null
+        }.getOrDefault(false)
+        private var licenseStatusLoaded = false
+        private var licenseStatusKey: String? = null
+        private var licenseStatusConfigured = false
         /**
          * Edge 朗读端点。必须与 edge-tts 参考实现保持一致：
          * 旧版 `api.msedgeservices.com/tts/cognitiveservices/websocket/v1` 会直接返回 403。
@@ -395,6 +475,7 @@ class SettingsStore(context: Context) {
 
         private const val KEY_PUNCTUATION_FILTER = "punctuationFilter"
     private const val KEY_THEME_MODE = "themeMode"
+        private const val KEY_UNATTRIBUTED_DIALOGUE = "unattributedDialogue"
         private const val KEY_NARRATOR = "narratorVoice"
         private const val KEY_DIALOGUE = "dialogueVoice"
         private const val KEY_SYSTEM_VOICE = "systemVoice"

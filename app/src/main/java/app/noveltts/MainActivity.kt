@@ -7,30 +7,44 @@ import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.viewModels
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.noveltts.data.settings.SettingsStore
 import app.noveltts.engine.DiagnosticsLog
 import app.noveltts.ui.AppSection
 import app.noveltts.ui.MainViewModel
 import app.noveltts.ui.MultiTtsScreen
+import app.noveltts.ui.common.ConfirmDialog
 import app.noveltts.ui.theme.MultiTtsTheme
 
 class MainActivity : ComponentActivity() {
-    private val viewModel: MainViewModel by viewModels()
+    private val viewModel: MainViewModel by lazy {
+        androidx.lifecycle.ViewModelProvider(application as NovelTtsApplication,
+            androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.getInstance(application))[MainViewModel::class.java]
+    }
+    private var openRequest by mutableStateOf<String?>(null)
+    private var pendingPackUrl by mutableStateOf<String?>(null)
+    private var pendingCatalogUrl by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         app.noveltts.data.backup.ConfigurationRecovery.recover(this)
-        Log.i(TAG, "onCreate intent=$intent")
+        Log.i(TAG, "onCreate action=${intent?.action}")
+        openRequest = savedInstanceState?.getString("pendingOpen")
+        pendingPackUrl = savedInstanceState?.getString(STATE_PACK_URL)
+        pendingCatalogUrl = savedInstanceState?.getString(STATE_CATALOG_URL)
         // 诊断日志落盘：只挂载不 detach，进程活着就一直异步追加；目录不可写时静默退化为纯内存。
         DiagnosticsLog.attachStore(filesDir)
         DiagnosticsLog.restoreRecent()
         handleDebugExtras(intent)
-        handleSharedText(intent)
-        handlePackInstall(intent)
-        handleCatalogIntent(intent)
+        if (savedInstanceState == null) {
+            handleOpenIntent(intent)
+            handleSharedText(intent)
+            handlePackInstall(intent)
+            handleCatalogIntent(intent)
+        }
 
         setContent {
             val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -38,10 +52,11 @@ class MainActivity : ComponentActivity() {
                 MultiTtsScreen(
                     viewModel = viewModel,
                     onOpenSystemSpeechSettings = ::openSystemSpeechSettings,
-                    openSectionOnStart = openSection(intent),
-                    openLogsOnStart = intent?.getStringExtra(EXTRA_OPEN)?.trim()?.lowercase() == OPEN_LOGS,
-                    openIntegrationOnStart = intent?.getStringExtra(EXTRA_OPEN) == "integration",
-                    openSettingsDetailOnStart = when (intent?.getStringExtra(EXTRA_OPEN)) {
+                    onOpenConsumed = { openRequest = null },
+                    openSectionOnStart = openSection(openRequest),
+                    openLogsOnStart = openRequest == OPEN_LOGS,
+                    openIntegrationOnStart = openRequest == "integration",
+                    openSettingsDetailOnStart = when (openRequest) {
                         "external" -> "EXTERNAL_CALL"
                         "reading" -> "READING"
                         "data" -> "DATA"
@@ -50,31 +65,59 @@ class MainActivity : ComponentActivity() {
                         else -> null
                     },
                 )
+                val packUrl = pendingPackUrl
+                val catalogUrl = pendingCatalogUrl
+                if (packUrl != null || catalogUrl != null) {
+                    val isPack = packUrl != null
+                    val url = packUrl ?: catalogUrl.orEmpty()
+                    val dismiss = { if (isPack) pendingPackUrl = null else pendingCatalogUrl = null }
+                    ConfirmDialog(
+                        title = if (isPack) "安装外部语音包？" else "更改在线目录？",
+                        message = (if (isPack) "外部应用请求下载并安装以下语音包，已有同包配置可能被替换。"
+                            else "外部应用请求将在线目录改为以下地址。") + "\n\n" + url.take(500),
+                        confirmLabel = if (isPack) "安装" else "更改并刷新",
+                        dangerous = isPack,
+                        onConfirm = {
+                            dismiss()
+                            if (isPack) viewModel.installPackFromUrl(url)
+                            else { viewModel.setCatalogUrl(url); viewModel.refreshCatalog() }
+                        },
+                        onDismiss = dismiss,
+                    )
+                }
             }
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("pendingOpen", openRequest)
+        outState.putString(STATE_PACK_URL, pendingPackUrl)
+        outState.putString(STATE_CATALOG_URL, pendingCatalogUrl)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        Log.i(TAG, "onNewIntent intent=$intent")
+        Log.i(TAG, "onNewIntent action=${intent.action}")
         handleDebugExtras(intent)
         handleSharedText(intent)
         handlePackInstall(intent)
         handleCatalogIntent(intent)
-        // 运行中再次收到「直达页面」请求时重建一次，让 onCreate 的启动路由生效。
-        if (handleOpenExtra(intent)) recreate()
+        // Route each explicit request once without recreating the Activity.
+        handleOpenIntent(intent)
     }
 
-    /** `--es open <页面>` 是否属于本 Activity 需要处理的直达请求。 */
-    private fun handleOpenExtra(intent: Intent?): Boolean =
-        openSection(intent) != null || intent?.getStringExtra(EXTRA_OPEN)?.trim()?.lowercase() == OPEN_LOGS
-
+    private fun handleOpenIntent(intent: Intent?) {
+        val value = intent?.getStringExtra(EXTRA_OPEN)?.trim()?.lowercase()
+        intent?.removeExtra(EXTRA_OPEN)
+        if (openSection(value) != null || value == OPEN_LOGS) openRequest = value
+    }
     /**
      * 支持通过 `--es open <workbench|voicepacks|roles|replacements|settings|logs>` 直达页面，
      * 便于分发链接与自动化验证；未知取值回落到工作台。
      */
-    private fun openSection(intent: Intent?): AppSection? = when (intent?.getStringExtra(EXTRA_OPEN)?.trim()?.lowercase()) {
+    private fun openSection(value: String?): AppSection? = when (value) {
         OPEN_WORKBENCH -> AppSection.WORKBENCH
         OPEN_VOICE_PACKS, "packs" -> AppSection.PACKS
         "roles" -> AppSection.ROLES
@@ -87,19 +130,17 @@ class MainActivity : ComponentActivity() {
         if (intent?.action != Intent.ACTION_SEND || intent.type != "text/plain") return
         val sharedText = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString().orEmpty()
         if (sharedText.isBlank()) return
+        intent.removeExtra(Intent.EXTRA_TEXT)
         viewModel.updateText(sharedText)
         viewModel.speak()
     }
 
     /**
-     * 支持通过 `am start … --es packUrl <zip 直链>` 直接安装语音包，
-     * 便于分发链接与自动化验证；日常使用走「语音包」界面的导入/下载。
+     * External install requests require confirmation before downloading or replacing a package.
+     * Consume the extra before showing the dialog, so rotation never repeats an accepted request.
      */
     private fun handlePackInstall(intent: Intent?) {
-        val url = intent?.getStringExtra(EXTRA_PACK_URL)?.trim().orEmpty()
-        Log.i(TAG, "handlePackInstall hasUrl=${url.isNotEmpty()}")
-        if (url.isEmpty()) return
-        viewModel.installPackFromUrl(url)
+        pendingPackUrl = consumeExternalUrl(intent, EXTRA_PACK_URL) ?: pendingPackUrl
     }
 
     /**
@@ -130,16 +171,27 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** `--es catalog <catalog.json 地址>`：设置在线目录并立即刷新，便于分发与自动化验证。 */
+    /** External directory changes follow the same confirmation and one-shot handling as installs. */
     private fun handleCatalogIntent(intent: Intent?) {
-        val catalog = intent?.getStringExtra(EXTRA_CATALOG_URL)?.trim().orEmpty()
-        if (catalog.isEmpty()) return
-        viewModel.setCatalogUrl(catalog)
-        viewModel.refreshCatalog()
+        pendingCatalogUrl = consumeExternalUrl(intent, EXTRA_CATALOG_URL) ?: pendingCatalogUrl
+    }
+
+    private fun consumeExternalUrl(intent: Intent?, key: String): String? {
+        val url = intent?.getStringExtra(key)?.trim().orEmpty()
+        intent?.removeExtra(key)
+        if (url.isEmpty()) return null
+        val protocol = runCatching { java.net.URL(url).protocol }.getOrNull()
+        if (protocol !in setOf("http", "https") || url.length > 8192) {
+            Toast.makeText(this, "外部地址无效，仅支持 HTTP / HTTPS", Toast.LENGTH_LONG).show()
+            return null
+        }
+        return url
     }
 
     private companion object {
         const val TAG = "MainActivity"
+        const val STATE_PACK_URL = "pendingPackUrl"
+        const val STATE_CATALOG_URL = "pendingCatalogUrl"
         const val EXTRA_PACK_URL = "packUrl"
         const val EXTRA_CATALOG_URL = "catalog"
         const val EXTRA_OPEN = "open"

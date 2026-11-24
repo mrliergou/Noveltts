@@ -45,8 +45,32 @@ data class ParsedPack(
 }
 
 object PackYaml {
+    private const val MAX_CACHED_PACKS = 8
+    private const val MAX_CACHED_CHARS = 262_144
+    private val parsedCache = java.util.LinkedHashMap<Pair<String, String>, ParsedPack>(8, 0.75f, true)
 
     fun parse(configText: String, enginesText: String): ParsedPack {
+        // Registry refreshes still read the manifests. Exact contents invalidate the cache,
+        // including same-size edits; large manifests do not occupy the bounded parse cache.
+        if (configText.length.toLong() + enginesText.length > MAX_CACHED_CHARS) {
+            return parseUncached(configText, enginesText)
+        }
+        val key = configText to enginesText
+        synchronized(parsedCache) { parsedCache[key]?.let { return it } }
+        val parsed = parseUncached(configText, enginesText)
+        return synchronized(parsedCache) {
+            parsedCache[key] ?: parsed.also {
+                parsedCache[key] = it
+                if (parsedCache.size > MAX_CACHED_PACKS) {
+                    val oldest = parsedCache.keys.iterator()
+                    oldest.next()
+                    oldest.remove()
+                }
+            }
+        }
+    }
+
+    private fun parseUncached(configText: String, enginesText: String): ParsedPack {
         val config = loadRoot(configText)
         val engineDocument = loadRoot(enginesText)
         val declared = engineDocument["engines"]
@@ -97,7 +121,8 @@ object PackYaml {
                 }
             }
         }
-        return ParsedPack(engines = engines, voices = voices)
+        require(voices.distinctBy { it.engineCode to it.code }.size == voices.size) { "同一引擎的音色代码重复" }
+        return ParsedPack(engines = java.util.Collections.unmodifiableList(engines), voices = java.util.Collections.unmodifiableList(voices))
     }
 
     /**
@@ -110,8 +135,8 @@ object PackYaml {
     private val TAG_PATTERN = Regex("!![A-Za-z0-9_.$]+")
 
     private fun loadRoot(text: String): Map<String, Any?> {
-        val loaded = Yaml(SafeConstructor(LoaderOptions())).load<Any?>(stripTags(text))
-        return loaded.asMap().orEmpty()
+        val loaded = Yaml(SafeConstructor(LoaderOptions().apply { codePointLimit = 4 * 1024 * 1024 })).load<Any?>(stripTags(text))
+        return loaded.asMap() ?: throw IllegalArgumentException("YAML 根节点必须为映射")
     }
 
     private fun Any?.asMap(): Map<String, Any?>? {

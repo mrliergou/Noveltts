@@ -49,9 +49,13 @@ private const val VOICE_EXPANDED_LIMIT = 10
 
 @Composable
 fun PacksPage(state: MainUiState, viewModel: MainViewModel, onImport: () -> Unit) {
+    var resetOverrides by rememberSaveable { mutableStateOf(false) }
     var pendingRemoval by remember { mutableStateOf<VoicePack?>(null) }
     var browsingPackId by rememberSaveable { mutableStateOf<String?>(null) }
 
+    if (resetOverrides) ConfirmDialog(title = "重置音色配置？", message = "将恢复语音包默认设置。原配置文件会另存保留，角色和语音包不受影响。",
+        confirmLabel = "重置", dangerous = true, onConfirm = { resetOverrides = false; viewModel.resetVoiceOverrides() },
+        onDismiss = { resetOverrides = false })
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -66,7 +70,7 @@ fun PacksPage(state: MainUiState, viewModel: MainViewModel, onImport: () -> Unit
             color = Ink,
         )
         Text(
-            text = "支持原版包（config.yaml + engines.yaml）与旧版 pack.json 包。包只声明音色，安装后即可在系统 TTS 中选择。",
+            text = "支持原版包（config.yaml + engines.yaml）与旧版 pack.json 包。原版包中的可用音色会注册到系统 TTS；离线音色另需模型与合法许可证。旧版包仅保留导入兼容，不注册系统音色。",
             style = MaterialTheme.typography.bodySmall,
             color = Muted,
         )
@@ -109,6 +113,15 @@ fun PacksPage(state: MainUiState, viewModel: MainViewModel, onImport: () -> Unit
             Text(text = message, style = MaterialTheme.typography.bodySmall, color = Ink)
         }
 
+        state.voiceOverridesError?.let { error ->
+            Text("音色配置无法读取：$error", color = MaterialTheme.colorScheme.error)
+            Text("暂按语音包默认配置朗读；修复前无法保存音色设置。")
+            TextButton(onClick = viewModel::recoverVoiceOverrides) { Text("恢复音色配置备份") }
+            TextButton(onClick = { resetOverrides = true }) { Text("重置音色配置") }
+        }
+        state.packProblems.forEach { Text(it, color = MaterialTheme.colorScheme.error) }
+        val unavailable = state.voices.filter { !it.usable }.groupingBy { it.unusableReason ?: "未知原因" }.eachCount()
+        unavailable.forEach { (reason, count) -> Text("$count 个音色不可用：$reason", style = MaterialTheme.typography.bodySmall) }
         SectionTitle("已安装（${state.packs.size}）")
         if (state.packs.isEmpty()) {
             EmptyState("还没有语音包。可导入本地 zip，或填写在线目录后刷新下载。", icon = AppIcon.FOLDER)

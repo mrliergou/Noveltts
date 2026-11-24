@@ -6,7 +6,6 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.media.AudioFormat
 import android.os.Build
-import android.os.Bundle
 import android.speech.tts.SynthesisCallback
 import android.speech.tts.SynthesisRequest
 import android.speech.tts.TextToSpeech
@@ -32,11 +31,7 @@ import app.noveltts.engine.api.SynthesisHandle
 import app.noveltts.engine.api.SynthesisListener
 import java.io.File
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicReference
 
 /**
  * MultiTTS 自己的 Android TextToSpeechService。
@@ -51,7 +46,7 @@ class MultiTtsService : TextToSpeechService() {
     private val rules by lazy { RulesRepository(this) }
     private val engines by lazy { EngineManager(this, settings) }
     // spool 目录开启“先落盘再回放”：单段失败可换备用音色，取消时能直接丢弃半成品。
-    private val synthesizer by lazy {
+    private val synthesizerDelegate = lazy {
         MultiSegmentSynthesizer(
             engines,
             spoolDir = File(cacheDir, "spool"),
@@ -60,28 +55,21 @@ class MultiTtsService : TextToSpeechService() {
             cacheEnabled = settings.cacheEnabled,
         )
     }
-    private val voiceLock = Any()
-
-    @Volatile
-    private var cachedVoices: List<Voice> = emptyList()
-
-    @Volatile
-    private var cachedDescriptors: List<VoiceDescriptor> = emptyList()
-
-    /** 上面两份缓存是按哪个本地引擎包名算出来的：设置一改就要重算。 */
-    private var cachedLocalEnginePackage: String? = null
-    private var cachedLicenseConfigured: Boolean? = null
+    private val synthesizer by synthesizerDelegate
+    private val catalog by lazy { app.noveltts.data.voicepack.VoiceCatalog(load = {
+        registry.voices(settings.hasLicense(), settings.localTtsEnginePackage)
+    }) }
     private val stopGeneration = AtomicLong()
 
     @Volatile
-    private var active: ActiveSynthesis? = null
+    private var active: SynthesisCallbackPump? = null
 
     @Volatile private var loadedVoiceName: String? = null
 
     private val stopPlaybackReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == PlaybackSession.ACTION_STOP_SYNTHESIS &&
-                intent.getStringExtra(PlaybackSession.EXTRA_SESSION_ID) == null) onStop()
+                intent.getStringExtra(PlaybackSession.EXTRA_SESSION_ID) == null) active?.fail(TextToSpeech.ERROR_SERVICE)
         }
     }
 
@@ -102,9 +90,9 @@ class MultiTtsService : TextToSpeechService() {
             registerReceiver(stopPlaybackReceiver, IntentFilter(PlaybackSession.ACTION_STOP_SYNTHESIS), Context.RECEIVER_NOT_EXPORTED)
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(refreshReceiver, filter)
+            registerReceiver(refreshReceiver, filter, VoicePackEvents.INTERNAL_PERMISSION, null)
             @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(stopPlaybackReceiver, IntentFilter(PlaybackSession.ACTION_STOP_SYNTHESIS))
+            registerReceiver(stopPlaybackReceiver, IntentFilter(PlaybackSession.ACTION_STOP_SYNTHESIS), VoicePackEvents.INTERNAL_PERMISSION, null)
         }
         runCatching { refreshVoices() }.onFailure {
             DiagnosticsLog.error(Category.ENGINE, "系统音色扫描失败", it.message)
@@ -115,9 +103,9 @@ class MultiTtsService : TextToSpeechService() {
         runCatching { unregisterReceiver(refreshReceiver) }
         runCatching { unregisterReceiver(stopPlaybackReceiver) }
         stopGeneration.incrementAndGet()
-        active?.cancel()
+        active?.stop()
         active = null
-        runCatching { synthesizer.shutdown() }
+        if (synthesizerDelegate.isInitialized()) runCatching { synthesizer.shutdown() }
         super.onDestroy()
     }
 
@@ -167,178 +155,96 @@ class MultiTtsService : TextToSpeechService() {
     // ---- 合成 -------------------------------------------------------------
 
     override fun onSynthesizeText(request: SynthesisRequest, callback: SynthesisCallback) {
-        runCatching { synthesizeRequest(request, callback) }.onFailure {
-            DiagnosticsLog.error(Category.SPEECH, "系统合成请求失败", it.message)
-            safeError(callback)
+        val session = SynthesisCallbackPump()
+        val generation = stopGeneration.get()
+        active = session
+        if (generation != stopGeneration.get()) session.stop()
+        var lease: AutoCloseable? = null
+        try {
+            try {
+                lease = prepareRequest(request, session, generation)
+            } catch (error: Exception) {
+                DiagnosticsLog.error(Category.SPEECH, "系统合成请求失败", error.message)
+                if (generation == stopGeneration.get()) session.fail()
+            }
+            session.drain(object : SynthesisSink {
+                override val maxBufferSize get() = callback.maxBufferSize
+                override fun start(sampleRate: Int, format: Int, channels: Int) = callback.start(sampleRate, format, channels)
+                override fun audio(bytes: ByteArray, offset: Int, length: Int) = callback.audioAvailable(bytes, offset, length)
+                override fun error(code: Int) { callback.error(code) }
+                override fun done() { callback.done() }
+                override fun hasFinished() = callback.hasFinished()
+            })
+        } catch (error: Exception) {
+            session.fail()
+            if (generation == stopGeneration.get()) safeError(callback)
+            if (error is InterruptedException) Thread.currentThread().interrupt()
+        } finally {
+            if (active === session) active = null
+            lease?.close()
         }
     }
 
-    private fun synthesizeRequest(request: SynthesisRequest, callback: SynthesisCallback) {
+    private fun prepareRequest(request: SynthesisRequest, session: SynthesisCallbackPump, generation: Long): AutoCloseable? {
         val text = request.charSequenceText?.toString().orEmpty()
-        if (text.isBlank()) {
-            safeError(callback)
-            return
-        }
-
-        val generation = stopGeneration.get()
+        if (text.isBlank()) { session.onComplete(); return null }
         val requestId = java.util.UUID.randomUUID().toString().take(8)
-        DiagnosticsLog.info(Category.SPEECH, "系统请求 $requestId 已接收", DiagnosticsLog.textHint(text))
+        val rate = (request.speechRate / 100f).coerceIn(0.25f, 4f)
+        val pitch = (request.pitch / 100f).coerceIn(0.25f, 2f)
+        // Android applies KEY_PARAM_VOLUME to playback. Role and voice gains remain in the plan.
+        val volume = 1f
+        DiagnosticsLog.info(Category.SPEECH, "系统请求 $requestId 已接收",
+            "${DiagnosticsLog.textHint(text)} · inputRate=${request.speechRate}% inputPitch=${request.pitch}% · rate=$rate pitch=$pitch volume=$volume")
         val prepared = rules.withConfigurationLock {
             val config = settings.synthesisSnapshot()
             val descriptors = descriptors()
-            if (descriptors.none { it.usable }) {
-                DiagnosticsLog.warn(Category.SPEECH, "系统朗读被拒绝：没有可用音色")
-                return@withConfigurationLock null
-            }
-            val requested = descriptors.firstOrNull { it.systemName == request.voiceName && it.usable }
-            val narrator = requested
+            check(descriptors.any { it.usable }) { "没有可用音色" }
+            val narrator = descriptors.firstOrNull { it.systemName == request.voiceName && it.usable }
                 ?: descriptors.firstOrNull { it.systemName == config.narratorVoice && it.usable }
                 ?: descriptors.firstOrNull { it.systemName == config.systemVoice && it.usable }
                 ?: descriptors.firstOrNull { it.usable && it.localeTag.startsWith("zh") }
                 ?: descriptors.firstOrNull { it.usable }
             val dialogue = descriptors.firstOrNull { it.systemName == config.dialogueVoice && it.usable } ?: narrator
-            val plan = SynthesisPlanBuilder.build(text,
+            SynthesisPlanBuilder.Snapshot(text,
                 config.builtInRoles.withVoices(narrator?.systemName, dialogue?.systemName),
-                loadRulesOrEmpty("roles") { rules.loadRoles() }, loadRulesOrEmpty("replacements") { rules.loadReplacements() },
-                config.punctuationFilter, descriptors, config.maxSegmentChars)
-            plan to config
+                rules.loadRoles(), rules.loadReplacements(), config.punctuationFilter, descriptors,
+                config.maxSegmentChars, config.unattributedPolicy) to config
         }
-        val (plan, config) = prepared ?: run { safeError(callback); return }
-        if (generation != stopGeneration.get()) return
-        if (plan.segments.isEmpty()) {
-            val started = runCatching {
-                callback.start(24_000, AudioFormat.ENCODING_PCM_16BIT, 1)
-            }.getOrDefault(TextToSpeech.ERROR)
-            if (started == TextToSpeech.SUCCESS) {
-                runCatching { if (!callback.hasFinished()) callback.done() }
-            } else {
-                safeError(callback)
-            }
-            return
+        val (snapshot, config) = prepared
+        val plan = snapshot.build()
+        if (generation != stopGeneration.get()) { session.stop(); return null }
+        if (plan.segments.isEmpty()) { session.onComplete(); return null }
+        synthesizer.configure(RetryPolicy(config.maxRetryCount + 1), config.silenceBetweenSegmentsMs, config.options.timeoutSec)
+        synthesizer.configureCache(config.cacheEnabled, config.cacheMaxMb)
+        val lease = PlaybackSession.open(this, plan.segments.any { it.voice.isOnline }) {
+            session.fail(TextToSpeech.ERROR_SERVICE)
         }
-
-        val latch = CountDownLatch(1)
-        val aborted = AtomicBoolean(false)
-        val started = AtomicBoolean(false)
-        val failed = AtomicBoolean(false)
-        val listener = object : SynthesisListener {
-            override fun onStart(sampleRateHz: Int, audioFormat: Int, channelCount: Int) {
-                if (aborted.get() || !started.compareAndSet(false, true)) return
-                val result = runCatching {
-                    callback.start(sampleRateHz, audioFormat, channelCount)
-                }.getOrDefault(TextToSpeech.ERROR)
-                if (result != TextToSpeech.SUCCESS) {
-                    failed.set(true)
-                    aborted.set(true)
-                    latch.countDown()
-                }
-            }
-
-            override fun onAudio(pcm: ByteArray, offset: Int, length: Int) {
-                if (aborted.get() || failed.get() || !started.get() || length <= 0) return
-                val result = runCatching {
-                    callback.audioAvailable(pcm, offset, length)
-                }.getOrDefault(TextToSpeech.ERROR)
-                if (result != TextToSpeech.SUCCESS) {
-                    failed.set(true)
-                    aborted.set(true)
-                    latch.countDown()
-                }
-            }
-
-            override fun onComplete() {
-                if (!aborted.get() && !failed.get()) {
-                    runCatching { if (!callback.hasFinished()) callback.done() }
-                        .onFailure { Log.w(TAG, "callback.done failed", it) }
-                }
-                latch.countDown()
-            }
-
-            override fun onError(code: Int, message: String?) {
-                DiagnosticsLog.error(Category.SPEECH, "系统朗读失败 [$code]", message?.take(200))
-                Log.w(TAG, "synthesis error [$code] request=$requestId")
-                aborted.set(true)
-                if (!callback.hasFinished()) safeError(callback)
-                latch.countDown()
-            }
-        }
-
-        val session = ActiveSynthesis(latch, aborted)
-        active = session
-        if (generation != stopGeneration.get()) session.cancel()
-        var lease: AutoCloseable? = null
         try {
-            if (aborted.get()) return
-            synthesizer.configure(RetryPolicy(config.maxRetryCount + 1), config.silenceBetweenSegmentsMs, config.options.timeoutSec)
-            synthesizer.configureCache(config.cacheEnabled, config.cacheMaxMb)
-            lease = PlaybackSession.open(this, plan.segments.any { it.voice.isOnline }) { onStop() }
-            val handle = synthesizer.synthesize(plan.segments,
-                (request.speechRate / 100f).coerceIn(0.25f, 4f), (request.pitch / 100f).coerceIn(0.25f, 4f),
-                resolveVolume(request.params), listener, options = config.options, requestId = requestId)
-            session.attach(handle)
-            if (!latch.await(SYNTHESIS_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                failed.set(true)
-                session.cancel()
-                DiagnosticsLog.error(Category.SPEECH, "系统请求 $requestId 超时")
-            }
-        } catch (interrupted: InterruptedException) {
-            failed.set(true)
-            session.cancel()
-            Thread.currentThread().interrupt()
-        } finally {
-            if (failed.get()) { session.cancel(); safeError(callback) }
-            if (active === session) active = null
-            lease?.close()
+            session.attach(synthesizer.synthesize(plan.segments, rate, pitch, volume,
+                session, options = config.options, requestId = requestId))
+        } catch (error: Exception) {
+            lease.close()
+            throw error
         }
+        return lease
     }
+
     override fun onStop() {
         stopGeneration.incrementAndGet()
-        active?.cancel()
+        active?.stop()
     }
 
     // ---- 内部辅助 ---------------------------------------------------------
 
-    private fun invalidateVoices() {
-        synchronized(voiceLock) {
-            cachedVoices = emptyList()
-            cachedDescriptors = emptyList()
-        }
+    private fun invalidateVoices() { VoicePackEvents.invalidate() }
+
+    private fun refreshVoices(): List<Voice> = descriptors().filter { it.usable }.mapNotNull { descriptor ->
+        val locale = TtsLanguageProtocol.locale(descriptor.localeTag) ?: return@mapNotNull null
+        runCatching { Voice(descriptor.systemName, locale, Voice.QUALITY_HIGH, Voice.LATENCY_NORMAL,
+            descriptor.isOnline, emptySet()) }.getOrNull()
     }
 
-    private fun refreshVoices(): List<Voice> = rules.withConfigurationLock { synchronized(voiceLock) {
-        val licensed = settings.hasLicense()
-        if (cachedVoices.isNotEmpty() && cachedLocalEnginePackage == settings.localTtsEnginePackage && cachedLicenseConfigured == licensed) {
-            return@synchronized cachedVoices
-        }
-        cachedDescriptors = registry.voices(licensed, settings.localTtsEnginePackage)
-        cachedLicenseConfigured = licensed
-        cachedLocalEnginePackage = settings.localTtsEnginePackage
-        cachedVoices = cachedDescriptors.filter { it.usable }.mapNotNull { descriptor ->
-            val locale = TtsLanguageProtocol.locale(descriptor.localeTag) ?: return@mapNotNull null
-            runCatching {
-                Voice(
-                    descriptor.systemName,
-                    locale,
-                    Voice.QUALITY_HIGH,
-                    Voice.LATENCY_NORMAL,
-                    descriptor.isOnline,
-                    emptySet(),
-                )
-            }.getOrNull()
-        }
-        cachedVoices
-    } }
-
-    private fun descriptors(): List<VoiceDescriptor> = rules.withConfigurationLock { synchronized(voiceLock) {
-        val licensed = settings.hasLicense()
-        if (cachedDescriptors.isEmpty() || cachedLocalEnginePackage != settings.localTtsEnginePackage || cachedLicenseConfigured != licensed) {
-            cachedDescriptors = registry.voices(licensed, settings.localTtsEnginePackage)
-            cachedLicenseConfigured = licensed
-            cachedLocalEnginePackage = settings.localTtsEnginePackage
-        }
-        cachedDescriptors
-    } }
-
+    private fun descriptors(): List<VoiceDescriptor> = catalog.voices()
     private fun matchLanguage(lang: String?, country: String?, variant: String?): Int {
         val voices = refreshVoices()
         if (voices.isEmpty() || lang.isNullOrBlank()) return TextToSpeech.LANG_NOT_SUPPORTED
@@ -355,43 +261,13 @@ class MultiTtsService : TextToSpeechService() {
         return TtsLanguageProtocol.matches(locale, lang, country, variant)
     }
 
-    private fun resolveVolume(params: Bundle?): Float =
-        (params?.getFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1f) ?: 1f).coerceIn(0f, 1f)
-
-    /** 规则文件损坏或版本过新时不阻断系统朗读：本次按无规则处理，文件原样保留等待应用内修复。 */
-    private fun <T> loadRulesOrEmpty(label: String, load: () -> RuleSet<T>): RuleSet<T> =
-        try {
-            load()
-        } catch (error: RulesStoreException) {
-            DiagnosticsLog.warn(Category.PIPELINE, "$label 规则不可用，本次按无规则合成", error.message?.take(200))
-            Log.w(TAG, "$label unavailable, synthesizing without rules: ${error.message}")
-            RuleSet()
-        }
-
     private fun safeError(callback: SynthesisCallback) {
         runCatching {
-            if (!callback.hasFinished()) callback.error()
+            if (!callback.hasFinished()) { try { callback.error() } finally { callback.done() } }
         }.onFailure { Log.w(TAG, "callback.error failed", it) }
-    }
-
-    private class ActiveSynthesis(
-        val latch: CountDownLatch,
-        private val aborted: AtomicBoolean,
-    ) {
-        private val handle = AtomicReference<SynthesisHandle?>()
-        fun attach(value: SynthesisHandle) {
-            handle.set(value)
-            if (aborted.get()) handle.getAndSet(null)?.cancel()
-        }
-        fun cancel() {
-            aborted.set(true)
-            handle.getAndSet(null)?.cancel()
-            latch.countDown()
-        }
     }
 
     private companion object {
         const val TAG = "MultiTtsService"
-        const val SYNTHESIS_TIMEOUT_SECONDS = 600L
     }
 }

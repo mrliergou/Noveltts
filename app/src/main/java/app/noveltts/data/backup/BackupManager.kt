@@ -1,5 +1,8 @@
 package app.noveltts.data.backup
 
+import app.noveltts.data.stringOrDefault
+
+import app.noveltts.data.JsonInput
 import app.noveltts.data.config.RulesImport
 import app.noveltts.data.config.RulesImportPreview
 import app.noveltts.data.config.ReadingProfile
@@ -40,6 +43,7 @@ data class ParsedBackup(
     val profiles: List<ReadingProfile> = emptyList(),
     val voiceHints: Map<String, String> = emptyMap(),
     val includesProfiles: Boolean = true,
+    val voiceOverrides: Map<String, app.noveltts.data.voicepack.VoiceOverride>? = null,
 ) {
     val settingsCount: Int get() = settings.size
 }
@@ -74,7 +78,6 @@ object BackupManager {
     const val FILE_NAME_PREFIX = "noveltts-backup-"
 
     private const val RULES_SCHEMA = 2
-    private const val MAX_ITEMS = 500
     private const val MAX_DEPTH = 6
     private const val MAX_LICENSE_CHARS = 8192
     private const val MAX_TOKEN_CHARS = 512
@@ -84,12 +87,13 @@ object BackupManager {
 
     private val SETTINGS_WHITELIST: List<Pair<String, SettingType>> = listOf(
         "punctuationFilter" to SettingType.BOOLEAN,
+        "keepAwake" to SettingType.BOOLEAN,
         "narratorVoice" to SettingType.STRING,
         "dialogueVoice" to SettingType.STRING,
         "systemVoice" to SettingType.STRING,
-        "edgeEndpoint" to SettingType.STRING,
         "compatibilityProxy" to SettingType.BOOLEAN,
         "themeMode" to SettingType.STRING,
+        "unattributedDialogue" to SettingType.STRING,
         "maxRetryCount" to SettingType.INT,
         "requestTimeoutSec" to SettingType.INT,
         "maxSegmentChars" to SettingType.INT,
@@ -100,9 +104,6 @@ object BackupManager {
         "bgmVolume" to SettingType.INT,
         "bgmLoop" to SettingType.BOOLEAN,
         "bgmDuck" to SettingType.BOOLEAN,
-        "forwardEnabled" to SettingType.BOOLEAN,
-        "forwardPort" to SettingType.INT,
-        "forwardBind" to SettingType.STRING,
     ) + SettingsStore.BUILT_IN_MULTIPLIER_RANGES.keys.map { it to SettingType.FLOAT }
 
     /** 默认文件名：noveltts-backup-yyyyMMdd.json。 */
@@ -124,6 +125,7 @@ object BackupManager {
         appVersion: String = "1.0.0",
         profiles: List<ReadingProfile> = emptyList(),
         voiceHints: Map<String, String> = emptyMap(),
+        voiceOverrides: Map<String, app.noveltts.data.voicepack.VoiceOverride>? = null,
     ): String {
         val roles = JSONObject(RulesImport.exportRoles(roleSet))
         val replacements = JSONObject(RulesImport.exportReplacements(replacementSet))
@@ -138,6 +140,7 @@ object BackupManager {
             .put("settings", filteredSettings(settings))
             .put("profiles", ReadingProfiles.toArray(profiles))
             .put("voiceHints", JSONObject(voiceHints))
+        if (voiceOverrides != null) root.put("voiceOverrides", JSONObject(app.noveltts.data.voicepack.VoiceOverrides.encode(voiceOverrides)))
         if (credentials != null && !credentials.isEmpty) {
             val json = JSONObject()
             credentials.license?.takeIf { it.isNotBlank() }?.let { json.put("license", it.take(MAX_LICENSE_CHARS)) }
@@ -145,7 +148,7 @@ object BackupManager {
                 ?.let { json.put("forwardToken", it.take(MAX_TOKEN_CHARS)) }
             if (json.length() > 0) root.put("credentials", json)
         }
-        return root.toString()
+        return root.toString().also { require(it.toByteArray(Charsets.UTF_8).size <= MAX_FILE_BYTES) { "备份超过 4 MB 上限，请减少规则或方案后重试" } }
     }
 
     /**
@@ -156,11 +159,11 @@ object BackupManager {
     fun parse(text: String): ParsedBackup {
         require(text.isNotBlank()) { "备份文件是空的" }
         require(text.length <= MAX_FILE_BYTES) { "备份文件超过 4 MB 上限" }
-        require(countDepth(text) <= MAX_DEPTH) { "备份文件 JSON 嵌套超过 $MAX_DEPTH 层，已拒绝导入" }
+        JsonInput.checkDepth(text, MAX_DEPTH)
         val root = try {
-            JSONObject(text)
+            JSONObject(text.removePrefix("\uFEFF"))
         } catch (error: Exception) {
-            throw IllegalArgumentException("不是有效的备份 JSON：${error.message ?: "解析失败"}")
+            throw IllegalArgumentException("不是有效的备份 JSON，请检查文件格式")
         }
         require(root.has("schema")) { "缺少 schema，这不是 NovelTTS 的备份文件" }
         val schema = root.optInt("schema", -1)
@@ -170,16 +173,12 @@ object BackupManager {
         val roles = root.optJSONArray("roles") ?: throw IllegalArgumentException("备份缺少 roles 数组")
         val replacements = root.optJSONArray("replacements")
             ?: throw IllegalArgumentException("备份缺少 replacements 数组")
-        require(roles.length() <= MAX_ITEMS) { "角色规则超过 $MAX_ITEMS 条上限" }
-        require(replacements.length() <= MAX_ITEMS) { "替换规则超过 $MAX_ITEMS 条上限" }
         val roleGroups = root.optJSONArray("roleGroups") ?: JSONArray()
         val replacementGroups = root.optJSONArray("replacementGroups") ?: JSONArray()
-        require(roleGroups.length() <= MAX_ITEMS) { "角色分组超过 $MAX_ITEMS 个上限" }
-        require(replacementGroups.length() <= MAX_ITEMS) { "替换分组超过 $MAX_ITEMS 个上限" }
 
         return ParsedBackup(
-            exportedAt = root.optString("exportedAt"),
-            appVersion = root.optString("appVersion"),
+            exportedAt = root.stringOrDefault("exportedAt"),
+            appVersion = root.stringOrDefault("appVersion"),
             rolesJson = rulesDocument("roles", roleGroups, roles),
             replacementsJson = rulesDocument("replacements", replacementGroups, replacements),
             roleCount = roles.length(),
@@ -188,8 +187,9 @@ object BackupManager {
             credentials = readCredentials(root.optJSONObject("credentials")),
             profiles = root.optJSONArray("profiles")?.let(ReadingProfiles::fromArray) ?: emptyList(),
             includesProfiles = root.has("profiles"),
+            voiceOverrides = root.optJSONObject("voiceOverrides")?.let { app.noveltts.data.voicepack.VoiceOverrides.decode(it.toString()) },
             voiceHints = root.optJSONObject("voiceHints")?.let { hints ->
-                hints.keys().asSequence().take(1000).associateWith { hints.optString(it).take(160) } } ?: emptyMap(),
+                hints.keys().asSequence().take(1000).associateWith { hints.stringOrDefault(it).take(160) } } ?: emptyMap(),
         )
     }
 
@@ -217,11 +217,12 @@ object BackupManager {
         currentReplacements: List<ReplacementRule>,
     ): BackupRestorePreview = BackupRestorePreview(
         backup = backup,
-        roles = RulesImport.previewRoles(backup.rolesJson, currentRoleGroups, currentRoles),
+        roles = RulesImport.previewRoles(backup.rolesJson, currentRoleGroups, currentRoles, externalImport = false),
         replacements = RulesImport.previewReplacements(
             backup.replacementsJson,
             currentReplacementGroups,
             currentReplacements,
+            externalImport = false,
         ),
     )
 
@@ -297,37 +298,9 @@ object BackupManager {
 
     private fun readCredentials(json: JSONObject?): BackupCredentials? {
         if (json == null) return null
-        val license = json.optString("license").takeIf { it.isNotBlank() }?.take(MAX_LICENSE_CHARS)
-        val token = json.optString("forwardToken").takeIf { it.isNotBlank() }?.take(MAX_TOKEN_CHARS)
+        val license = json.stringOrDefault("license").takeIf { it.isNotBlank() }?.take(MAX_LICENSE_CHARS)
+        val token = json.stringOrDefault("forwardToken").takeIf { it.isNotBlank() }?.take(MAX_TOKEN_CHARS)
         if (license == null && token == null) return null
         return BackupCredentials(license, token)
-    }
-
-    /** 备份文件只是本地数据，递归统计 `{ [` 的嵌套深度即可。 */
-    private fun countDepth(text: String): Int {
-        var depth = 0
-        var max = 0
-        var inString = false
-        var escaped = false
-        for (char in text) {
-            if (inString) {
-                when {
-                    escaped -> escaped = false
-                    char == '\\' -> escaped = true
-                    char == '"' -> inString = false
-                }
-                continue
-            }
-            when (char) {
-                '"' -> inString = true
-                '{', '[' -> {
-                    depth += 1
-                    if (depth > max) max = depth
-                }
-
-                '}', ']' -> if (depth > 0) depth -= 1
-            }
-        }
-        return max
     }
 }

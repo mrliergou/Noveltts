@@ -33,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
@@ -71,22 +72,38 @@ fun MultiTtsScreen(
     openLogsOnStart: Boolean = false,
     openIntegrationOnStart: Boolean = false,
     openSettingsDetailOnStart: String? = null,
+    onOpenConsumed: () -> Unit = {},
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     BackgroundNotificationPermission(active = state.isSpeaking || state.forwardRunning)
     val drawerState = rememberDrawerState(DrawerValue.Closed)
-    var showLogs by remember { mutableStateOf(false) }
+    var showLogs by rememberSaveable { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     BackHandler(enabled = showLogs) { showLogs = false }
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri != null) viewModel.importPack(uri)
     }
 
-    LaunchedEffect(openSectionOnStart, openLogsOnStart) {
+    var pendingSettingsDetail by rememberSaveable { mutableStateOf<String?>(null) }
+    LaunchedEffect(openSectionOnStart, openLogsOnStart, openIntegrationOnStart, openSettingsDetailOnStart) {
+        if (openIntegrationOnStart) pendingSettingsDetail = "INTEGRATION"
+        else if (openSettingsDetailOnStart != null) pendingSettingsDetail = openSettingsDetailOnStart
         if (openLogsOnStart) showLogs = true
         if (openSectionOnStart != null) viewModel.selectSection(openSectionOnStart)
+        onOpenConsumed()
     }
 
+    var dismissedRecovery by rememberSaveable { mutableStateOf<String?>(null) }
+    state.recoveryWarning?.takeIf { it != dismissedRecovery }?.let { message ->
+        app.noveltts.ui.common.ConfirmDialog(title = "请检查还原后的配置", message = message,
+            confirmLabel = "知道了", dangerous = false, onConfirm = { dismissedRecovery = message },
+            onDismiss = { dismissedRecovery = message })
+    }
+    state.pendingPackUpdate?.let { preview ->
+        app.noveltts.ui.common.ConfirmDialog(title = "确认更新语音包",
+            message = "${preview.name}：${preview.previousVersion} → ${preview.nextVersion}。关联 ${preview.linkedRoles} 个角色、${preview.linkedDefaults} 个默认音色。稳定 ID 和音色覆盖设置会保留；缺失音色显示回落提示。取消或失败保留旧包。",
+            confirmLabel = "更新", dangerous = false, onConfirm = { viewModel.confirmPackUpdate(true) }, onDismiss = { viewModel.confirmPackUpdate(false) })
+    }
     if (showLogs) {
         LogPage(onBack = { showLogs = false })
         return
@@ -163,8 +180,9 @@ fun MultiTtsScreen(
                         state = state,
                         viewModel = viewModel,
                         onOpenSystemSpeechSettings = onOpenSystemSpeechSettings,
-                        openIntegration = openIntegrationOnStart,
-                        openDetail = openSettingsDetailOnStart,
+
+                        openDetail = pendingSettingsDetail,
+                        onOpenConsumed = { pendingSettingsDetail = null },
                         backEnabled = !drawerState.isOpen,
                     )
                 }
@@ -270,11 +288,11 @@ private fun BottomPanel(
                             }
                         }
                     } else {
-                        Button(onClick = viewModel::speak, modifier = Modifier.weight(1f)) {
+                        Button(onClick = if (state.isPaused) viewModel::resume else viewModel::speak, modifier = Modifier.weight(1f)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 AppIconGlyph(AppIcon.PLAY, size = 20.dp)
                                 Spacer(Modifier.width(8.dp))
-                                Text("开始朗读")
+                                Text(if (state.isPaused) "继续朗读" else "开始朗读")
                             }
                         }
                     }
@@ -283,8 +301,8 @@ private fun BottomPanel(
                 if (state.isSpeaking && !state.isPreview || state.isPaused) {
                     Row(modifier = Modifier.fillMaxWidth()) {
                         androidx.compose.material3.TextButton(onClick = viewModel::previousSegment, modifier = Modifier.weight(1f)) { Text("上一段") }
-                        androidx.compose.material3.TextButton(onClick = if (state.isPaused) viewModel::resume else viewModel::pause,
-                            modifier = Modifier.weight(1f)) { Text(if (state.isPaused) "继续朗读" else "暂停") }
+                        androidx.compose.material3.TextButton(onClick = if (state.isPaused) viewModel::speak else viewModel::pause,
+                            modifier = Modifier.weight(1f)) { Text(if (state.isPaused) "重新朗读" else "暂停") }
                         androidx.compose.material3.TextButton(onClick = viewModel::nextSegment, modifier = Modifier.weight(1f)) { Text("下一段") }
                     }
                 }
@@ -295,10 +313,14 @@ private fun BottomPanel(
             }
             LogEventBar(onClick = onOpenLogs)
             Spacer(Modifier.height(4.dp))
+            // 固定两行：状态文案长短变化（合成/播放/失败）不再让底部面板和上方内容区跟着伸缩。
             Text(
                 text = state.statusMessage,
                 style = MaterialTheme.typography.labelSmall,
                 color = Muted,
+                minLines = 2,
+                maxLines = 2,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
             )
         }
     }

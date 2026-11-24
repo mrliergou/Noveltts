@@ -145,6 +145,16 @@ fun LogPage(onBack: () -> Unit = {}) {
     var categoryMenuOpen by remember { mutableStateOf(false) }
     var expandedKeys by remember { mutableStateOf(emptySet<String>()) }
     var statusLine by remember { mutableStateOf<String?>(null) }
+    var confirmClear by remember { mutableStateOf(false) }
+    if (confirmClear) app.noveltts.ui.common.ConfirmDialog(
+        title = "清空诊断日志？", message = "将清空内存日志和本机日志文件。",
+        confirmLabel = "清空", dangerous = true,
+        onConfirm = {
+            confirmClear = false
+            DiagnosticsLog.clear()
+            statusLine = "已清空日志"
+        }, onDismiss = { confirmClear = false },
+    )
     val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
     val scope = rememberCoroutineScope()
     var pendingExport by remember { mutableStateOf<String?>(null) }
@@ -281,8 +291,7 @@ fun LogPage(onBack: () -> Unit = {}) {
                 }
                 OutlinedButton(
                     onClick = {
-                        DiagnosticsLog.clear()
-                        statusLine = if (DiagnosticsLog.isStoreAttached()) "已清空内存日志与磁盘文件" else null
+                        confirmClear = true
                     },
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                 ) {

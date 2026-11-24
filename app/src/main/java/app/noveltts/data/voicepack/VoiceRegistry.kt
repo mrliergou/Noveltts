@@ -1,7 +1,6 @@
 package app.noveltts.data.voicepack
 
 import android.content.Context
-import java.io.File
 
 /**
  * 把已安装语音包转换为稳定、可用于 Android Voice 的系统音色名。
@@ -30,7 +29,7 @@ class VoiceRegistry(
                 val engine = pack.engines.firstOrNull { it.code == engineCode }
                 if (engine?.supported != true) return@forEach
                 val modelDir = when (engineCode) {
-                    "microsoft" -> File(store.directoryOf(pack.id), "microsoft/${voice.code}")
+                    "microsoft" -> embeddedModelDirectory(store.directoryOf(pack.id), voice.code)
                     else -> null
                 }
                 val licenseRequired = engineCode == "microsoft"
@@ -77,7 +76,12 @@ class VoiceRegistry(
                 )
             }
         }
-        }.sortedWith(compareBy<VoiceDescriptor> { it.isOnline }.thenBy { it.displayName })
+        }.let { voices ->
+            val overrides = runCatching { VoiceOverrides(appContext).load() }
+            val values = overrides.getOrNull()
+            if (values == null) voices
+            else voices.map { values[it.systemName]?.apply(it) ?: it }
+        }.sortedWith(compareByDescending<VoiceDescriptor> { it.favorite }.thenBy { it.isOnline }.thenBy { it.displayName })
 
     fun find(
         voiceId: String?,

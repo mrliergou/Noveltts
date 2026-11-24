@@ -42,6 +42,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import app.noveltts.data.config.RuleDrafts
 import app.noveltts.data.voicepack.VoiceDescriptor
 import app.noveltts.domain.ReplacementRule
 import app.noveltts.domain.RoleMatchMode
@@ -71,6 +72,7 @@ internal sealed interface RuleEditorTarget {
         val draftGroupName: String = "",
         val restoredDraft: Boolean = false,
         val fields: Map<String, String> = emptyMap(),
+        val expected: RoleRule? = rule,
     ) : RuleEditorTarget
 
     data class Replacement(
@@ -79,6 +81,7 @@ internal sealed interface RuleEditorTarget {
         val draftGroupName: String = "",
         val restoredDraft: Boolean = false,
         val fields: Map<String, String> = emptyMap(),
+        val expected: ReplacementRule? = rule,
     ) : RuleEditorTarget
 }
 
@@ -115,8 +118,8 @@ internal fun RuleEditorSheet(
     onTestReplacement: suspend (String, ReplacementRule, Boolean) -> String,
     onPreviewVoice: (VoiceDescriptor) -> Unit,
     onStopPreview: () -> Unit,
-    onRoleDraftChange: (RoleRule, String, Map<String, String>) -> Unit,
-    onReplacementDraftChange: (ReplacementRule, String, Map<String, String>) -> Unit,
+    onRoleDraftChange: (RoleRule, String, Map<String, String>, RoleRule?) -> Unit,
+    onReplacementDraftChange: (ReplacementRule, String, Map<String, String>, ReplacementRule?) -> Unit,
     onDiscardDraft: () -> Unit,
 ) {
     var dirty by remember { mutableStateOf(false) }
@@ -180,7 +183,7 @@ private fun RoleEditor(
     onTest: suspend (String, RoleRule, Boolean) -> String,
     onPreviewVoice: (VoiceDescriptor) -> Unit,
     onStopPreview: () -> Unit,
-    onDraftChange: (RoleRule, String, Map<String, String>) -> Unit,
+    onDraftChange: (RoleRule, String, Map<String, String>, RoleRule?) -> Unit,
     onDirtyChange: (Boolean) -> Unit,
     onSavingChange: (Boolean) -> Unit,
 ) {
@@ -206,7 +209,7 @@ private fun RoleEditor(
     var saveError by remember { mutableStateOf<String?>(null) }
     var testing by remember { mutableStateOf(false) }
     var testAll by rememberSaveable { mutableStateOf(false) }
-    var matchScope by rememberSaveable { mutableStateOf(existing?.matchScope ?: RoleMatchScope.SEGMENT) }
+    var matchScope by rememberSaveable { mutableStateOf(existing?.matchScope ?: RoleMatchScope.AUTO) }
     var contextChars by rememberSaveable { mutableStateOf(target.fields["contextChars"] ?: (existing?.contextChars ?: 200).toString()) }
     var speechRate by rememberSaveable { mutableStateOf(target.fields["speechRate"] ?: (existing?.speechRate ?: 1f).toString()) }
     var speechPitch by rememberSaveable { mutableStateOf(target.fields["speechPitch"] ?: (existing?.speechPitch ?: 1f).toString()) }
@@ -214,29 +217,32 @@ private fun RoleEditor(
     val fields = mapOf("name" to name, "pattern" to pattern, "priority" to priority, "contextChars" to contextChars,
         "speechRate" to speechRate, "speechPitch" to speechPitch, "speechVolume" to speechVolume)
     val initialFields = remember { fields }
-    val base = remember { existing ?: RoleRule(name = "", pattern = "", voiceIds = emptyList(), groupId = target.groupId) }
+    // 新建规则的基线也用 AUTO，否则刚打开就会被判成「已修改」。
+    val base = remember {
+        existing ?: RoleRule(name = "", pattern = "", voiceIds = emptyList(), groupId = target.groupId,
+            matchScope = RoleMatchScope.AUTO)
+    }
     val draft = base.copy(name = name.trim(), pattern = pattern.trim(), voiceIds = voiceIds,
         priority = priority.toIntOrNull() ?: 100, onlyDialogue = onlyDialogue, enabled = enabled,
         groupId = groupId, matchMode = matchMode, voiceSelectionMode = selectionMode, matchScope = matchScope,
         contextChars = contextChars.toIntOrNull()?.coerceIn(1, 2000) ?: 200,
-        speechRate = speechRate.toFloatOrNull() ?: 1f, speechPitch = speechPitch.toFloatOrNull() ?: 1f,
-        speechVolume = speechVolume.toFloatOrNull() ?: 1f)
+        speechRate = RuleDrafts.finiteMultiplier(speechRate), speechPitch = RuleDrafts.finiteMultiplier(speechPitch),
+        speechVolume = RuleDrafts.finiteMultiplier(speechVolume))
     LaunchedEffect(draft, newGroupName, fields) {
-        onDraftChange(draft, newGroupName, fields)
+        onDraftChange(draft, newGroupName, fields, target.expected)
         onDirtyChange(target.restoredDraft || draft != base || newGroupName != target.draftGroupName || fields != initialFields)
     }
 
     val voiceNames = remember(voices) { voices.associate { it.systemName to it.displayName } }
-    val regexError = remember(pattern, matchMode) {
-        if (matchMode == RoleMatchMode.LITERAL_EXACT || pattern.isBlank()) {
-            null
-        } else {
-            runCatching { Regex(pattern) }.exceptionOrNull()?.let { "正则无效：" + it.message }
-        }
+    var regexError by remember { mutableStateOf<String?>("正在校验…") }
+    LaunchedEffect(draft) {
+        regexError = "正在校验…"
+        kotlinx.coroutines.delay(150)
+        regexError = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { RuleValidation.roleError(draft) }
     }
-    val canSave = RuleValidation.roleError(draft) == null && !saving &&
+    val canSave = regexError == null && !saving &&
         speechRate.toFloatOrNull()?.let { it.isFinite() && it in 0.25f..4f } == true &&
-        speechPitch.toFloatOrNull()?.let { it.isFinite() && it in 0.25f..4f } == true &&
+        speechPitch.toFloatOrNull()?.let { it.isFinite() && (it in 0.25f..2f || it == existing?.speechPitch) } == true &&
         speechVolume.toFloatOrNull()?.let { it.isFinite() && it in 0f..1f } == true
 
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -282,10 +288,12 @@ private fun RoleEditor(
                 modifier = Modifier.fillMaxWidth(),
             )
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(text = "匹配模式", style = MaterialTheme.typography.labelSmall, color = Muted)
+                val auto = matchScope == RoleMatchScope.AUTO
+                Text(text = if (auto) "称呼写法" else "匹配模式", style = MaterialTheme.typography.labelSmall, color = Muted)
                 FilterChipRow(
-                    options = RoleMatchMode.entries.map { it to it.label },
-                    selected = matchMode,
+                    options = if (auto) listOf(RoleMatchMode.REGEX_CONTAINS to "正则称呼", RoleMatchMode.LITERAL_EXACT to "普通文本")
+                        else RoleMatchMode.entries.map { it to it.label },
+                    selected = if (auto && matchMode != RoleMatchMode.LITERAL_EXACT) RoleMatchMode.REGEX_CONTAINS else matchMode,
                     onSelect = { matchMode = it },
                 )
             }
@@ -367,21 +375,35 @@ private fun RoleEditor(
                     )
                 }
             }
-            LabeledSwitch("仅匹配对话", onlyDialogue) { onlyDialogue = it }
+            if (matchScope != RoleMatchScope.AUTO) {
+                LabeledSwitch("仅匹配对话", onlyDialogue) { onlyDialogue = it }
+            }
             ChoiceField("匹配范围", matchScope.name, listOf(
+                RoleMatchScope.AUTO.name to "自动（看引号前后是谁在说）",
                 RoleMatchScope.SEGMENT.name to "当前片段", RoleMatchScope.PREVIOUS_NARRATION.name to "前一句旁白",
                 RoleMatchScope.NEXT_NARRATION.name to "后一句旁白")) { matchScope = RoleMatchScope.valueOf(it) }
-            if (matchScope != RoleMatchScope.SEGMENT) OutlinedTextField(value = contextChars,
+            if (matchScope == RoleMatchScope.AUTO) Text(
+                text = if (matchMode == RoleMatchMode.LITERAL_EXACT) "只判断对话；将匹配文本作为一个完整称呼"
+                    else "只判断对话；匹配内容填角色的称呼，多个称呼用 | 分隔",
+                style = MaterialTheme.typography.labelSmall,
+                color = Muted,
+            )
+            // 上下文字数只对「前/后一句旁白」有意义，自动判断按整句旁白取证。
+            else if (matchScope != RoleMatchScope.SEGMENT) OutlinedTextField(value = contextChars,
                 onValueChange = { contextChars = it.filter(Char::isDigit).take(4) },
                 label = { Text("上下文长度（1–2000 字）") }, modifier = Modifier.fillMaxWidth())
             LabeledSwitch("启用", enabled) { enabled = it }
             TextButton(onClick = { advanced = !advanced }) { Text(if (advanced) "收起高级" else "高级") }
             if (advanced) {
                 OutlinedTextField(value = speechRate, onValueChange = { speechRate = it },
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal),
                     label = { Text("角色语速倍率（0.25–4）") }, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = speechPitch, onValueChange = { speechPitch = it },
-                    label = { Text("角色音调倍率（0.25–4）") }, modifier = Modifier.fillMaxWidth())
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal),
+                    label = { Text("角色音调倍率（新值 0.25–2）") }, modifier = Modifier.fillMaxWidth())
+                if ((RuleDrafts.finiteMultiplier(speechPitch)) > 2f) Text("历史音调值已保留；叠加音色和全局参数后，有效上限为 2。", color = Muted)
                 OutlinedTextField(value = speechVolume, onValueChange = { speechVolume = it },
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal),
                     label = { Text("角色音量倍率（0–1）") }, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(
                     value = priority,
@@ -463,7 +485,7 @@ private fun ReplacementEditor(
     onDismiss: () -> Unit,
     onSave: suspend (ReplacementRule, RuleGroup?) -> Boolean,
     onTest: suspend (String, ReplacementRule, Boolean) -> String,
-    onDraftChange: (ReplacementRule, String, Map<String, String>) -> Unit,
+    onDraftChange: (ReplacementRule, String, Map<String, String>, ReplacementRule?) -> Unit,
     onDirtyChange: (Boolean) -> Unit,
     onSavingChange: (Boolean) -> Unit,
 ) {
@@ -492,16 +514,15 @@ private fun ReplacementEditor(
         enabled = enabled, groupId = groupId, sortIndex = sortIndex.toIntOrNull() ?: 0,
         scope = replacementScope, targetRoleId = targetRoleId)
     LaunchedEffect(draft, newGroupName, fields) {
-        onDraftChange(draft, newGroupName, fields)
+        onDraftChange(draft, newGroupName, fields, target.expected)
         onDirtyChange(target.restoredDraft || draft != base || newGroupName != target.draftGroupName || fields != initialFields)
     }
 
-    val regexError = remember(find, isRegex, replaceWith) {
-        if (!isRegex || find.isEmpty()) {
-            null
-        } else {
-            RuleValidation.replacementError(draft)
-        }
+    var regexError by remember { mutableStateOf<String?>("正在校验…") }
+    LaunchedEffect(find, isRegex, replaceWith) {
+        regexError = "正在校验…"
+        kotlinx.coroutines.delay(150)
+        regexError = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { RuleValidation.replacementError(draft) }
     }
     val canSave = name.isNotBlank() && find.isNotEmpty() && regexError == null && !saving &&
         (replacementScope != ReplacementScope.ROLE || roles.any { it.id == targetRoleId })
