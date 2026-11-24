@@ -2,7 +2,16 @@
 
 NovelTTS 是一个面向小说朗读的 Android 文本转语音（TTS）引擎，使用 Kotlin 与 Jetpack Compose 编写。它导入语音包后直接合成音频，并注册为 Android 系统 TTS 引擎，供阅读器等应用调用；朗读时把旁白与引号内的对话分开，让不同角色使用不同音色。
 
-> 项目处于开发阶段，历史发布提供的是调试 APK，尚无正式签名的 release 版本；工作区修复不等于已发布。在线音源使用**非官方**的 Edge Read Aloud 接口，上游协议随时可能变化。
+> 项目处于开发阶段，发布 APK 使用调试签名。在线音源使用**非官方**的 Edge Read Aloud 接口，上游协议随时可能变化。
+
+## 1.1.0 更新
+
+[下载 APK](https://github.com/mrliergou/Noveltts/releases/download/v1.1.0/NovelTTS-1.1.0-arm64-v8a.apk) · Android 8.0+ · arm64-v8a
+
+- 新增自动说话人归属、角色别名与不确定片段提示。
+- 新增音色收藏、启停与默认倍率配置。
+- 优化段间预取、暂停续读和音频焦点处理。
+- 修复系统 TTS / HTTP 合成的超时、取消与空音频处理，强化备份恢复。
 
 ## 目录
 
@@ -121,4 +130,4 @@ NovelTTS 是一个面向小说朗读的 Android 文本转语音（TTS）引擎�
 - 语音包格式兼容 MultiTTS；引擎能力参考了 [jing332/tts-server-android](https://github.com/jing332/tts-server-android)。
 - Edge 接口的鉴权算法参考了 [rany2/edge-tts](https://github.com/rany2/edge-tts)。
 - HTTP 配置导出面向 [LegadoTeam/legado](https://github.com/LegadoTeam/legado)。
-- 本项目不包含、也不分发任何第三方 APK 中的模型、原生库或许可证。与微软、百度、讯飞等公司没有关联。
+- 模型与许可证需由用户自行取得。本项目与微软、百度、讯飞等公司没有关联。
