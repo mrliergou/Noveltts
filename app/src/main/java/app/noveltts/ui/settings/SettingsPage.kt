@@ -53,7 +53,7 @@ fun SettingsPage(
     BackHandler(enabled = backEnabled && opened != null) { opened = null }
     val page = SettingsDetailPage.entries.firstOrNull { it.name == opened }
     if (page == null) {
-        SettingsIndexPage(state = state, onOpen = { opened = it.name })
+        SettingsIndexPage(state = state, onThemeMode = viewModel::setThemeMode, onOpen = { opened = it.name })
         return
     }
     Column(

@@ -16,7 +16,7 @@ import androidx.core.view.WindowCompat
  * （Manifest 未声明 configChanges），ViewModel 与 rememberSaveable 状态保留。
  */
 @Composable
-fun MultiTtsTheme(themeMode: ThemeMode = ThemeMode.DEFAULT, content: @Composable () -> Unit) {
+fun NovelTtsTheme(themeMode: ThemeMode = ThemeMode.DEFAULT, content: @Composable () -> Unit) {
     val dark = themeMode.isDark(isSystemInDarkTheme())
     val colorScheme = if (dark) DarkColors else LightColors
     val view = LocalView.current

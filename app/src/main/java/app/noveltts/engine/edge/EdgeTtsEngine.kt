@@ -110,13 +110,13 @@ class EdgeTtsEngine(
                 socket.getAndSet(null)?.cancel()
                 if (!cancelled.get()) listener.onError(SynthesisError.RESOURCE_LIMIT, error.message)
             } catch (error: EdgeHttpException) {
-                DiagnosticsLog.warn(Category.ENGINE, "Edge 合成失败（HTTP ${error.code}）", error.userMessage().take(200))
                 if (!cancelled.get()) {
+                    DiagnosticsLog.warn(Category.ENGINE, "Edge 合成失败（HTTP ${error.code}）", error.userMessage().take(200))
                     listener.onError(error.code, error.userMessage())
                 }
             } catch (error: Exception) {
-                DiagnosticsLog.error(Category.ENGINE, "Edge 合成异常", error.message?.take(200))
                 if (!cancelled.get()) {
+                    DiagnosticsLog.error(Category.ENGINE, "Edge 合成异常", error.message?.take(200))
                     Log.w(TAG, "edge synthesis failed", error)
                     listener.onError(SynthesisError.NETWORK_FAILED, error.message ?: "在线语音合成失败")
                 }

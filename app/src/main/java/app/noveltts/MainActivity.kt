@@ -15,9 +15,9 @@ import app.noveltts.data.settings.SettingsStore
 import app.noveltts.engine.DiagnosticsLog
 import app.noveltts.ui.AppSection
 import app.noveltts.ui.MainViewModel
-import app.noveltts.ui.MultiTtsScreen
+import app.noveltts.ui.NovelTtsScreen
 import app.noveltts.ui.common.ConfirmDialog
-import app.noveltts.ui.theme.MultiTtsTheme
+import app.noveltts.ui.theme.NovelTtsTheme
 
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by lazy {
@@ -48,8 +48,8 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val state by viewModel.uiState.collectAsStateWithLifecycle()
-            MultiTtsTheme(themeMode = state.themeMode) {
-                MultiTtsScreen(
+            NovelTtsTheme(themeMode = state.themeMode) {
+                NovelTtsScreen(
                     viewModel = viewModel,
                     onOpenSystemSpeechSettings = ::openSystemSpeechSettings,
                     onOpenConsumed = { openRequest = null },
@@ -121,6 +121,7 @@ class MainActivity : ComponentActivity() {
         OPEN_WORKBENCH -> AppSection.WORKBENCH
         OPEN_VOICE_PACKS, "packs" -> AppSection.PACKS
         "roles" -> AppSection.ROLES
+        "books" -> AppSection.BOOKS
         "replacements" -> AppSection.REPLACEMENTS
         "settings", "integration", "external", "reading", "data", "synthesis", "bgm" -> AppSection.SETTINGS
         else -> null

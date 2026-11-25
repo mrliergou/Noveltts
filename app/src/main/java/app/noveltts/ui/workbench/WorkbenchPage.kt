@@ -148,14 +148,23 @@ fun WorkbenchPage(state: MainUiState, viewModel: MainViewModel) {
         )
         } }
 
+        item(key = "current-book") {
+            SectionCard {
+                Text("当前书籍：${state.bookLibrary.activeBook?.name ?: "未选择（全局角色模式）"}", fontWeight = FontWeight.SemiBold)
+                Text(state.booksLoadError ?: "换书后请在此切换；系统 TTS 与 HTTP 使用同一选择。进行中的朗读保持原配置。",
+                    style = MaterialTheme.typography.bodySmall, color = if (state.booksLoadError != null) Accent else Muted)
+                TextButton(onClick = { viewModel.selectSection(AppSection.BOOKS) }) { Text("管理书籍与人物声音") }
+            }
+        }
+
         item(key = "roles-title") {
             Column {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("朗读角色", fontWeight = FontWeight.SemiBold, color = Ink, modifier = Modifier.weight(1f))
+                    Text(if (state.bookLibrary.activeBook != null) "全局朗读设置" else "朗读角色", fontWeight = FontWeight.SemiBold, color = Ink, modifier = Modifier.weight(1f))
                     TextButton(onClick = { sheetTarget = RoleSheetTarget.New }, enabled = rolesEditable) {
                         AppIconGlyph(AppIcon.ADD, size = 16.dp)
                         Spacer(Modifier.width(4.dp))
-                        Text("添加角色")
+                        Text(if (state.bookLibrary.activeBook != null) "添加全局角色" else "添加角色")
                     }
                 }
                 HorizontalDivider()

@@ -10,7 +10,7 @@ import androidx.compose.ui.graphics.Color
 // ---- 浅色调色板 -------------------------------------------------------------
 
 private val InkLight = Color(0xFF202D33)
-private val MutedLight = Color(0xFF647377)
+private val MutedLight = Color(0xFF606F73)
 private val TealLight = Color(0xFF007770)
 private val TealDeepLight = Color(0xFF005B57)
 private val AccentLight = Color(0xFFBE5C2A)

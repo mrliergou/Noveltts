@@ -23,6 +23,7 @@ fun SearchField(
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
+        label = { Text(placeholder) },
         placeholder = { Text(text = placeholder, style = MaterialTheme.typography.bodySmall, color = Muted) },
         singleLine = true,
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),

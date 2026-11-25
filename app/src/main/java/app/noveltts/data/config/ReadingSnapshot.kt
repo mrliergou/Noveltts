@@ -15,6 +15,7 @@ object ReadingSnapshot {
                 .put("isDialogue", segment.isDialogue).put("voiceId", planned.voice.systemName)
                 .put("roleName", segment.roleName).put("roleId", segment.roleId)
                 .put("requestedVoiceId", segment.requestedVoiceId).put("fallbackReason", segment.fallbackReason)
+                .put("useDefaultStandby", planned.useDefaultStandby).put("standbyVoiceId", planned.standbyVoice?.systemName)
                 .put("speechRate", segment.speechRate).put("speechPitch", segment.speechPitch)
                 .put("speechVolume", segment.speechVolume)
                 .put("attribution", segment.attribution?.let { JSONObject().put("kind", it.kind.name).put("confidence", it.confidence.name).put("evidence", it.evidence) }))
@@ -35,8 +36,12 @@ object ReadingSnapshot {
             require(id.isNotBlank() && seen.add(id) && text.isNotBlank()) { "朗读快照内容无效" }
             val isDialogue = item.getBoolean("isDialogue")
             val savedVoice = item.getString("voiceId")
-            val voice = byId[savedVoice] ?: (if (isDialogue) dialogue else narrator) ?: error("快照没有可用音色")
-            val fallback = if (voice.systemName == savedVoice) optional(item, "fallbackReason")
+            val bookVoice = item.optBoolean("useDefaultStandby", false)
+            val requestedVoice = optional(item, "requestedVoiceId") ?: savedVoice
+            val voice = (if (bookVoice) byId[requestedVoice] else byId[savedVoice])
+                ?: (if (isDialogue) dialogue else narrator) ?: error("快照没有可用音色")
+            val fallback = if (bookVoice && voice.systemName == requestedVoice) null
+                else if (voice.systemName == savedVoice) optional(item, "fallbackReason")
                 else "快照音色不可用，本段使用 ${voice.displayName}"
             PlannedSegment(PipelineSegment(text, isDialogue, voice.systemName, optional(item, "roleName"), id,
                 optional(item, "roleId"), optional(item, "requestedVoiceId") ?: savedVoice, fallback,
@@ -44,7 +49,9 @@ object ReadingSnapshot {
                 finite(item, "speechVolume", 0f, 1f), item.optJSONObject("attribution")?.let { attribution ->
                     app.noveltts.domain.Attribution(app.noveltts.domain.AttributionKind.valueOf(attribution.getString("kind")),
                         app.noveltts.domain.Confidence.valueOf(attribution.getString("confidence")), attribution.optString("evidence").take(20))
-                }), voice)
+                }), voice,
+                standbyVoice = if (bookVoice) byId[optional(item, "standbyVoiceId")] ?: dialogue else null,
+                useDefaultStandby = bookVoice)
         }
     }
 

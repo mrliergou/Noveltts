@@ -10,11 +10,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -39,6 +41,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -54,6 +58,7 @@ import app.noveltts.ui.rules.RolesPage
 import app.noveltts.ui.settings.SettingsPage
 import app.noveltts.ui.theme.Ink
 import app.noveltts.ui.theme.Muted
+import app.noveltts.ui.theme.ThemeModeSelector
 import app.noveltts.ui.workbench.WorkbenchPage
 import kotlinx.coroutines.launch
 
@@ -65,7 +70,7 @@ import kotlinx.coroutines.launch
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MultiTtsScreen(
+fun NovelTtsScreen(
     viewModel: MainViewModel,
     onOpenSystemSpeechSettings: () -> Unit,
     openSectionOnStart: AppSection? = null,
@@ -75,6 +80,17 @@ fun MultiTtsScreen(
     onOpenConsumed: () -> Unit = {},
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    var showTheme by rememberSaveable { mutableStateOf(false) }
+    if (showTheme) AlertDialog(
+        onDismissRequest = { showTheme = false },
+        title = { Text("主题模式") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                ThemeModeSelector(state.themeMode) { viewModel.setThemeMode(it); showTheme = false }
+            }
+        },
+        confirmButton = { androidx.compose.material3.TextButton({ showTheme = false }) { Text("关闭") } },
+    )
     BackgroundNotificationPermission(active = state.isSpeaking || state.forwardRunning)
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     var showLogs by rememberSaveable { mutableStateOf(false) }
@@ -132,6 +148,10 @@ fun MultiTtsScreen(
         Scaffold(
             topBar = {
                 TopAppBar(
+                    actions = {
+                        androidx.compose.material3.TextButton({ showTheme = true },
+                            modifier = Modifier.semantics { contentDescription = "主题模式：${state.themeMode.label}" }) { Text("主题") }
+                    },
                     navigationIcon = {
                         IconButton(onClick = { scope.launch { drawerState.open() } }) {
                             MenuCloseIcon(expanded = drawerState.isOpen)
@@ -175,6 +195,7 @@ fun MultiTtsScreen(
                     )
 
                     AppSection.ROLES -> RolesPage(state = state, viewModel = viewModel)
+                    AppSection.BOOKS -> app.noveltts.ui.books.BookRolesPage(state, viewModel)
                     AppSection.REPLACEMENTS -> ReplacementsPage(state = state, viewModel = viewModel)
                     AppSection.SETTINGS -> SettingsPage(
                         state = state,
@@ -197,6 +218,7 @@ private fun AppSection.icon(): AppIcon = when (this) {
     AppSection.WORKBENCH -> AppIcon.TEXT
     AppSection.PACKS -> AppIcon.FOLDER
     AppSection.ROLES -> AppIcon.PERSON
+    AppSection.BOOKS -> AppIcon.TEXT
     AppSection.REPLACEMENTS -> AppIcon.SWAP
     AppSection.SETTINGS -> AppIcon.GEAR
 }
@@ -275,8 +297,21 @@ private fun BottomPanel(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .navigationBarsPadding()
                 .padding(horizontal = 16.dp, vertical = 10.dp),
         ) {
+            if (state.section != AppSection.WORKBENCH && (state.isSpeaking || state.isPaused)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(if (state.isPreview) "正在试听" else if (state.isPaused) "朗读已暂停" else "正在朗读",
+                        modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                    if (!state.isPreview) androidx.compose.material3.TextButton(
+                        onClick = if (state.isPaused) viewModel::resume else viewModel::pause,
+                    ) { Text(if (state.isPaused) "继续" else "暂停") }
+                    androidx.compose.material3.TextButton(onClick = if (state.isPreview) viewModel::stopPreview else viewModel::stop) {
+                        Text(if (state.isPreview) "停止试听" else "停止")
+                    }
+                }
+            }
             if (state.section == AppSection.WORKBENCH) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (state.isSpeaking) {

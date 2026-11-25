@@ -10,8 +10,8 @@ import android.content.Context
  *
  * 注意：应用已改名 NovelTTS，但这个 `multitts:` 前缀**故意保留**——它会被第三方阅读器、
  * 系统设置以及本应用的已保存设置同时记住，换掉等于让所有已选音色失效。
- * 计划在功能稳定后统一迁移，届时需要同步改 [systemName]、[find] 的旧 ID 兼容逻辑、
- * `SettingsStore`/`RulesRepository` 里保存的 voiceId，以及在 UI 上提示用户重选音色。
+ * 前缀迁移属于路线图 D-05 的待决策方向；当前保留 [systemName] 和 [find] 的格式。
+ * 如另行批准迁移，需覆盖旧 ID 解析、持久引用、备份及外部客户端兼容。
  */
 class VoiceRegistry(
     context: Context,

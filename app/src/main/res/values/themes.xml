@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!--
-      只负责冷启动那一帧：窗口底色 + 状态栏底色，内容之后由 Compose 的 MultiTtsTheme 接管。
+      只负责冷启动那一帧：窗口底色 + 状态栏底色，内容之后由 Compose 的 NovelTtsTheme 接管。
       应用内的白天/夜间/跟随系统由 Compose 配色决定，这里跟随系统深浅色资源目录。
     -->
     <style name="Theme.NovelTts" parent="@android:style/Theme.Material.Light.NoActionBar">

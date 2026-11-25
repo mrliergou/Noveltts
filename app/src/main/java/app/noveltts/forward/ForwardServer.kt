@@ -10,6 +10,7 @@ import app.noveltts.data.voicepack.VoiceDescriptor
 import app.noveltts.data.voicepack.VoicePackStore
 import app.noveltts.data.voicepack.VoiceRegistry
 import app.noveltts.domain.SynthesisPlanBuilder
+import app.noveltts.data.config.BookRolesRepository
 import app.noveltts.engine.Category
 import app.noveltts.engine.DiagnosticsLog
 import app.noveltts.engine.EngineManager
@@ -188,6 +189,7 @@ internal class EngineForwardBackend(context: Context, private val settings: Sett
     private val app = context.applicationContext
     private val registry = VoiceRegistry(app, VoicePackStore(app))
     private val rules = RulesRepository(app)
+    private val books = BookRolesRepository(app)
     private val engines = EngineManager(app, settings)
     private val synth = MultiSegmentSynthesizer(engines, File(app.cacheDir, "spool"),
         cacheDir = File(app.cacheDir, AudioCache.DIR_NAME))
@@ -209,7 +211,8 @@ internal class EngineForwardBackend(context: Context, private val settings: Sett
                 throw ForwardHttpException(400, "unknown_voice", "请求音色不存在或不可用")
             val snapshot = try { SynthesisPlanBuilder.Snapshot(text,
                 config.builtInRoles.withVoices(requested ?: config.narratorVoice, config.dialogueVoice), rules.loadRoles(), rules.loadReplacements(), config.punctuationFilter,
-                available, config.maxSegmentChars, config.unattributedPolicy) }
+                available, config.maxSegmentChars, config.unattributedPolicy,
+                books.prepare(available.filter { it.usable }.mapTo(HashSet()) { it.systemName }).activeBook) }
             catch (_: Exception) { throw ForwardHttpException(503, "rules_unavailable", "规则无法读取，请在应用内恢复配置") }
             snapshot to config
         }

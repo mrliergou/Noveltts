@@ -57,6 +57,7 @@ import app.noveltts.ui.theme.Accent
 import app.noveltts.ui.theme.Ink
 import app.noveltts.ui.theme.Muted
 import app.noveltts.ui.theme.ThemeMode
+import app.noveltts.ui.theme.ThemeModeSelector
 import kotlin.math.roundToInt
 import kotlinx.coroutines.launch
 
@@ -68,47 +69,41 @@ private data class SettingsEntry(
     val subtitle: String,
 )
 
-/** 设置一级页：分区标题 + 入口行，点进二级页。 */
+/** 设置首页直接切换主题，其他选项按入口进入详情。 */
 @Composable
-internal fun SettingsIndexPage(state: MainUiState, onOpen: (SettingsDetailPage) -> Unit) {
-    val groups = listOf(
-        "外观" to SettingsEntry(
-            page = SettingsDetailPage.APPEARANCE,
-            icon = AppIcon.TUNE,
-            title = "主题模式",
-            subtitle = appearanceSummary(state),
-        ),
-        "朗读行为" to SettingsEntry(
+internal fun SettingsIndexPage(state: MainUiState, onThemeMode: (ThemeMode) -> Unit, onOpen: (SettingsDetailPage) -> Unit) {
+    val entries = listOf(
+        SettingsEntry(
             page = SettingsDetailPage.READING,
             icon = AppIcon.VOICE,
             title = "朗读与分段",
             subtitle = readingSummary(state),
         ),
-        "合成与网络" to SettingsEntry(
+        SettingsEntry(
             page = SettingsDetailPage.SYNTHESIS,
             icon = AppIcon.WIFI,
             title = "合成参数与 Edge 端点",
             subtitle = synthesisSummary(state),
         ),
-        "背景音乐" to SettingsEntry(
+        SettingsEntry(
             page = SettingsDetailPage.BACKGROUND_MUSIC,
             icon = AppIcon.MUSIC,
             title = "背景音乐与试听",
             subtitle = backgroundMusicSummary(state),
         ),
-        "外部调用" to SettingsEntry(
+        SettingsEntry(
             page = SettingsDetailPage.EXTERNAL_CALL,
             icon = AppIcon.EXTERNAL,
             title = "Legado HTTP 转发",
             subtitle = externalCallSummary(state),
         ),
-        "数据管理" to SettingsEntry(
+        SettingsEntry(
             page = SettingsDetailPage.DATA,
             icon = AppIcon.UPLOAD,
             title = "备份、还原与缓存",
             subtitle = "备份导出 / 还原导入 · 缓存 " + formatSize(state.cacheBytes) + " / " + state.cacheFileCount + " 个文件",
         ),
-        "系统集成" to SettingsEntry(
+        SettingsEntry(
             page = SettingsDetailPage.INTEGRATION,
             icon = AppIcon.GEAR,
             title = "许可证与系统语音",
@@ -128,8 +123,12 @@ internal fun SettingsIndexPage(state: MainUiState, onOpen: (SettingsDetailPage) 
             fontWeight = FontWeight.Bold,
             color = Ink,
         )
-        groups.forEach { (groupTitle, entry) ->
-            SectionTitle(groupTitle)
+        SectionCard {
+            SectionTitle("主题模式")
+            ThemeModeSelector(state.themeMode, onThemeMode)
+            Text("立即生效 · 跟随系统会自动切换明暗", style = MaterialTheme.typography.bodySmall, color = Muted)
+        }
+        entries.forEach { entry ->
             SectionCard {
                 SettingsEntryRow(
                     icon = entry.icon,
@@ -139,18 +138,7 @@ internal fun SettingsIndexPage(state: MainUiState, onOpen: (SettingsDetailPage) 
                 )
             }
         }
-        Text(
-            text = "首版不支持 JS 插件与自动人物识别；HTTP 转发服务在设置里手动启用后才会监听端口。",
-            style = MaterialTheme.typography.labelSmall,
-            color = Muted,
-        )
     }
-}
-
-private fun appearanceSummary(state: MainUiState): String = when (state.themeMode) {
-    ThemeMode.LIGHT -> "白天 · 固定浅色"
-    ThemeMode.DARK -> "夜间 · 固定深色"
-    ThemeMode.SYSTEM -> "跟随系统 · 系统深色开关生效时自动变深"
 }
 
 /** 外观：主题模式三选一，切换立即生效并持久化。 */
@@ -163,11 +151,7 @@ internal fun AppearanceSettings(state: MainUiState, viewModel: MainViewModel) {
             style = MaterialTheme.typography.bodySmall,
             color = Muted,
         )
-        FilterChipRow(
-            options = ThemeMode.entries.map { it to it.label },
-            selected = state.themeMode,
-            onSelect = viewModel::setThemeMode,
-        )
+        ThemeModeSelector(state.themeMode, viewModel::setThemeMode)
     }
     Text(
         text = "切换立即生效，无需重启；主题设置会随备份一起迁移。",

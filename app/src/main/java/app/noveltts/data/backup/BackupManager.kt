@@ -12,6 +12,8 @@ import app.noveltts.domain.ReplacementRule
 import app.noveltts.domain.RoleRule
 import app.noveltts.domain.RuleGroup
 import app.noveltts.domain.RuleSet
+import app.noveltts.domain.BookLibrary
+import app.noveltts.data.config.BookLibraryJson
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -44,6 +46,7 @@ data class ParsedBackup(
     val voiceHints: Map<String, String> = emptyMap(),
     val includesProfiles: Boolean = true,
     val voiceOverrides: Map<String, app.noveltts.data.voicepack.VoiceOverride>? = null,
+    val bookLibrary: BookLibrary? = null,
 ) {
     val settingsCount: Int get() = settings.size
 }
@@ -53,13 +56,15 @@ data class BackupRestorePreview(
     val backup: ParsedBackup,
     val roles: RulesImportPreview<RoleRule>,
     val replacements: RulesImportPreview<ReplacementRule>,
+    val bookRevision: String? = null,
+    val bookFingerprint: String? = null,
 ) {
     val roleNewCount: Int get() = roles.newCount
     val roleConflictCount: Int get() = roles.conflictCount
     val replacementNewCount: Int get() = replacements.newCount
     val replacementConflictCount: Int get() = replacements.conflictCount
     val hasConflict: Boolean get() = roles.hasConflict || replacements.hasConflict
-    val isEmpty: Boolean get() = roles.entries.isEmpty() && replacements.entries.isEmpty()
+    val isEmpty: Boolean get() = roles.entries.isEmpty() && replacements.entries.isEmpty() && backup.bookLibrary?.books.isNullOrEmpty()
 }
 
 /**
@@ -70,7 +75,7 @@ data class BackupRestorePreview(
  */
 object BackupManager {
     /** 当前备份格式版本；还原时高于它的文件一律拒绝。 */
-    const val SCHEMA = 1
+    const val SCHEMA = 2
 
     /** 备份文件上限，避免一次读进超大文件。 */
     const val MAX_FILE_BYTES = 4 * 1024 * 1024
@@ -78,7 +83,7 @@ object BackupManager {
     const val FILE_NAME_PREFIX = "noveltts-backup-"
 
     private const val RULES_SCHEMA = 2
-    private const val MAX_DEPTH = 6
+    private const val MAX_DEPTH = 7
     private const val MAX_LICENSE_CHARS = 8192
     private const val MAX_TOKEN_CHARS = 512
 
@@ -126,6 +131,7 @@ object BackupManager {
         profiles: List<ReadingProfile> = emptyList(),
         voiceHints: Map<String, String> = emptyMap(),
         voiceOverrides: Map<String, app.noveltts.data.voicepack.VoiceOverride>? = null,
+        bookLibrary: BookLibrary? = null,
     ): String {
         val roles = JSONObject(RulesImport.exportRoles(roleSet))
         val replacements = JSONObject(RulesImport.exportReplacements(replacementSet))
@@ -141,6 +147,7 @@ object BackupManager {
             .put("profiles", ReadingProfiles.toArray(profiles))
             .put("voiceHints", JSONObject(voiceHints))
         if (voiceOverrides != null) root.put("voiceOverrides", JSONObject(app.noveltts.data.voicepack.VoiceOverrides.encode(voiceOverrides)))
+        if (bookLibrary != null) root.put("bookLibrary", JSONObject(BookLibraryJson.encode(bookLibrary)))
         if (credentials != null && !credentials.isEmpty) {
             val json = JSONObject()
             credentials.license?.takeIf { it.isNotBlank() }?.let { json.put("license", it.take(MAX_LICENSE_CHARS)) }
@@ -188,6 +195,7 @@ object BackupManager {
             profiles = root.optJSONArray("profiles")?.let(ReadingProfiles::fromArray) ?: emptyList(),
             includesProfiles = root.has("profiles"),
             voiceOverrides = root.optJSONObject("voiceOverrides")?.let { app.noveltts.data.voicepack.VoiceOverrides.decode(it.toString()) },
+            bookLibrary = if (root.has("bookLibrary")) BookLibraryJson.decode(root.getJSONObject("bookLibrary").toString()) else null,
             voiceHints = root.optJSONObject("voiceHints")?.let { hints ->
                 hints.keys().asSequence().take(1000).associateWith { hints.stringOrDefault(it).take(160) } } ?: emptyMap(),
         )
@@ -197,6 +205,7 @@ object BackupManager {
         preview.roles.entries.forEach { addAll(it.rule.voiceIds) }
         if (includeSettings) listOf("narratorVoice", "dialogueVoice", "systemVoice").forEach { (preview.backup.settings[it] as? String)?.let(::add) }
         preview.backup.profiles.forEach { add(it.narratorVoice); add(it.dialogueVoice); add(it.systemVoice) }
+        preview.backup.bookLibrary?.books?.forEach { book -> addAll(book.voicePool); book.characters.forEach { add(it.voiceId) } }
     }.filter { it.isNotBlank() && it !in usableIds }.distinct()
 
     fun remapVoices(preview: BackupRestorePreview, mapping: Map<String, String>): BackupRestorePreview {
@@ -205,7 +214,12 @@ object BackupManager {
         val settings = preview.backup.settings.mapValues { (key, value) ->
             if (key in setOf("narratorVoice", "dialogueVoice", "systemVoice")) mapping[value] ?: value else value }
         return preview.copy(roles = roles, backup = preview.backup.copy(settings = settings,
-            profiles = preview.backup.profiles.map { it.remapVoices(mapping) }))
+            profiles = preview.backup.profiles.map { it.remapVoices(mapping) },
+            bookLibrary = preview.backup.bookLibrary?.let { library -> library.copy(books = library.books.map { book ->
+                book.copy(voicePool = book.voicePool.map { mapping[it] ?: it }.distinct(), characters = book.characters.map { character ->
+                    character.copy(voiceId = mapping[character.voiceId] ?: character.voiceId)
+                })
+            }) }))
     }
 
     /** 用当前规则计算还原冲突，复用阶段 2 的 [RulesImport] 预览。 */
@@ -215,8 +229,12 @@ object BackupManager {
         currentRoles: List<RoleRule>,
         currentReplacementGroups: List<RuleGroup>,
         currentReplacements: List<ReplacementRule>,
+        bookRevision: String? = null,
+        bookFingerprint: String? = null,
     ): BackupRestorePreview = BackupRestorePreview(
         backup = backup,
+        bookRevision = bookRevision,
+        bookFingerprint = bookFingerprint,
         roles = RulesImport.previewRoles(backup.rolesJson, currentRoleGroups, currentRoles, externalImport = false),
         replacements = RulesImport.previewReplacements(
             backup.replacementsJson,

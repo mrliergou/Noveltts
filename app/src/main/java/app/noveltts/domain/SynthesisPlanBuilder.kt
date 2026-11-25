@@ -11,8 +11,9 @@ data class BuiltSynthesisPlan(
 object SynthesisPlanBuilder {
     data class Snapshot(val text: String, val builtInRoles: BuiltInRoleSettings,
         val roles: RuleSet<RoleRule>, val replacements: RuleSet<ReplacementRule>, val punctuation: Boolean,
-        val voices: List<VoiceDescriptor>, val maxChars: Int, val policy: UnattributedPolicy) {
-        fun build() = SynthesisPlanBuilder.build(text, builtInRoles, roles, replacements, punctuation, voices, maxChars, policy)
+        val voices: List<VoiceDescriptor>, val maxChars: Int, val policy: UnattributedPolicy,
+        val book: BookRoleProfile? = null) {
+        fun build() = SynthesisPlanBuilder.build(text, builtInRoles, roles, replacements, punctuation, voices, maxChars, policy, book)
     }
     fun build(
         text: String,
@@ -23,6 +24,7 @@ object SynthesisPlanBuilder {
         voices: List<VoiceDescriptor>,
         maxSegmentChars: Int = TextPipeline.DEFAULT_MAX_SEGMENT_CHARS,
         unattributedPolicy: UnattributedPolicy = UnattributedPolicy.DEFAULT,
+        book: BookRoleProfile? = null,
     ): BuiltSynthesisPlan {
         val usable = voices.filter { it.usable }
         val byId = usable.associateBy { it.systemName }
@@ -30,14 +32,16 @@ object SynthesisPlanBuilder {
             ?: usable.firstOrNull()
         val narrator = byId[builtInRoles.narrator.voiceId] ?: fallback
         val dialogue = byId[builtInRoles.dialogue.voiceId] ?: narrator
+        val effectiveRoles = book?.withRules(roles, dialogue?.systemName) ?: roles
+        val bookRoleIds = book?.characters?.map { book.roleId(it.id) }?.toSet().orEmpty()
 
         val pipeline = TextPipeline.build(
             text = text,
             builtInRoles = builtInRoles.withVoices(narrator?.systemName, dialogue?.systemName),
-            roles = roles.items,
+            roles = effectiveRoles.items,
             replacements = replacements.items,
             filterPurePunctuation = filterPurePunctuation,
-            roleGroups = roles.groups,
+            roleGroups = effectiveRoles.groups,
             replacementGroups = replacements.groups,
             maxSegmentChars = maxSegmentChars,
             unattributedPolicy = unattributedPolicy,
@@ -47,7 +51,9 @@ object SynthesisPlanBuilder {
             val voice = byId[segment.voiceId] ?: fallbackVoice ?: return@mapNotNull null
             PlannedSegment(segment.copy(voiceId = voice.systemName,
                 fallbackReason = if (segment.voiceId != voice.systemName)
-                    "指定音色不可用，本段使用 ${voice.displayName}" else null), voice)
+                    "指定音色不可用，本段使用 ${voice.displayName}" else null), voice,
+                standbyVoice = if (segment.roleId in bookRoleIds) dialogue else null,
+                useDefaultStandby = segment.roleId in bookRoleIds)
         }
         val resolved = segments.associate { it.segment.id to it.segment }
         return BuiltSynthesisPlan(pipeline.copy(segments = pipeline.segments.map {

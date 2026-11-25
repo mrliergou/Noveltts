@@ -30,6 +30,10 @@ import app.noveltts.data.cache.AudioCache
 import app.noveltts.data.cache.CacheManager
 import app.noveltts.data.cache.CacheUsage
 import app.noveltts.data.config.ReadingProfile
+import app.noveltts.data.config.BookRolesRepository
+import app.noveltts.domain.BookLibrary
+import app.noveltts.domain.BookRoleProfile
+import app.noveltts.domain.BookCharacter
 import app.noveltts.data.config.ReadingProfiles
 import app.noveltts.data.config.ProfileSwitchPreview
 import app.noveltts.data.config.RuleRecoveryCandidate
@@ -93,7 +97,8 @@ import java.util.UUID
 enum class AppSection(val label: String) {
     WORKBENCH("工作台"),
     PACKS("语音包"),
-    ROLES("角色"),
+    BOOKS("书籍角色"),
+    ROLES("全局角色"),
     REPLACEMENTS("替换"),
     SETTINGS("设置"),
 }
@@ -136,6 +141,11 @@ data class MainUiState(
     val roles: List<RoleRule> = emptyList(),
     val replacements: List<ReplacementRule> = emptyList(),
     val readingProfiles: List<ReadingProfile> = emptyList(),
+    val bookLibrary: BookLibrary = BookLibrary(),
+    val booksLoadError: String? = null,
+    val bookBusy: Boolean = false,
+    val bookOperationId: String = "",
+    val bookOperationError: String? = null,
     val profilesLoadError: String? = null,
     val activeProfileId: String = "",
     val recoveryCandidates: List<RuleRecoveryCandidate> = emptyList(),
@@ -225,6 +235,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val registry = VoiceRegistry(application, packStore)
     private val voiceOverrides = app.noveltts.data.voicepack.VoiceOverrides(application)
     private val rulesRepository = RulesRepository(application)
+    private val bookRepository = BookRolesRepository(application)
     private val engines = EngineManager(application, settings)
     private val synthesizer = MultiSegmentSynthesizer(
         engines = engines,
@@ -285,6 +296,55 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectSection(section: AppSection) {
         _uiState.update { it.copy(section = section) }
+        if (section == AppSection.BOOKS) refreshAll()
+    }
+
+    // Jobs belong to the ViewModel: rotating or leaving an editor cannot cancel an accepted write.
+    private fun changeBooks(operationId: String, action: () -> Unit) {
+        if (_uiState.value.bookBusy) return
+        _uiState.update { it.copy(bookBusy = true, bookOperationId = operationId, bookOperationError = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = runCatching { action(); refreshAll() }
+            _uiState.update { it.copy(bookBusy = false, bookOperationError = result.exceptionOrNull()?.message,
+                statusMessage = result.exceptionOrNull()?.message ?: "书籍角色已保存，对下一次新朗读生效") }
+        }
+    }
+
+    private fun usableBookVoices() = registry.voices(settings.hasLicense(), settings.localTtsEnginePackage)
+        .filter { it.usable }.mapTo(HashSet()) { it.systemName }
+
+    fun createBook(operationId: String, book: BookRoleProfile) = changeBooks(operationId) {
+        bookRepository.create(book, select = true)
+    }
+
+    fun selectBook(id: String, expectedRevision: String) = changeBooks(UUID.randomUUID().toString()) {
+        rulesRepository.withConfigurationLock { bookRepository.select(id, expectedRevision, usableBookVoices()) }
+    }
+
+    fun updateBook(operationId: String, expected: BookRoleProfile, name: String, pool: List<String>) = changeBooks(operationId) {
+        rulesRepository.withConfigurationLock { bookRepository.update(expected, name, pool, usableBookVoices()) }
+    }
+
+    fun saveBookCharacter(operationId: String, expected: BookRoleProfile, character: BookCharacter) = changeBooks(operationId) {
+        rulesRepository.withConfigurationLock { bookRepository.saveCharacter(expected, character, usableBookVoices()) }
+    }
+
+    fun deleteBook(operationId: String, expected: BookRoleProfile) = changeBooks(operationId) { bookRepository.delete(expected) }
+    fun deleteBookCharacter(operationId: String, expected: BookRoleProfile, id: String) = changeBooks(operationId) {
+        bookRepository.deleteCharacter(expected, id)
+    }
+    fun mergeBookCharacters(operationId: String, expected: BookRoleProfile, source: String, target: String) = changeBooks(operationId) {
+        bookRepository.mergeCharacters(expected, source, target)
+    }
+    suspend fun bookRecoveryPreview(): Result<Pair<String, Int>> = withContext(Dispatchers.IO) { runCatching {
+        rulesRepository.withConfigurationLock {
+            val fingerprint = bookRepository.recoveryFingerprint()
+            val backup = bookRepository.readBackup()
+            fingerprint to backup.books.size
+        }
+    } }
+    fun recoverBooks(operationId: String, fingerprint: String) = changeBooks(operationId) {
+        transactionalConfiguration { bookRepository.recoverBackup(fingerprint) }
     }
 
     fun updateText(value: String) {
@@ -489,14 +549,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val generation = playbackGeneration.get()
         _uiState.update { it.copy(isSpeaking = true, isPaused = false, statusMessage = "正在准备朗读计划…") }
         viewModelScope.launch {
-            val result = withContext(Dispatchers.Default) { runCatching { buildPlan(state) } }
+            val snapshot = withContext(Dispatchers.IO) { runCatching { rulesRepository.withConfigurationLock {
+                val books = bookRepository.prepare(usableBookVoices())
+                _uiState.update { it.copy(bookLibrary = books, booksLoadError = null) }
+                state.copy(bookLibrary = books, booksLoadError = null)
+            } } }
+            val result = withContext(Dispatchers.Default) { snapshot.mapCatching { buildPlan(it) } }
             if (generation != playbackGeneration.get()) return@launch
             val plan = result.getOrNull()
             if (plan == null || plan.segments.isEmpty()) {
                 _uiState.update { it.copy(isSpeaking = false, statusMessage = result.exceptionOrNull()?.message ?: "没有可朗读的文本片段。") }
                 return@launch
             }
-            playSegments(plan.segments, plan.pipeline.issues, "正在合成朗读…", playbackState = state)
+            playSegments(plan.segments, plan.pipeline.issues, "正在合成朗读…", playbackState = snapshot.getOrThrow())
         }
     }
 
@@ -546,7 +611,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun buildPlan(state: MainUiState): BuiltSynthesisPlan = with(SynthesisPlanBuilder.build(
-        text = state.text,
+        text = state.text.also { check(state.booksLoadError == null) { state.booksLoadError.orEmpty() } },
         builtInRoles = state.builtInRoles,
         roles = state.roleSet,
         replacements = state.replacementSet,
@@ -554,6 +619,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         voices = state.voices,
         maxSegmentChars = state.maxSegmentChars,
         unattributedPolicy = state.unattributedPolicy,
+        book = state.bookLibrary.activeBook,
     )) {
         val first = segments.firstOrNull()
         val effective = first?.let {
@@ -599,7 +665,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         synthesizer.configure(RetryPolicy(maxAttemptsPerVoice = playbackState.maxRetryCount + 1),
             playbackState.silenceBetweenSegmentsMs, playbackState.requestTimeoutSec)
         synthesizer.configureCache(playbackState.cacheEnabled, playbackState.cacheMaxMb)
-        playbackLease = PlaybackSession.open(getApplication(), segments.any { it.voice.isOnline }) {
+        playbackLease = PlaybackSession.open(getApplication(), segments.any { it.voice.isOnline || it.standbyVoice?.isOnline == true }) {
             if (generation == playbackGeneration.get()) stop()
         }
         if (!audioPolicy.start()) {
@@ -831,7 +897,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun retryCurrentSegment() { resume() }
     fun useStandbyVoice() = withReadingSession { session ->
         val current = session.segments[readingIndex]
-        val alternative = _uiState.value.voices.firstOrNull {
+        val alternative = if (current.useDefaultStandby) _uiState.value.voices.firstOrNull {
+            it.usable && it.systemName == current.standbyVoice?.systemName && it.systemName != current.voice.systemName
+        } else _uiState.value.voices.firstOrNull {
             it.usable && it.systemName != current.voice.systemName && it.localeTag == current.voice.localeTag &&
                 (!it.engineCode.startsWith("android-") || it.engineCode == "android-${session.state.localTtsEnginePackage}")
         }
@@ -938,6 +1006,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val profiles = runCatching { ReadingProfiles.decode(preferences.getString(ReadingProfiles.KEY, null)) }
         val roles = loadRules { rulesRepository.loadRoles() }
         val replacements = loadRules { rulesRepository.loadReplacements() }
+        val books = runCatching { bookRepository.prepare(voices.filter { it.usable }.mapTo(HashSet()) { it.systemName }) }
         _uiState.update {
             it.copy(
                 recoveryWarning = app.noveltts.data.backup.ConfigurationRecovery.lastError,
@@ -950,6 +1019,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 firstSegmentReady = settings.firstSegmentEvidence()?.accepted == true && settings.firstSegmentDeviceMatches(),
                 readingProfiles = profiles.getOrNull() ?: it.readingProfiles,
                 profilesLoadError = profiles.exceptionOrNull()?.message,
+                bookLibrary = books.getOrNull() ?: it.bookLibrary,
+                booksLoadError = books.exceptionOrNull()?.message,
                 activeProfileId = preferences.getString("activeProfileId", "").orEmpty(),
                 voices = voices,
                 roles = roles.getOrNull()?.items ?: it.roles,
@@ -1322,7 +1393,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val built = withContext(Dispatchers.Default) { runCatching { app.noveltts.domain.RuleRuntime.preview { buildPlan(state).pipeline } } }
         if (generation != previewGeneration) return@launch
         val result = built.getOrElse { error ->
-            _uiState.update { it.copy(previewBusy = false, statusMessage = "分段预览失败：${error.message}") }
+            _uiState.update { it.copy(preview = emptyList(), pipelineIssues = emptyList(), previewBusy = false,
+                previewError = error.message, statusMessage = "分段预览失败：${error.message}") }
             return@launch
         }
         if (generation != previewGeneration) return@launch
@@ -1339,7 +1411,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 uncertain = segment.attribution?.uncertain == true,
             )
         }
-        _uiState.update { it.copy(preview = preview, pipelineIssues = result.issues, previewBusy = false) }
+        _uiState.update { it.copy(preview = preview, pipelineIssues = result.issues, previewBusy = false, previewError = null) }
         }
     }
 
@@ -1767,19 +1839,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun backupFileName(): String = BackupManager.exportFileName()
 
     /** 生成备份 JSON；[includeSensitive] 为 false 时不写许可证与访问令牌。 */
-    fun backupJson(includeSensitive: Boolean): String = BackupManager.exportJson(
-        roleSet = _uiState.value.roleSet,
-        replacementSet = _uiState.value.replacementSet,
+    fun backupJson(includeSensitive: Boolean): String = rulesRepository.withConfigurationLock { BackupManager.exportJson(
+        roleSet = rulesRepository.loadRoles(),
+        replacementSet = rulesRepository.loadReplacements(),
         settings = settingsSnapshot(),
+        appVersion = getApplication<Application>().let { app ->
+            app.packageManager.getPackageInfo(app.packageName, 0).versionName.orEmpty()
+        },
         voiceOverrides = voiceOverrides.load(),
-        profiles = _uiState.value.readingProfiles,
+        profiles = ReadingProfiles.decode(preferences.getString(ReadingProfiles.KEY, null)),
+        bookLibrary = bookRepository.load(),
         voiceHints = _uiState.value.voices.associate { it.systemName to it.displayName },
         credentials = if (includeSensitive) {
             BackupCredentials(settings.license(), settings.forwardToken)
         } else {
             null
         },
-    )
+    ) }
 
     /** 导出到 SAF 选定的文件；失败以 Result 返回，由 UI 提示。 */
     suspend fun exportBackupTo(uri: Uri, includeSensitive: Boolean): Result<String> =
@@ -1795,6 +1871,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     append(" 条、设置 ")
                     append(settingsSnapshot().size)
                     append(" 项")
+                    append("、书籍 "); append(state.bookLibrary.books.size); append(" 本")
                     append(if (includeSensitive) "（包含许可证与访问令牌）" else "（不含许可证与访问令牌）")
                 }
             }
@@ -1806,13 +1883,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             runCatching {
                 val parsed = BackupManager.parse(readBackupText(uri))
                 val state = _uiState.value
-                BackupManager.previewRestore(
+                rulesRepository.withConfigurationLock { BackupManager.previewRestore(
                     backup = parsed,
                     currentRoleGroups = state.roleGroups,
                     currentRoles = state.roles,
                     currentReplacementGroups = state.replacementGroups,
                     currentReplacements = state.replacements,
-                )
+                    bookRevision = runCatching { bookRepository.load().revision }.getOrNull(),
+                    bookFingerprint = bookRepository.recoveryFingerprint(),
+                ) }
             }
         }
 
@@ -1858,6 +1937,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val encodedProfiles = ReadingProfiles.encode(profiles)
         transactionalConfiguration {
+            mapped.backup.bookLibrary?.let { incoming ->
+                check(mapped.bookFingerprint == bookRepository.recoveryFingerprint()) { "书籍配置已变化，请重新预览备份" }
+                val current = runCatching { bookRepository.load() }
+                check(current.isSuccess || repairCorrupt) { "书籍配置无法读取，请先确认使用备份修复" }
+                check(current.getOrNull()?.revision == mapped.bookRevision) { "书籍配置已变化，请重新预览备份" }
+                bookRepository.restore(BookRolesRepository.merge(current.getOrDefault(BookLibrary()), incoming, strategy),
+                    mapped.bookRevision, repairCorrupt = current.isFailure && repairCorrupt)
+            }
             if (!repairCorrupt) {
                 check(mapped.roles.baseFingerprint == RulesImport.rolesFingerprint(rulesRepository.loadRoles()) &&
                     mapped.replacements.baseFingerprint == RulesImport.replacementsFingerprint(rulesRepository.loadReplacements())) {
@@ -1886,8 +1973,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshAll()
         refreshRecoveryCandidates()
         VoicePackEvents.notifyChanged(getApplication())
-        "已还原：角色 ${roles.items.size} 条、替换 ${replacements.items.size} 条、阅读方案 ${profiles.size} 个"
-            .also { message -> _uiState.update { it.copy(statusMessage = message) } }
+        val message = "已还原：角色 ${roles.items.size} 条、替换 ${replacements.items.size} 条、阅读方案 ${profiles.size} 个；" +
+            (if (mapped.backup.bookLibrary == null) "本机书籍保留" else "书籍已按所选策略合并")
+        _uiState.update { it.copy(statusMessage = message) }
+        message
     }
 
     private fun transactionalConfiguration(apply: () -> Unit) = rulesRepository.withConfigurationLock {
@@ -1897,7 +1986,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val restoreApp = getApplication<Application>()
         val shared = File(restoreApp.applicationInfo.dataDir, "shared_prefs")
         app.noveltts.data.backup.ConfigurationRecovery.transaction(restoreApp).run(
-            rulesRepository.transactionFiles() + voiceOverrides.files() + listOf(File(shared, "multitts.xml"), File(shared, "multitts.xml.bak"),
+            rulesRepository.transactionFiles() + bookRepository.files() + voiceOverrides.files() + listOf(File(shared, "multitts.xml"), File(shared, "multitts.xml.bak"),
                 File(shared, "multitts.secrets.xml"), File(shared, "multitts.secrets.xml.bak")),
             rollbackMemory = { settings.commitValues(settingsBefore, replace = true); settings.restoreCredentialSnapshot(credentialsBefore) },
             apply = apply)

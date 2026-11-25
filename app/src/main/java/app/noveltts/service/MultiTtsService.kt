@@ -34,7 +34,8 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * MultiTTS 自己的 Android TextToSpeechService。
+ * NovelTTS 的 Android TextToSpeechService。
+ * 类名沿用已导出的服务组件名，命名整理时保留以维持组件身份。
  *
  * 系统只看到 usable=true 的音色；合成直接调用 Edge 或微软嵌入式引擎，不再转发给
  * 其他已安装 TTS。离线模型未配置许可证时保留在应用内，但不暴露给系统。
@@ -44,6 +45,7 @@ class MultiTtsService : TextToSpeechService() {
     private val packStore by lazy { VoicePackStore(this) }
     private val registry by lazy { VoiceRegistry(this, packStore) }
     private val rules by lazy { RulesRepository(this) }
+    private val books by lazy { app.noveltts.data.config.BookRolesRepository(this) }
     private val engines by lazy { EngineManager(this, settings) }
     // spool 目录开启“先落盘再回放”：单段失败可换备用音色，取消时能直接丢弃半成品。
     private val synthesizerDelegate = lazy {
@@ -208,7 +210,8 @@ class MultiTtsService : TextToSpeechService() {
             SynthesisPlanBuilder.Snapshot(text,
                 config.builtInRoles.withVoices(narrator?.systemName, dialogue?.systemName),
                 rules.loadRoles(), rules.loadReplacements(), config.punctuationFilter, descriptors,
-                config.maxSegmentChars, config.unattributedPolicy) to config
+                config.maxSegmentChars, config.unattributedPolicy,
+                books.prepare(descriptors.filter { it.usable }.mapTo(HashSet()) { it.systemName }).activeBook) to config
         }
         val (snapshot, config) = prepared
         val plan = snapshot.build()
@@ -216,7 +219,7 @@ class MultiTtsService : TextToSpeechService() {
         if (plan.segments.isEmpty()) { session.onComplete(); return null }
         synthesizer.configure(RetryPolicy(config.maxRetryCount + 1), config.silenceBetweenSegmentsMs, config.options.timeoutSec)
         synthesizer.configureCache(config.cacheEnabled, config.cacheMaxMb)
-        val lease = PlaybackSession.open(this, plan.segments.any { it.voice.isOnline }) {
+        val lease = PlaybackSession.open(this, plan.segments.any { it.voice.isOnline || it.standbyVoice?.isOnline == true }) {
             session.fail(TextToSpeech.ERROR_SERVICE)
         }
         try {

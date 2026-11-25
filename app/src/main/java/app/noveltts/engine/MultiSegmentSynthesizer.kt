@@ -25,6 +25,8 @@ import kotlin.math.roundToInt
 data class PlannedSegment(
     val segment: PipelineSegment,
     val voice: VoiceDescriptor,
+    val standbyVoice: VoiceDescriptor? = null,
+    val useDefaultStandby: Boolean = false,
 )
 
 /**
@@ -515,12 +517,15 @@ class MultiSegmentSynthesizer(
     /**
      * 候选音色 = 主音色 + 同段备用。
      *
-     * 备用从本次合成计划里挑：同样的 [PipelineSegment.isDialogue] 分类、可用、
+     * 书籍人物仅使用快照中的默认对话音色作为备用。其它片段从本次计划里挑：同样的 [PipelineSegment.isDialogue] 分类、可用、
      * 且与主音色不同，最多 [MAX_STANDBY_VOICES] 个。计划里没有其它音色时自然只有主音色。
      */
     private fun candidatesFor(job: Job, planned: PlannedSegment): List<VoiceDescriptor> {
         val primary = planned.voice
         if (!job.retryPolicy.allowStandbyVoice) return listOf(primary)
+        if (planned.useDefaultStandby) return listOfNotNull(primary, planned.standbyVoice?.takeIf {
+            it.usable && it.systemName != primary.systemName
+        })
         val standby = job.segments.asSequence()
             .filter { it.segment.isDialogue == planned.segment.isDialogue }
             .map { it.voice }

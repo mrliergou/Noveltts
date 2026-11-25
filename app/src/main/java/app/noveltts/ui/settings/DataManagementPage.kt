@@ -103,7 +103,7 @@ internal fun DataManagementSettings(state: MainUiState, viewModel: MainViewModel
     SectionTitle("备份导出")
     SectionCard {
         Text(
-            text = "导出角色、替换规则与设置。语音包与最近文本不在备份范围内。",
+            text = "导出书籍、人物绑定、声音池、全局角色、替换规则与设置。语音包与最近文本不在备份范围内。",
             style = MaterialTheme.typography.labelSmall,
             color = Muted,
         )
@@ -166,7 +166,7 @@ internal fun DataManagementSettings(state: MainUiState, viewModel: MainViewModel
             Text("选择备份文件…")
         }
         Text(
-            text = "只接受 schema 为 1 的 NovelTTS 备份；更高版本会被拒绝。",
+            text = "支持 schema 1 和 2；新备份需使用支持书籍角色的版本还原。旧备份不改变现有书籍。",
             style = MaterialTheme.typography.labelSmall,
             color = Muted,
         )
@@ -289,7 +289,8 @@ private fun BackupRestoreSheet(
     var keepMissing by remember { mutableStateOf(false) }
     var repair by remember { mutableStateOf(false) }
     var applyError by remember { mutableStateOf<String?>(null) }
-    val damaged = state.rolesLoadError != null || state.replacementsLoadError != null || state.profilesLoadError != null
+    val damaged = state.rolesLoadError != null || state.replacementsLoadError != null || state.profilesLoadError != null ||
+        (preview.backup.bookLibrary != null && state.booksLoadError != null)
     androidx.compose.runtime.DisposableEffect(Unit) { onDispose { viewModel.stopPreview() } }
     var strategy by remember { mutableStateOf(RuleImportStrategy.SKIP) }
     var applySettings by remember { mutableStateOf(preview.backup.settingsCount > 0) }
@@ -326,6 +327,11 @@ private fun BackupRestoreSheet(
             }
             RulePreviewBlock("角色规则", preview.roles, RoleRule::name)
             RulePreviewBlock("替换规则", preview.replacements, ReplacementRule::name)
+            preview.backup.bookLibrary?.let { library ->
+                val conflicts = library.books.count { incoming -> state.bookLibrary.books.any { it.id == incoming.id } }
+                Text("书籍 ${library.books.size} 本 · 人物 ${library.books.sumOf { it.characters.size }} 个 · 同 ID 书籍 $conflicts 本")
+                Text("书籍按 ID 整本合并；同名不同 ID 会保留为不同书。还原不会替你切换当前书籍。", style = MaterialTheme.typography.bodySmall, color = Muted)
+            } ?: Text("此备份不包含书籍，保留本机书籍与人物绑定。", color = Muted)
             SectionTitle("冲突处理")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 RuleImportStrategy.entries.forEach { option ->
@@ -345,7 +351,7 @@ private fun BackupRestoreSheet(
                 ) {
                     AppIconGlyph(icon = AppIcon.WARNING, size = 16.dp, tint = Accent)
                     Text(
-                        text = "全部覆盖会先清空当前所有规则，只保留备份里的内容。",
+                        text = "全部覆盖只保留备份中的规则。" + if (preview.backup.bookLibrary != null) "书籍也将全部替换为备份内容。" else "本机书籍保留。",
                         style = MaterialTheme.typography.labelSmall,
                         color = Accent,
                     )
