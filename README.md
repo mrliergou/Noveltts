@@ -96,7 +96,7 @@ Android 8.0+ · arm64-v8a · Edge 在线语音 / 微软 Embedded 离线语音
 
 ### 源码与分发
 
-本仓库分享 Kotlin / Jetpack Compose 产品源码与公开文档。Gradle 构建配置、测试、原生库、模型、语音包及本机工作资料不随仓库分发，**仅克隆仓库不能直接构建 APK**。接手源码先读 [维护约束](AGENTS.md)，依赖信息见 [技术栈](docs/ARCHITECTURE.md#技术栈)。
+本仓库分享 Kotlin / Jetpack Compose 产品源码与公开文档。Gradle 构建配置、测试、原生库、模型、语音包及本机工作资料不随仓库分发，**仅克隆仓库不能直接构建 APK**。接手源码先读 [开发手册](docs/DEVELOPMENT.md)，依赖信息见 [技术栈](docs/ARCHITECTURE.md#技术栈)。
 
 发布 APK 使用调试签名；仓库暂未附带开源许可证文件。
 
