@@ -68,7 +68,7 @@ engines:
     note: 需要许可证
 ```
 
-`type` 目前只用于展示。
+`type` 目前只用于展示。原版的 `url/header/param/extendUI` 等引擎扩展不构成本项目的通用接口或脚本能力；不能因为保留某个清单字段就宣称对应后端可用。
 
 原版 YAML 里带有 `!!org.nobody.multitts...` 这类 Java 类型标签。解析前会先去掉标签，再用 SnakeYAML 的 `SafeConstructor` 读成普通的 map 和 list，不会加载任何外部类。
 
@@ -161,7 +161,7 @@ packId   = "vp-" + sha256(config.yaml + 0x00 + engines.yaml) 的前 16 位
 
 其他应用或 adb 可以请求安装语音包或设置在线目录：
 
-```bash
+```powershell
 # 请求安装 ZIP 直链
 adb shell am start -n app.noveltts/.MainActivity --es packUrl "https://example.com/pack.zip"
 

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">NovelTTS：从书页，到声音</title>
+  <desc id="desc">浅绿书页和应用原有的气泡声波图形，表达旁白与已配置人物使用各自配音的小说朗读主题。这是概念插图，不是应用截图。</desc>
+  <rect width="1200" height="360" rx="24" fill="#EBF6F1"/>
+
+  <g id="reading-title" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif">
+    <text x="64" y="146" fill="#202D33" font-size="72" font-weight="650">从书页，到声音</text>
+    <text x="68" y="220" fill="#005B57" font-size="42" font-weight="500">旁白与人物，各有配音</text>
+    <path d="M68 281 H140" stroke="#BE5C2A" stroke-width="5" stroke-linecap="round"/>
+    <text x="162" y="291" fill="#606F73" font-size="28">NovelTTS · Android 小说朗读</text>
+  </g>
+
+  <g id="open-book" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M804 201 Q872 184 950 218 Q1022 184 1102 201 L1102 297 Q1020 281 950 313 Q877 281 804 297 Z" fill="#FFFFFF" stroke="#005B57" stroke-width="5"/>
+    <path d="M950 218 V313" fill="none" stroke="#005B57" stroke-width="5"/>
+    <path d="M829 226 Q879 219 925 236 M829 251 Q879 244 925 261 M975 236 Q1022 219 1077 226 M975 261 Q1022 244 1077 251" fill="none" stroke="#B3CEC2" stroke-width="5"/>
+    <path d="M1064 198 V231 L1076 221 L1088 231 V199" fill="#BE5C2A" stroke="none"/>
+  </g>
+
+  <!-- Adapts the speech bubble and five bars from the app launcher vector. -->
+  <g id="app-voice-mark" transform="translate(807 -17) scale(2.7)">
+    <path d="M38 30 H70 A14 14 0 0 1 84 44 V60 A14 14 0 0 1 70 74 H52 L34 86 V74 H38 A14 14 0 0 1 24 60 V44 A14 14 0 0 1 38 30 Z" fill="#005B57"/>
+    <g fill="none" stroke="#EBF6F1" stroke-width="5" stroke-linecap="round">
+      <path d="M38 58 V46 M45 62 V42 M59 62 V42 M66 58 V46"/>
+      <path d="M52 66 V38" stroke="#F0A87C"/>
+    </g>
+  </g>
+</svg>

@@ -2,6 +2,8 @@
 
 NovelTTS 可以在本机开启一个 HTTP 服务，供阅读器等应用查询音色并合成语音。合成走与应用内朗读相同的链路，角色规则和替换规则同样生效。
 
+HTTP 采用应用「书籍角色」中当前选中的书籍及固定音色绑定，与系统 TTS 共用同一个选择；未选书时使用全局角色。此接口没有自动识别或切换书籍的参数。换书后，新规划使用新选择，已捕获的请求和阅读器缓存音频不重建。
+
 ## 启用
 
 在「设置 → 外部调用」里开启。
@@ -68,17 +70,16 @@ NovelTTS 可以在本机开启一个 HTTP 服务，供阅读器等应用查询�
 
 GET 使用查询参数；POST 使用 JSON 请求体：
 
-```bash
-curl -X POST http://127.0.0.1:8080/tts \
-  -H "Content-Type: application/json" \
-  -H "X-Token: <令牌>" \
-  -d '{"text":"他笑道：“走吧。”","rate":1.2}' \
-  --output out.wav
+```powershell
+$body = [System.Text.Encoding]::UTF8.GetBytes('{"text":"他笑道：“走吧。”","rate":1.2}')
+Invoke-WebRequest -Uri 'http://127.0.0.1:8080/tts' -Method Post -ContentType 'application/json' -Headers @{'X-Token'='<令牌>'} -Body $body -OutFile 'out.wav'
 ```
 
-```bash
-curl "http://127.0.0.1:8080/tts?text=%E4%BD%A0%E5%A5%BD" -H "X-Token: <令牌>" --output out.wav
+```powershell
+Invoke-WebRequest -Uri 'http://127.0.0.1:8080/tts?text=%E4%BD%A0%E5%A5%BD' -Headers @{'X-Token'='<令牌>'} -OutFile 'out.wav'
 ```
+
+以上为 PowerShell 示例；`127.0.0.1` 指发出请求的设备，在电脑执行前需要已有端口转发或替换为允许访问的地址，并填入实际令牌。
 
 成功时返回 `audio/wav`：24 kHz、16 位、单声道 PCM，带 44 字节的 RIFF 头。
 
